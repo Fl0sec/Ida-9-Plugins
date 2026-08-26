@@ -65,6 +65,16 @@ _GLOBAL_PREFIX_RE = re.compile(r"^g_")
 # `??_7CNetMessage@@6B@`), and demangled forms carry `:`/`<`/`(`/spaces.
 _HUMAN_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# IDA auto-generated name stems that can slip past has_user_name (notably
+# empty-stub `nullsub_240`, incl. `_74`/`_0` dedup suffixes and `j_`/`j_j_`
+# thunk prefixes). A human never types these. Suffix must be hex-ish so real
+# renames like `sub_process` or `Handler_beef` are not caught.
+_AUTO_NAME_RE = re.compile(
+    r"^(j_)*(sub|nullsub|unknown_libname|loc|locret|off|unk|byte|word|dword|"
+    r"qword|tbyte|packreal|flt|dbl|xmmword|ymmword|stru|asc|algn|jpt|def)"
+    r"(_[0-9A-Fa-f]+)+$"
+)
+
 
 def _is_mangled(name):
     """True if `name` is a mangled compiler symbol (MSVC or Itanium)."""
@@ -75,15 +85,18 @@ def _is_mangled(name):
 
 
 def _is_human_named(name):
-    """Distinguish a human rename from a tool/loader symbol.
+    """Distinguish a human rename from a tool/loader/auto-generated symbol.
 
     `ida_bytes.has_user_name` (FF_NAME) is far too broad: PDB, ClassInformer
-    RTTI/vftables and FLIRT all set it. We additionally require the name to be a
-    plain identifier and to not demangle. The identifier test rejects MSVC
+    RTTI/vftables, FLIRT and even some auto stubs (`nullsub_N`) all set it. We
+    additionally require the name to be a plain identifier, to not match an IDA
+    auto-name stem, and to not demangle. The identifier test rejects MSVC
     mangled/demangled shapes on its own; the demangle test also rejects Itanium
     `_Z...` names, which are identifier-shaped but still compiler-emitted.
     """
     if not name or not _HUMAN_NAME_RE.match(name):
+        return False
+    if _AUTO_NAME_RE.match(name):
         return False
     if _is_mangled(name):
         return False
@@ -147,7 +160,9 @@ def get_all_user_named_function_eas():
         f = ida_funcs.get_func(ea)
         if f is None or f.start_ea != ea:
             continue
-        if f.flags & ida_funcs.FUNC_LIB:  # FLIRT library match, not a rename
+        # FLIRT library match or a thunk (j_*): not a genuine rename, and a
+        # thunk's lone jmp makes a poor signature anyway.
+        if f.flags & (ida_funcs.FUNC_LIB | ida_funcs.FUNC_THUNK):
             continue
         flags = ida_bytes.get_full_flags(ea)
         if not ida_bytes.has_user_name(flags):
