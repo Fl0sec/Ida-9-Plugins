@@ -57,9 +57,14 @@ selection); the selection only scopes which functions are exported.
 - Transitively exports dependent named local types (structs/unions/enums/
   typedefs), deduplicated across functions and globals, with full member bodies.
 
-**Which globals?** A global is exported when it is a data item (not code, not a
-function, not a tail) whose name is user-given (`has_user_name`) **or** starts
-with `g_`. IDA-generated names (`dword_…`, `off_…`, strings, …) are excluded.
+**Which names are "user" names?** `has_user_name` (IDA's `FF_NAME`) is not
+enough: PDB imports, ClassInformer RTTI/vftables (`??_7…@@6B@`) and FLIRT
+library matches all set it. So both discovery passes additionally require the
+name to be a **plain C identifier** and to **not demangle** (rejecting MSVC and
+Itanium `_Z…` symbols); functions flagged `FUNC_LIB` are also skipped. A global
+is exported when it is a data item (not code, not a function, not a tail) that
+passes this filter and is either user-named or starts with `g_`. This keeps
+your hand-renamed items and drops the thousands of tool-emitted symbols.
 
 ### `cvutils-cfs-importer.py` — CFS5 Importer
 

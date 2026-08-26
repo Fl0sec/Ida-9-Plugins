@@ -60,6 +60,35 @@ PROGRESS_EVERY = 10
 # not set; whitelist that prefix in addition to the has_user_name gate.
 _GLOBAL_PREFIX_RE = re.compile(r"^g_")
 
+# A human's interactive rename is a plain C identifier. Compiler/tool-emitted
+# names are not: MSVC RTTI/vftable/method symbols carry `?@` (e.g.
+# `??_7CNetMessage@@6B@`), and demangled forms carry `:`/`<`/`(`/spaces.
+_HUMAN_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _is_mangled(name):
+    """True if `name` is a mangled compiler symbol (MSVC or Itanium)."""
+    try:
+        return ida_name.demangle_name(name, ida_name.MNG_NODEFINIT) is not None
+    except Exception:
+        return False
+
+
+def _is_human_named(name):
+    """Distinguish a human rename from a tool/loader symbol.
+
+    `ida_bytes.has_user_name` (FF_NAME) is far too broad: PDB, ClassInformer
+    RTTI/vftables and FLIRT all set it. We additionally require the name to be a
+    plain identifier and to not demangle. The identifier test rejects MSVC
+    mangled/demangled shapes on its own; the demangle test also rejects Itanium
+    `_Z...` names, which are identifier-shaped but still compiler-emitted.
+    """
+    if not name or not _HUMAN_NAME_RE.match(name):
+        return False
+    if _is_mangled(name):
+        return False
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Discovery
@@ -111,21 +140,26 @@ def get_selected_function_eas(ctx):
 
 
 def get_all_user_named_function_eas():
+    """Human-renamed function starts: user name, plain identifier, not a FLIRT
+    library match, not a compiler/RTTI symbol."""
     result = []
     for ea in idautils.Functions():
         f = ida_funcs.get_func(ea)
         if f is None or f.start_ea != ea:
             continue
+        if f.flags & ida_funcs.FUNC_LIB:  # FLIRT library match, not a rename
+            continue
         flags = ida_bytes.get_full_flags(ea)
         if not ida_bytes.has_user_name(flags):
             continue
-        if ida_name.get_name(ea):
+        if _is_human_named(ida_name.get_name(ea)):
             result.append(ea)
     return result
 
 
 def get_user_global_eas():
-    """User-named (or g_*) data globals: not code, not a function, not a tail."""
+    """Human-named (or g_*) data globals: not code, not a function, not a tail,
+    and a plain identifier rather than a compiler/RTTI/vftable symbol."""
     result = []
     for ea, name in idautils.Names():
         if not name:
@@ -136,6 +170,8 @@ def get_user_global_eas():
         if ida_funcs.get_func(ea) is not None:
             continue
         if not (ida_bytes.has_user_name(flags) or _GLOBAL_PREFIX_RE.match(name)):
+            continue
+        if not _is_human_named(name):
             continue
         result.append(ea)
     return sorted(set(result))
