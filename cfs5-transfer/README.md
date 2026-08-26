@@ -33,14 +33,20 @@ loader at them). The package must remain a sibling of the entry files.
 Exports functions **and** user-named globals to a `.cfs` file: signatures +
 prototypes/types + dependent local types.
 
-**Usage**
-- Open the *Functions* window (View → Open subviews → Functions).
-- Right-click → **CFS5/** → *Export selected functions (+ globals)* (`Ctrl+Shift+E`),
-  or *Export ALL user-named functions + globals*.
-- Choose an output `.cfs` path.
+**Usage** — functions and globals are controlled independently.
 
-User-named globals are always included in an export (there is no per-global
-selection); the selection only scopes which functions are exported.
+*Functions* window (View → Open subviews → Functions) → right-click → **CFS5/**:
+- *Export selected functions* (`Ctrl+Shift+E`) — only the rows you selected.
+- *Export ALL user-named functions* — every user function, **no globals**.
+- *Export ALL user functions + globals* — the full transfer set.
+
+*Names* window (Shift+F4) → right-click → **CFS5/**:
+- *Export selected globals* — only the data globals you selected (pick them in
+  the Names window). Explicitly selected items skip the human-name heuristic.
+- *Export ALL user-named globals* — every user global, **no functions**.
+
+Each action asks for an output `.cfs` path. So you can export functions only,
+globals only, a hand-picked subset of either, or everything.
 
 **Features**
 - Function signatures in three modes, shortest-unique first:

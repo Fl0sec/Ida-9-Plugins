@@ -51,8 +51,13 @@ from cfs5.typeio import (
 
 
 PLUGIN_NAME = "CFS5 Exporter (IDA 9)"
-ACTION_SELECTED = "cfs5:export_selected"
-ACTION_ALL_USER_NAMED = "cfs5:export_all_user_named"
+# Functions window actions.
+ACTION_SEL_FUNCS = "cfs5:export_sel_funcs"
+ACTION_ALL_FUNCS = "cfs5:export_all_funcs"
+ACTION_ALL_BOTH = "cfs5:export_all_both"
+# Names window actions.
+ACTION_SEL_GLOBALS = "cfs5:export_sel_globals"
+ACTION_ALL_GLOBALS = "cfs5:export_all_globals"
 SELECTED_HOTKEY = "Ctrl+Shift+E"
 PROGRESS_EVERY = 10
 
@@ -190,6 +195,55 @@ def get_user_global_eas():
             continue
         result.append(ea)
     return sorted(set(result))
+
+
+def _chooser_ea(ctx, row):
+    """Map a chooser row to an address. Prefers the chooser's own mapping (so
+    UI sorting is honored); falls back to the name list that backs the Names
+    window."""
+    ch = getattr(ctx, "chooser", None)
+    if ch is not None:
+        try:
+            ea = ch.get_ea(row)
+            if ea is not None and ea != BADADDR:
+                return ea
+        except Exception:
+            pass
+    try:
+        if 0 <= row < ida_name.get_nlist_size():
+            return ida_name.get_nlist_ea(row)
+    except Exception:
+        pass
+    return BADADDR
+
+
+def get_selected_global_eas(ctx):
+    """Globals selected in the Names window. The user picked these explicitly,
+    so the human-name heuristic is NOT applied; we only drop code/functions/
+    tails so a stray selected function isn't mistaken for a global."""
+    if ctx is None or getattr(ctx, "widget_type", None) != ida_kernwin.BWN_NAMES:
+        return []
+
+    eas = []
+    for row in _selected_indices(ctx):
+        ea = _chooser_ea(ctx, row)
+        if ea != BADADDR:
+            eas.append(ea)
+
+    if not eas:
+        cur = getattr(ctx, "cur_ea", BADADDR)
+        if cur != BADADDR:
+            eas.append(cur)
+
+    out = []
+    for ea in eas:
+        flags = ida_bytes.get_full_flags(ea)
+        if ida_bytes.is_code(flags) or ida_bytes.is_tail(flags):
+            continue
+        if ida_funcs.get_func(ea) is not None:
+            continue
+        out.append(ea)
+    return sorted(set(out))
 
 
 # ---------------------------------------------------------------------------
@@ -339,12 +393,12 @@ def _write_global(writer, state, global_ea, ranges):
     return name
 
 
-def export_items(function_eas, title):
-    function_eas = sorted(set(function_eas))
-    global_eas = get_user_global_eas()
+def export_items(function_eas, global_eas, title):
+    function_eas = sorted(set(function_eas or []))
+    global_eas = sorted(set(global_eas or []))
 
     if not function_eas and not global_eas:
-        ida_kernwin.warning("No suitable functions or user-named globals found.")
+        ida_kernwin.warning("Nothing to export (no functions and no globals).")
         return False
 
     path = ida_kernwin.ask_file(True, "*.cfs", title)
@@ -392,7 +446,7 @@ def export_items(function_eas, title):
                 done += 1
                 if done == 1 or done == total or done % PROGRESS_EVERY == 0:
                     ida_kernwin.replace_wait_box(
-                        "Functions + globals -> CFS5...\n%d / %d\n"
+                        "Building CFS5 signatures + types...\n%d / %d\n"
                         "Functions: %d  Globals: %d  Types: %d  No anchor: %d"
                         % (done, total, state.functions, state.globals,
                            len(state.exported_types), state.no_candidate)
@@ -407,7 +461,7 @@ def export_items(function_eas, title):
                     done += 1
                     if done == 1 or done == total or done % PROGRESS_EVERY == 0:
                         ida_kernwin.replace_wait_box(
-                            "Functions + globals -> CFS5...\n%d / %d\n"
+                            "Building CFS5 signatures + types...\n%d / %d\n"
                             "Functions: %d  Globals: %d  Types: %d  No anchor: %d"
                             % (done, total, state.functions, state.globals,
                                len(state.exported_types), state.no_candidate)
@@ -469,57 +523,135 @@ def export_items(function_eas, title):
 # IDA plugin / UI glue
 # ---------------------------------------------------------------------------
 
-class ExportSelectedHandler(ida_kernwin.action_handler_t):
+def _enable_for(ctx, widget_type):
+    if getattr(ctx, "widget_type", None) == widget_type:
+        return ida_kernwin.AST_ENABLE_FOR_WIDGET
+    return ida_kernwin.AST_DISABLE_FOR_WIDGET
+
+
+# --- Functions window ---
+
+class ExportSelFuncsHandler(ida_kernwin.action_handler_t):
     def activate(self, ctx):
-        export_items(
-            get_selected_function_eas(ctx),
-            "Export selected functions (+ user globals) to CFS5",
-        )
+        eas = get_selected_function_eas(ctx)
+        if not eas:
+            ida_kernwin.warning("No functions selected.")
+            return 1
+        export_items(eas, [], "Export selected functions to CFS5")
         return 1
 
     def update(self, ctx):
-        if getattr(ctx, "widget_type", None) == ida_kernwin.BWN_FUNCS:
-            return ida_kernwin.AST_ENABLE_FOR_WIDGET
-        return ida_kernwin.AST_DISABLE_FOR_WIDGET
+        return _enable_for(ctx, ida_kernwin.BWN_FUNCS)
 
 
-class ExportAllHandler(ida_kernwin.action_handler_t):
+class ExportAllFuncsHandler(ida_kernwin.action_handler_t):
     def activate(self, ctx):
         eas = get_all_user_named_function_eas()
-        globals_found = len(get_user_global_eas())
-        if not eas and not globals_found:
+        if not eas:
+            ida_kernwin.warning("No user-named functions found.")
+            return 1
+        if ida_kernwin.ask_yn(
+            ida_kernwin.ASKBTN_YES,
+            "Export %d user-named functions (no globals) to CFS5?" % len(eas),
+        ) != ida_kernwin.ASKBTN_YES:
+            return 1
+        export_items(eas, [], "Export ALL user-named functions to CFS5")
+        return 1
+
+    def update(self, ctx):
+        return _enable_for(ctx, ida_kernwin.BWN_FUNCS)
+
+
+class ExportAllBothHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        funcs = get_all_user_named_function_eas()
+        globs = get_user_global_eas()
+        if not funcs and not globs:
             ida_kernwin.warning("No user-named functions or globals found.")
             return 1
-
         if ida_kernwin.ask_yn(
             ida_kernwin.ASKBTN_YES,
             "Export %d user-named functions and %d user-named globals to CFS5?"
-            % (len(eas), globals_found),
+            % (len(funcs), len(globs)),
         ) != ida_kernwin.ASKBTN_YES:
             return 1
-
-        export_items(eas, "Export ALL user-named functions + globals to CFS5")
+        export_items(funcs, globs, "Export ALL user functions + globals to CFS5")
         return 1
 
     def update(self, ctx):
-        if getattr(ctx, "widget_type", None) == ida_kernwin.BWN_FUNCS:
-            return ida_kernwin.AST_ENABLE_FOR_WIDGET
-        return ida_kernwin.AST_DISABLE_FOR_WIDGET
+        return _enable_for(ctx, ida_kernwin.BWN_FUNCS)
+
+
+# --- Names window ---
+
+class ExportSelGlobalsHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        eas = get_selected_global_eas(ctx)
+        if not eas:
+            ida_kernwin.warning("No data globals selected in the Names window.")
+            return 1
+        export_items([], eas, "Export selected globals to CFS5")
+        return 1
+
+    def update(self, ctx):
+        return _enable_for(ctx, ida_kernwin.BWN_NAMES)
+
+
+class ExportAllGlobalsHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        globs = get_user_global_eas()
+        if not globs:
+            ida_kernwin.warning("No user-named globals found.")
+            return 1
+        if ida_kernwin.ask_yn(
+            ida_kernwin.ASKBTN_YES,
+            "Export %d user-named globals (no functions) to CFS5?" % len(globs),
+        ) != ida_kernwin.ASKBTN_YES:
+            return 1
+        export_items([], globs, "Export ALL user-named globals to CFS5")
+        return 1
+
+    def update(self, ctx):
+        return _enable_for(ctx, ida_kernwin.BWN_NAMES)
 
 
 class Hooks(ida_kernwin.UI_Hooks):
     def finish_populating_widget_popup(self, widget, popup_handle, ctx=None):
-        if ida_kernwin.get_widget_type(widget) != ida_kernwin.BWN_FUNCS:
-            return
-        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_SELECTED, "CFS5/")
-        ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_ALL_USER_NAMED, "CFS5/")
+        wt = ida_kernwin.get_widget_type(widget)
+        if wt == ida_kernwin.BWN_FUNCS:
+            for aid in (ACTION_SEL_FUNCS, ACTION_ALL_FUNCS, ACTION_ALL_BOTH):
+                ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS5/")
+        elif wt == ida_kernwin.BWN_NAMES:
+            for aid in (ACTION_SEL_GLOBALS, ACTION_ALL_GLOBALS):
+                ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS5/")
+
+
+# (action_id, label, handler_factory, hotkey, tooltip)
+_ACTIONS = [
+    (ACTION_SEL_FUNCS, "Export selected functions to CFS5",
+     ExportSelFuncsHandler, SELECTED_HOTKEY,
+     "Export the functions selected in the Functions window"),
+    (ACTION_ALL_FUNCS, "Export ALL user-named functions to CFS5",
+     ExportAllFuncsHandler, None,
+     "Export every user-named function (no globals)"),
+    (ACTION_ALL_BOTH, "Export ALL user functions + globals to CFS5",
+     ExportAllBothHandler, None,
+     "Export every user-named function and global"),
+    (ACTION_SEL_GLOBALS, "Export selected globals to CFS5",
+     ExportSelGlobalsHandler, None,
+     "Export the globals selected in the Names window"),
+    (ACTION_ALL_GLOBALS, "Export ALL user-named globals to CFS5",
+     ExportAllGlobalsHandler, None,
+     "Export every user-named global (no functions)"),
+]
 
 
 class CFS5ExporterPlugin(idaapi.plugin_t):
     flags = idaapi.PLUGIN_PROC | idaapi.PLUGIN_HIDE
     comment = "Optimized CFS5 signature + type exporter for IDA 9 (functions + globals)"
     help = (
-        "Functions window -> right click -> CFS5. Exports short unique "
+        "Functions window -> right click -> CFS5 (functions). "
+        "Names window -> right click -> CFS5 (globals). Exports short unique "
         "ENTRY/BODY/REL function signatures, REL-anchored global signatures, "
         "and function/global/local types."
     )
@@ -527,33 +659,18 @@ class CFS5ExporterPlugin(idaapi.plugin_t):
     wanted_hotkey = ""
 
     def init(self):
-        self.h1 = ExportSelectedHandler()
-        self.h2 = ExportAllHandler()
+        self.handlers = []
         self.hooks = Hooks()
 
-        ida_kernwin.unregister_action(ACTION_SELECTED)
-        ida_kernwin.unregister_action(ACTION_ALL_USER_NAMED)
-
-        ok1 = ida_kernwin.register_action(
-            ida_kernwin.action_desc_t(
-                ACTION_SELECTED,
-                "Export selected functions (+ globals) to CFS5",
-                self.h1, SELECTED_HOTKEY,
-                "Export selected functions and all user globals to CFS5", -1,
-            )
-        )
-        ok2 = ida_kernwin.register_action(
-            ida_kernwin.action_desc_t(
-                ACTION_ALL_USER_NAMED,
-                "Export ALL user-named functions + globals to CFS5",
-                self.h2, None,
-                "Export all user-named functions and globals to CFS5", -1,
-            )
-        )
-
-        if not ok1 or not ok2:
-            msg("Action registration failed.")
-            return idaapi.PLUGIN_SKIP
+        for action_id, label, factory, hotkey, tip in _ACTIONS:
+            ida_kernwin.unregister_action(action_id)
+            handler = factory()
+            self.handlers.append(handler)
+            if not ida_kernwin.register_action(
+                ida_kernwin.action_desc_t(action_id, label, handler, hotkey, tip, -1)
+            ):
+                msg("Action registration failed: %s" % action_id)
+                return idaapi.PLUGIN_SKIP
 
         self.hooks.hook()
         msg("%s initialized." % VERSION)
@@ -561,7 +678,8 @@ class CFS5ExporterPlugin(idaapi.plugin_t):
 
     def run(self, arg):
         ida_kernwin.info(
-            "Open View -> Open subviews -> Functions,\nthen right-click -> CFS5."
+            "Functions window -> right-click -> CFS5 (functions).\n"
+            "Names window -> right-click -> CFS5 (globals)."
         )
 
     def term(self):
@@ -569,8 +687,8 @@ class CFS5ExporterPlugin(idaapi.plugin_t):
             self.hooks.unhook()
         except Exception:
             pass
-        ida_kernwin.unregister_action(ACTION_SELECTED)
-        ida_kernwin.unregister_action(ACTION_ALL_USER_NAMED)
+        for action_id, _label, _factory, _hotkey, _tip in _ACTIONS:
+            ida_kernwin.unregister_action(action_id)
 
 
 def PLUGIN_ENTRY():
