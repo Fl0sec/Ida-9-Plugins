@@ -1,0 +1,18 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# Embedded/unrelated projects checked out alongside this repo
+ida-pro-mcp/
+
+# IDA database artifacts
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
