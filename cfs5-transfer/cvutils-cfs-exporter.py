@@ -72,11 +72,13 @@ _HUMAN_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Exclusion regex (matches names to KEEP): reject the sub_/j_/_ prefixes and the
 # nullsub / std:: / unknown_libname / Concurrency substrings that IDA, PDB and
-# FLIRT emit. Empirically this handles the vast majority; the one gap is raw
-# MSVC mangled names (??_7...@std@@6B@) which store `@std@@` not `std::` and
-# start with `?` -- those are caught by the plain-identifier gate below instead.
+# FLIRT emit, plus any raw MSVC mangling metacharacter `?` `@` `$` (e.g.
+# `?ToString@Value@v8@@...` or template `?$Local@...`). The plain-identifier
+# gate below already rejects those metacharacters, so this clause is
+# defense-in-depth that also makes the regex correct if used standalone.
 _KEEP_RE = re.compile(
-    r"^(?!sub_|j_|_)(?!.*nullsub)(?!.*std::)(?!.*unknown_libname)(?!.*Concurrency).*"
+    r"^(?!sub_|j_|_)(?!.*nullsub)(?!.*std::)(?!.*unknown_libname)"
+    r"(?!.*Concurrency)(?!.*[?@$]).*"
 )
 
 
