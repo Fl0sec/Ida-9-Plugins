@@ -64,13 +64,20 @@ globals only, a hand-picked subset of either, or everything.
   typedefs), deduplicated across functions and globals, with full member bodies.
 
 **Which names are "user" names?** `has_user_name` (IDA's `FF_NAME`) is not
-enough: PDB imports, ClassInformer RTTI/vftables (`??_7…@@6B@`) and FLIRT
-library matches all set it. So both discovery passes additionally require the
-name to be a **plain C identifier** and to **not demangle** (rejecting MSVC and
-Itanium `_Z…` symbols); functions flagged `FUNC_LIB` are also skipped. A global
-is exported when it is a data item (not code, not a function, not a tail) that
-passes this filter and is either user-named or starts with `g_`. This keeps
-your hand-renamed items and drops the thousands of tool-emitted symbols.
+enough: PDB imports, ClassInformer RTTI/vftables (`??_7…@@6B@`), FLIRT library
+matches and even empty-stub `nullsub_N` all set it. So the *auto-discovery*
+passes additionally require the name to:
+
+- be a **plain C identifier** (rejects MSVC `??_7…@@` / `::`-demangled shapes),
+- pass an **exclusion regex** that drops `sub_` / `j_` / `_` prefixes and any
+  `nullsub` / `std::` / `unknown_libname` / `Concurrency` substring, and
+- **not demangle** (backstop for identifier-shaped Itanium `_Z…` names).
+
+Functions flagged `FUNC_LIB` or `FUNC_THUNK` are also skipped. A global is
+auto-discovered when it is a data item (not code/function/tail) that passes this
+filter and is either user-named or starts with `g_`. This keeps hand-renamed
+items and drops the thousands of tool-emitted symbols. **Manual selections in
+the Names window bypass this filter** — if you pick it, it exports.
 
 ### `cvutils-cfs-importer.py` — CFS5 Importer
 

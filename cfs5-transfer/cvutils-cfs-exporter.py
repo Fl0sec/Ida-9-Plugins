@@ -70,14 +70,13 @@ _GLOBAL_PREFIX_RE = re.compile(r"^g_")
 # `??_7CNetMessage@@6B@`), and demangled forms carry `:`/`<`/`(`/spaces.
 _HUMAN_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# IDA auto-generated name stems that can slip past has_user_name (notably
-# empty-stub `nullsub_240`, incl. `_74`/`_0` dedup suffixes and `j_`/`j_j_`
-# thunk prefixes). A human never types these. Suffix must be hex-ish so real
-# renames like `sub_process` or `Handler_beef` are not caught.
-_AUTO_NAME_RE = re.compile(
-    r"^(j_)*(sub|nullsub|unknown_libname|loc|locret|off|unk|byte|word|dword|"
-    r"qword|tbyte|packreal|flt|dbl|xmmword|ymmword|stru|asc|algn|jpt|def)"
-    r"(_[0-9A-Fa-f]+)+$"
+# Exclusion regex (matches names to KEEP): reject the sub_/j_/_ prefixes and the
+# nullsub / std:: / unknown_libname / Concurrency substrings that IDA, PDB and
+# FLIRT emit. Empirically this handles the vast majority; the one gap is raw
+# MSVC mangled names (??_7...@std@@6B@) which store `@std@@` not `std::` and
+# start with `?` -- those are caught by the plain-identifier gate below instead.
+_KEEP_RE = re.compile(
+    r"^(?!sub_|j_|_)(?!.*nullsub)(?!.*std::)(?!.*unknown_libname)(?!.*Concurrency).*"
 )
 
 
@@ -93,15 +92,15 @@ def _is_human_named(name):
     """Distinguish a human rename from a tool/loader/auto-generated symbol.
 
     `ida_bytes.has_user_name` (FF_NAME) is far too broad: PDB, ClassInformer
-    RTTI/vftables, FLIRT and even some auto stubs (`nullsub_N`) all set it. We
-    additionally require the name to be a plain identifier, to not match an IDA
-    auto-name stem, and to not demangle. The identifier test rejects MSVC
-    mangled/demangled shapes on its own; the demangle test also rejects Itanium
-    `_Z...` names, which are identifier-shaped but still compiler-emitted.
+    RTTI/vftables, FLIRT and even some auto stubs (`nullsub_N`) all set it. A
+    name is kept only if it is a plain C identifier (rejects MSVC `??_7...@@`
+    mangled/`::`-demangled shapes), passes the exclusion regex (rejects sub_/j_/_
+    prefixes and nullsub/std/unknown_libname/Concurrency), and does not demangle
+    (a backstop for identifier-shaped Itanium `_Z...` names).
     """
     if not name or not _HUMAN_NAME_RE.match(name):
         return False
-    if _AUTO_NAME_RE.match(name):
+    if not _KEEP_RE.match(name):
         return False
     if _is_mangled(name):
         return False
