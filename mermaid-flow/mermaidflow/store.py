@@ -1,24 +1,31 @@
 """Per-function persistence of Mermaid source in the IDB.
 
-One flowchart per function, keyed by the function's start address, stored as a
-netnode blob so it travels with the IDB and comes back when the database is
-reopened.
+One flowchart per function, stored as the blob of a netnode named after the
+function's start address, so it travels with the IDB and comes back when the
+database is reopened.
 
-Deliberately the simplest thing that works. If this ever needs to grow into a
-named graph library (several graphs per function, or graphs that belong to the
-whole binary rather than one function), the shape to move to is a second
-netnode holding `name -> source` with an optional function anchor, leaving this
-one as the per-function index. Nothing here needs to change until that is
-actually wanted.
+**Why one netnode per function, with the blob at index 0.** The obvious design
+-- a single shared netnode with `setblob_ea(source, func_ea, tag)` -- does not
+work in IDA 9.0. `setblob_ea` returns True and the matching `getblob_ea`
+returns nothing, for payloads as small as 21 bytes, with the tag passed either
+as a str or as an int; a plain `getblob` at the same raw index is empty too, so
+the data is not where the address says it should be. That was measured, not
+guessed (see `diagnose`, which still checks both shapes side by side).
 
-**Read-after-write, always.** `setblob_ea` returning True is not proof that
-anything was stored: the SDK types its tag as `uchar` while `getblob_ea` types
-its own as `char`, so the two SWIG typemaps need not agree on what the Python
-value "M" means, and a write can land in a tag space the read never looks at.
-Rather than guess which form is correct, every write is read straight back and
-the tag pairings are tried until one genuinely round-trips. The winner is
-cached and logged, so a storage problem announces itself in one line instead of
-appearing later as "my flowchart vanished".
+So this follows the shape IDA's own shipped example uses and proves works
+(`python/examples/decompiler/vds3.py`): construct an unnamed netnode, `create`
+it by name, and read and write the blob at **index 0**. That also removes a
+latent collision the address-indexed design had -- a blob spans *consecutive*
+supval indices from its start, MAXSPECSIZE (1024) bytes each, so a 1581-byte
+chart stored "at" 0x4160 also claimed the slot for 0x4161.
+
+Nothing was ever successfully stored by the old scheme, so there is nothing to
+migrate.
+
+If this ever needs to become a named graph library (several charts per
+function, or charts belonging to the whole binary), add an index netnode
+listing the members and give each chart its own node as here. Nothing below
+needs to change for that.
 """
 
 import ida_funcs
@@ -27,35 +34,49 @@ import ida_netnode
 from .common import BADADDR, ea_str, msg
 
 
-# `$ `-prefixed names are the convention for private plugin netnodes.
-NETNODE_NAME = "$ mermaid flowcharts"
+# Per-function netnode name. The "$ " prefix is the documented convention for
+# private plugin netnodes -- it cannot collide with an identifier-shaped name.
+NODE_PREFIX = "$ mermaid flowchart "
 
-# Blob tag. One character, ours alone within this netnode.
+# Blob tag. One of the 256 supval arrays a netnode may carry; ours alone.
 BLOB_TAG = "M"
+
+# The blob always lives at index 0 of its own netnode. Never an address: see
+# the module docstring.
+BLOB_INDEX = 0
 
 ENCODING = "utf-8"
 
-# The two ways the tag argument can plausibly be expressed.
-_TAG_FORMS = (("str", BLOB_TAG), ("int", ord(BLOB_TAG)))
-
-# (write form name, read form name) proven to round-trip in this session.
-_known_forms = None
+# Legacy shared netnode, kept only so `diagnose` can keep proving the old
+# scheme fails. Never written to.
+LEGACY_NODE_NAME = "$ mermaid flowcharts"
 
 
-def _node(create=False):
-    """Open the plugin's netnode, creating it only when about to write."""
+def node_name(func_ea):
+    return "%s0x%X" % (NODE_PREFIX, func_ea)
+
+
+def _open(func_ea):
+    """Bind a netnode for this function, creating it if needed.
+
+    Mirrors the vds3.py idiom: `create` returns False when the node already
+    existed, but the object is bound either way, which is all we need.
+    """
     try:
-        return ida_netnode.netnode(NETNODE_NAME, 0, create)
+        node = ida_netnode.netnode()
+        node.create(node_name(func_ea))
+        return node
     except Exception as exc:
-        msg("storage: netnode unavailable: %s" % exc)
+        msg("storage: cannot open netnode for %s: %s" % (ea_str(func_ea), exc))
         return None
 
 
-def _node_index(node):
+def _exists(func_ea):
     try:
-        return node.index()
-    except Exception:
-        return None
+        return ida_netnode.netnode.exist(node_name(func_ea))
+    except Exception as exc:
+        msg("storage: exist() failed for %s: %s" % (ea_str(func_ea), exc))
+        return False
 
 
 def func_key(ea):
@@ -73,134 +94,80 @@ def func_key(ea):
 
 
 # ---------------------------------------------------------------------------
-# Raw blob access
-# ---------------------------------------------------------------------------
-
-def _write(node, func_ea, data, tag):
-    try:
-        return bool(node.setblob_ea(data, func_ea, tag))
-    except Exception as exc:
-        msg("storage: setblob_ea(%s, tag=%r) raised: %s"
-            % (ea_str(func_ea), tag, exc))
-        return False
-
-
-def _read(node, func_ea, tag):
-    try:
-        return node.getblob_ea(func_ea, tag)
-    except Exception as exc:
-        msg("storage: getblob_ea(%s, tag=%r) raised: %s"
-            % (ea_str(func_ea), tag, exc))
-        return None
-
-
-def _write_read_pairs():
-    """Every (write, read) tag pairing, the one known to work first."""
-    pairs = [(wn, wt, rn, rt) for wn, wt in _TAG_FORMS for rn, rt in _TAG_FORMS]
-    if _known_forms is not None:
-        pairs.sort(key=lambda pair: (pair[0], pair[2]) != _known_forms)
-    return pairs
-
-
-def _read_forms():
-    """Read tag forms, the one known to work first."""
-    forms = list(_TAG_FORMS)
-    if _known_forms is not None:
-        forms.sort(key=lambda form: form[0] != _known_forms[1])
-    return forms
-
-
-def _remember(write_name, read_name, func_ea, size):
-    global _known_forms
-    pairing = (write_name, read_name)
-    if _known_forms != pairing:
-        _known_forms = pairing
-        msg("storage: using %s-tag writes and %s-tag reads." % pairing)
-    msg("storage: stored %d bytes for %s (verified by read-back)."
-        % (size, ea_str(func_ea)))
-
-
-# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def load(func_ea):
     """Return the stored Mermaid source for a function, or None."""
-    node = _node()
+    if not _exists(func_ea):
+        return None
+
+    node = _open(func_ea)
     if node is None:
         return None
 
-    index = _node_index(node)
-    if index is None or index == BADADDR:
-        msg("storage: netnode %r does not exist yet (index=%s)."
-            % (NETNODE_NAME, index if index is None else ea_str(index)))
+    try:
+        blob = node.getblob(BLOB_INDEX, BLOB_TAG)
+    except Exception as exc:
+        msg("storage: getblob failed for %s: %s" % (ea_str(func_ea), exc))
         return None
 
-    for read_name, read_tag in _read_forms():
-        blob = _read(node, func_ea, read_tag)
-        if not blob:
-            continue
-        if _known_forms is not None and read_name != _known_forms[1]:
-            msg("storage: read succeeded with the %s tag form, not the "
-                "expected %s." % (read_name, _known_forms[1]))
-        try:
-            return blob.decode(ENCODING)
-        except Exception as exc:
-            msg("storage: blob for %s is not valid %s: %s"
-                % (ea_str(func_ea), ENCODING, exc))
-            return None
+    if not blob:
+        msg("storage: netnode %r exists but its blob is empty."
+            % node_name(func_ea))
+        return None
 
-    return None
+    try:
+        return blob.decode(ENCODING)
+    except Exception as exc:
+        msg("storage: blob for %s is not valid %s: %s"
+            % (ea_str(func_ea), ENCODING, exc))
+        return None
 
 
 def save(func_ea, source):
-    """Store the Mermaid source for a function, verifying it can be read back.
+    """Store the Mermaid source for a function, verifying the read-back.
 
-    Returns True only when a subsequent `load` will actually find the data.
+    Returns True only when a subsequent `load` will actually find the data --
+    `setblob` returning True is not, on its own, evidence that it did.
     """
-    node = _node(create=True)
+    node = _open(func_ea)
     if node is None:
         return False
 
-    index = _node_index(node)
-    if index is None or index == BADADDR:
-        msg("storage: could not create netnode %r (index=%s)."
-            % (NETNODE_NAME, index))
+    data = source.encode(ENCODING)
+    try:
+        wrote = bool(node.setblob(data, BLOB_INDEX, BLOB_TAG))
+    except Exception as exc:
+        msg("storage: setblob raised for %s: %s" % (ea_str(func_ea), exc))
         return False
 
-    data = source.encode(ENCODING)
-    for write_name, write_tag, read_name, read_tag in _write_read_pairs():
-        if not _write(node, func_ea, data, write_tag):
-            continue
-        echo = _read(node, func_ea, read_tag)
-        if echo == data:
-            _remember(write_name, read_name, func_ea, len(data))
-            return True
-        if echo:
-            msg("storage: %s-write/%s-read returned %d bytes, expected %d."
-                % (write_name, read_name, len(echo), len(data)))
+    echo = load(func_ea)
+    if echo == source:
+        msg("storage: stored %d bytes for %s in %r (verified)."
+            % (len(data), ea_str(func_ea), node_name(func_ea)))
+        return True
 
-    msg("storage: NO tag form round-tripped for %s (%d bytes). "
+    msg("storage: write to %r reported %s but read back %s. "
         "Run Mermaid -> Diagnose flowchart storage."
-        % (ea_str(func_ea), len(data)))
+        % (node_name(func_ea), wrote,
+           "nothing" if echo is None else "%d chars" % len(echo)))
     return False
 
 
 def delete(func_ea):
-    """Remove the stored flowchart for a function, in every tag form."""
-    node = _node()
+    """Remove the stored flowchart for a function."""
+    if not _exists(func_ea):
+        return False
+    node = _open(func_ea)
     if node is None:
         return False
-
-    removed = False
-    for _name, tag in _TAG_FORMS:
-        try:
-            if node.delblob_ea(func_ea, tag):
-                removed = True
-        except Exception as exc:
-            msg("storage: delblob_ea(%s, tag=%r) raised: %s"
-                % (ea_str(func_ea), tag, exc))
-    return removed
+    try:
+        node.kill()          # drops the netnode and everything attached
+        return True
+    except Exception as exc:
+        msg("storage: kill failed for %s: %s" % (ea_str(func_ea), exc))
+        return False
 
 
 def has(func_ea):
@@ -212,71 +179,87 @@ def has(func_ea):
 # ---------------------------------------------------------------------------
 
 def diagnose(func_ea):
-    """Probe every part of the storage path and return report lines.
-
-    Written to answer one question without a debugger: when a flowchart does
-    not come back, is the netnode missing, is the tag pairing wrong, is the
-    blob empty, or is the address different from the one it was stored under?
-    """
+    """Probe both storage shapes and report which one actually round-trips."""
     lines = []
     add = lines.append
+    probe = b"mermaid-storage-probe"
 
-    add("netnode name: %r" % NETNODE_NAME)
     add("function key: %s" % ea_str(func_ea))
+    add("")
+    add("A. per-function netnode, blob at index 0 (current scheme)")
+    add("   name: %r" % node_name(func_ea))
     try:
-        add("netnode.exist: %s" % ida_netnode.netnode.exist(NETNODE_NAME))
+        add("   exists before: %s" % _exists(func_ea))
     except Exception as exc:
-        add("netnode.exist raised: %s" % exc)
+        add("   exist() raised: %s" % exc)
 
-    reader = _node()
-    add("index (create=False): %s"
-        % (None if reader is None else _node_index(reader)))
-    writer = _node(create=True)
-    add("index (create=True):  %s"
-        % (None if writer is None else _node_index(writer)))
-
-    if writer is None:
-        add("VERDICT: the netnode cannot be opened at all.")
+    node = _open(func_ea)
+    if node is None:
+        add("   VERDICT: cannot open the netnode at all.")
         return lines
 
-    probe = b"mermaid-storage-probe"
-    add("")
-    add("write/read matrix (probe of %d bytes):" % len(probe))
-    working = []
-    for write_name, write_tag, read_name, read_tag in _write_read_pairs():
-        wrote = _write(writer, func_ea, probe, write_tag)
-        echo = _read(writer, func_ea, read_tag)
-        state = "MATCH" if echo == probe else (
-            "%d bytes" % len(echo) if echo else "empty")
-        add("  write %-3s -> read %-3s : setblob=%s, got %s"
-            % (write_name, read_name, wrote, state))
-        if echo == probe:
-            working.append((write_name, read_name))
+    add("   index: %s" % _index_str(node))
+    preserved = None
+    try:
+        preserved = node.getblob(BLOB_INDEX, BLOB_TAG)
+    except Exception:
+        pass
 
-    # getblob (raw index) as a cross-check on the ea -> node index conversion.
-    add("")
-    for name, tag in _TAG_FORMS:
-        try:
-            raw = writer.getblob(func_ea, tag)
-        except Exception as exc:
-            raw = "raised: %s" % exc
-        add("  getblob(index=%s, tag %s): %s"
-            % (ea_str(func_ea), name,
-               ("%d bytes" % len(raw)) if isinstance(raw, bytes) else raw))
+    try:
+        wrote = node.setblob(probe, BLOB_INDEX, BLOB_TAG)
+        echo = node.getblob(BLOB_INDEX, BLOB_TAG)
+        add("   setblob=%s, read back %s" % (wrote, _describe(echo)))
+        scheme_a = echo == probe
+    except Exception as exc:
+        add("   raised: %s" % exc)
+        scheme_a = False
 
-    for _name, tag in _TAG_FORMS:
-        try:
-            writer.delblob_ea(func_ea, tag)
-        except Exception:
-            pass
+    # Put back whatever was there, so diagnosing never costs a flowchart.
+    try:
+        if preserved:
+            node.setblob(preserved, BLOB_INDEX, BLOB_TAG)
+        else:
+            node.delblob(BLOB_INDEX, BLOB_TAG)
+    except Exception:
+        pass
 
     add("")
-    if working:
-        add("VERDICT: storage works with %s."
-            % ", ".join("%s-write/%s-read" % pair for pair in working))
-        add("If a real flowchart still does not come back, the address it was")
-        add("stored under differs from %s." % ea_str(func_ea))
+    add("B. shared netnode, blob keyed by address (old scheme, for contrast)")
+    scheme_b = False
+    try:
+        legacy = ida_netnode.netnode(LEGACY_NODE_NAME, 0, True)
+        add("   index: %s" % _index_str(legacy))
+        wrote = legacy.setblob_ea(probe, func_ea, BLOB_TAG)
+        echo = legacy.getblob_ea(func_ea, BLOB_TAG)
+        add("   setblob_ea=%s, getblob_ea %s" % (wrote, _describe(echo)))
+        raw = legacy.getblob(func_ea, BLOB_TAG)
+        add("   getblob at raw index %s: %s" % (ea_str(func_ea), _describe(raw)))
+        scheme_b = echo == probe
+        legacy.delblob_ea(func_ea, BLOB_TAG)
+    except Exception as exc:
+        add("   raised: %s" % exc)
+
+    add("")
+    if scheme_a:
+        add("VERDICT: scheme A works. Flowcharts persist.")
+    elif scheme_b:
+        add("VERDICT: scheme A fails but B works -- revert to the shared node.")
     else:
-        add("VERDICT: no tag pairing round-trips. Blob storage is unusable")
-        add("here; the source must move to supvals or a hash node instead.")
+        add("VERDICT: neither blob scheme round-trips here. Next step is to")
+        add("chunk the source across supvals (setblob is then not involved).")
     return lines
+
+
+def _index_str(node):
+    try:
+        return "0x%X" % node.index()
+    except Exception as exc:
+        return "unavailable (%s)" % exc
+
+
+def _describe(blob):
+    if blob is None:
+        return "None"
+    if not blob:
+        return "empty"
+    return "%d bytes" % len(blob)
