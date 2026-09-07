@@ -1,0 +1,46 @@
+```mermaid
+flowchart TD
+    A["RealDriverEntry"] --> B["Initialize logging lock"]
+    B --> C["Initialize protection lock<br/>and worker stop event"]
+    C --> D["InitializeTextIntegrityBaseline"]
+
+    D --> D1["Find mapped driver image"]
+    D1 --> D2["Locate executable PE section"]
+    D2 --> D3["Save nonpaged baseline copy"]
+    D3 --> D4["Calculate FNV-1a baseline"]
+
+    D4 --> E["Resolve optional kernel routines"]
+    E --> E1["ZwQueryVirtualMemory"]
+    E --> E2["ZwQueryInformationProcess"]
+    E --> E3["PsGetProcessSectionBaseAddress"]
+    E1 --> F
+    E2 --> F
+    E3 --> F
+
+    F["Create Device/TBMKEv1"] --> G{"Device created?"}
+    G -- No --> X1["Return failure"]
+    G -- Yes --> H["Enable buffered I/O<br/>Clear initializing flag"]
+
+    H --> I["Create DosDevices/TBMKEv1"]
+    I --> J{"Link created?"}
+    J -- No --> X2["Delete device<br/>Return failure"]
+    J -- Yes --> K["Register process-handle filter<br/>Altitude 321500"]
+
+    K --> L["Register process callback"]
+    L --> M["Register thread callback"]
+    M --> N["Register image-load callback"]
+
+    N --> O["Create ProtectionWorkerThread"]
+    O --> P{"Worker created?"}
+    P -- No --> X3["RealDriverUnload<br/>Return failure"]
+    P -- Yes --> Q["Install RealDriverUnload"]
+
+    Q --> R["Install IRP_MJ_CREATE<br/>DispatchCreate"]
+    R --> S["Install IRP_MJ_CLOSE<br/>DispatchClose"]
+    S --> T["Install IRP_MJ_DEVICE_CONTROL<br/>DispatchDeviceControl"]
+    T --> U["Return STATUS_SUCCESS"]
+
+    K -. "failure is non-fatal" .-> L
+    L -. "failure is non-fatal" .-> M
+    M -. "failure is non-fatal" .-> N
+```

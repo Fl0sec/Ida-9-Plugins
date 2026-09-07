@@ -1,0 +1,11 @@
+{
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "Mermaid Flowchart",
+    "entryPoint": "cvutils-mermaid-flow.py",
+    "idaVersions": ">=9.0",
+    "version": "1.0.0",
+    "description": "Attach a Mermaid flowchart to a function and render it as a native IDA graph, with node-to-address navigation.",
+    "categories": ["api-scripting-and-automation"]
+  }
+}
