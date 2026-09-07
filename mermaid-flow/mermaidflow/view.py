@@ -10,6 +10,8 @@ Two IDA constraints shape everything here, both verified against IDA 9.0:
   decision (`{...}`) is distinguished by colour and a `<>` marker instead.
 """
 
+import re
+
 import ida_funcs
 import ida_graph
 import ida_kernwin
@@ -39,24 +41,94 @@ _NO_LABELS = frozenset(["no", "n", "false", "fail", "failure", "error"])
 # Labels wider than this wrap, so a long step does not stretch the whole graph.
 WRAP_WIDTH = 38
 
+_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# A single-word match inside a multi-word label is the weakest evidence this
+# plugin acts on, so it is fenced in: a token must be at least this long and
+# must not be one of the verbs and nouns every generated flowchart is built
+# from. Without the fence, `Register process callback` would happily jump to
+# whatever `process` happens to name.
+MIN_TOKEN_LEN = 5
+_TOKEN_STOPLIST = frozenset("""
+    address alloc baseline buffer callback calculate check cleanup clear code
+    context copy count create data delete device driver enable entry error
+    event exit failed failure file filter find flag free handle header image
+    index init initialize input install list load locate lock main memory name
+    node object offset open output path pointer process queue read register
+    resolve result return save section setup size start status stop store
+    string success table test thread type unload value verify worker write
+""".split())
+
 
 def resolve_target(node):
-    """Resolve a node to an address in this IDB, or BADADDR.
+    """Resolve a node to `(ea, why)`, or `(BADADDR, None)`.
 
-    Order matters. An explicit `click` target wins; otherwise the node's own
-    label is tried as a symbol name, which is what makes the common case --
-    an LLM-generated flowchart whose node labels *are* the callee names --
-    link itself with no annotation at all.
+    Four passes, most trustworthy first. An explicit `click` target wins; then
+    the whole label; then each of its lines; and only then individual
+    identifier tokens inside the label. That ordering is what makes
+    `Install IRP_MJ_CREATE<br/>DispatchCreate` reach `DispatchCreate` without
+    letting a one-word coincidence hijack a node that had an exact match
+    available.
 
     A name is preferred over a raw address everywhere because an address dies
     the moment the IDB is rebased, while a name that stops resolving is a
     visible, useful signal rather than a silent wrong jump.
+
+    `why` records what actually matched, so the hover hint can show it: a
+    wrong link should be legible, not mysterious.
     """
-    for candidate in (node.target, node.label.split("\n")[0]):
+    if node.target:
+        ea = _resolve_token(node.target)
+        if ea != BADADDR:
+            return ea, "click target %s" % node.target
+
+    label = node.label
+    lines = [line for line in label.split("\n") if line.strip()]
+    for candidate in [label] + lines:
+        if "\n" in candidate and candidate is not label:
+            continue
         ea = _resolve_token(candidate)
         if ea != BADADDR:
-            return ea
-    return BADADDR
+            return ea, "label %r" % candidate
+
+    found = _resolve_from_tokens(label)
+    if found is not None:
+        ea, token = found
+        return ea, "token %r in the label" % token
+
+    return BADADDR, None
+
+
+def _is_func_start(ea):
+    try:
+        func = ida_funcs.get_func(ea)
+    except Exception:
+        return False
+    return func is not None and func.start_ea == ea
+
+
+def _resolve_from_tokens(label):
+    """Last-resort match on a single word of a multi-word label.
+
+    Longest token first, and **only a function start counts**. A flowchart step
+    means a routine; accepting data here is how `Register process-handle filter
+    / Altitude 321500` ends up jumping to a global called `Altitude`. An exact
+    label or line may still resolve to data -- that is a deliberate choice by
+    whoever wrote the label -- and `click` can always name data explicitly.
+
+    The stoplist and length floor also apply only here. An exact label has
+    already been tried, so a node genuinely called `Process` still links; what
+    is filtered out is `Process` extracted from `Register process callback`,
+    which is precisely where a false jump would come from.
+    """
+    tokens = sorted(set(_TOKEN_RE.findall(label)), key=len, reverse=True)
+    for token in tokens:
+        if len(token) < MIN_TOKEN_LEN or token.lower() in _TOKEN_STOPLIST:
+            continue
+        ea = _resolve_token(token)
+        if ea != BADADDR and _is_func_start(ea):
+            return ea, token
+    return None
 
 
 def _resolve_token(token):
@@ -125,6 +197,7 @@ class MermaidGraphView(ida_graph.GraphViewer):
 
         self._keys = []          # graph node id -> mermaid node key
         self._targets = {}       # graph node id -> resolved ea
+        self._why = {}           # graph node id -> what matched, for the hint
         self._edge_labels = {}   # (src_id, dst_id) -> label
         self.linked_count = 0
 
@@ -134,6 +207,7 @@ class MermaidGraphView(ida_graph.GraphViewer):
         self.Clear()
         self._keys = []
         self._targets = {}
+        self._why = {}
         self._edge_labels = {}
         self.linked_count = 0
 
@@ -143,8 +217,9 @@ class MermaidGraphView(ida_graph.GraphViewer):
             ids[node.key] = node_id
             self._keys.append(node.key)
 
-            ea = resolve_target(node)
+            ea, why = resolve_target(node)
             self._targets[node_id] = ea
+            self._why[node_id] = why
             if ea != BADADDR:
                 self.linked_count += 1
 
@@ -251,6 +326,9 @@ class MermaidGraphView(ida_graph.GraphViewer):
         if ea != BADADDR:
             name = ida_funcs.get_func_name(ea) or ida_name.get_name(ea)
             parts.append("links to %s (%s)" % (ea_str(ea), name or "?"))
+            # Say which of the four passes matched: a link found by a single
+            # token is a guess, and the reader deserves to see that it was one.
+            parts.append("matched by %s" % (self._why.get(node_id) or "?"))
             parts.append("double-click to jump")
         return "\n".join(parts)
 
