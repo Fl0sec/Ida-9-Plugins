@@ -42,7 +42,6 @@ PLUGIN_NAME = "Mermaid Flowchart (IDA 9)"
 ACTION_SHOW = "mermaidflow:show"
 ACTION_EDIT = "mermaidflow:edit"
 ACTION_DELETE = "mermaidflow:delete"
-ACTION_DIAGNOSE = "mermaidflow:diagnose"
 
 SHOW_HOTKEY = "Ctrl+Shift+M"
 POPUP_PATH = "Mermaid/"
@@ -134,8 +133,6 @@ def show_flowchart(func_ea):
         msg("Loaded a stored flowchart for %s (%d bytes)."
             % (func_label(func_ea), len(source)))
     else:
-        msg("No stored flowchart for %s." % func_label(func_ea))
-    if source is None:
         if ida_kernwin.ask_yn(
             ida_kernwin.ASKBTN_YES,
             "No flowchart is registered for %s.\n\nRegister one now?"
@@ -167,19 +164,6 @@ def edit_flowchart(func_ea):
     else:
         ida_kernwin.warning("Could not store the flowchart in the IDB.")
     render(func_ea, source)
-
-
-def diagnose_storage(func_ea):
-    """Probe the whole persistence path and report where it breaks."""
-    msg("--- storage diagnosis for %s ---" % func_label(func_ea))
-    lines = store.diagnose(func_ea)
-    for line in lines:
-        msg(line)
-    msg("--- end of diagnosis ---")
-    ida_kernwin.info(
-        "Mermaid storage diagnosis for %s\n\n%s"
-        % (func_label(func_ea), "\n".join(lines))
-    )
 
 
 def delete_flowchart(func_ea):
@@ -260,17 +244,12 @@ class DeleteHandler(_FuncActionHandler):
         delete_flowchart(func_ea)
 
 
-class DiagnoseHandler(_FuncActionHandler):
-    def operate(self, func_ea):
-        diagnose_storage(func_ea)
-
 
 class Hooks(ida_kernwin.UI_Hooks):
     def finish_populating_widget_popup(self, widget, popup_handle, ctx=None):
         if ida_kernwin.get_widget_type(widget) not in TARGET_WIDGETS:
             return
-        for action_id in (ACTION_SHOW, ACTION_EDIT, ACTION_DELETE,
-                          ACTION_DIAGNOSE):
+        for action_id in (ACTION_SHOW, ACTION_EDIT, ACTION_DELETE):
             ida_kernwin.attach_action_to_popup(
                 widget, popup_handle, action_id, POPUP_PATH
             )
@@ -284,8 +263,6 @@ _ACTIONS = [
      "Edit the Mermaid source stored for this function"),
     (ACTION_DELETE, "Delete flowchart", DeleteHandler, None,
      "Remove the flowchart stored for this function"),
-    (ACTION_DIAGNOSE, "Diagnose flowchart storage", DiagnoseHandler, None,
-     "Probe the IDB storage path and report where it fails"),
 ]
 
 

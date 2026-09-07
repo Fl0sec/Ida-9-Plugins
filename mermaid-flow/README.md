@@ -46,13 +46,35 @@ Right-click inside a function — **disassembly**, **pseudocode**, or the
 The source is stored per function in the IDB, so it survives closing the
 database. **Double-click a node** to jump to its address.
 
+### How it is stored
+
+Each function's chart is the blob at **index 0** of its own netnode, named
+`$ mermaid flowchart 0x4160`. That shape is deliberate: the obvious
+alternative -- one shared netnode with `setblob_ea(source, func_ea, tag)` --
+does **not** work in IDA 9.0. `setblob_ea` returns True while the matching
+`getblob_ea` returns nothing, for payloads as small as 21 bytes, with the tag
+passed as a str or an int alike. This follows the shape IDA's own shipped
+example proves works (`python/examples/decompiler/vds3.py`). Every write is
+verified by reading it back, so a save that stores nothing reports failure
+instead of success.
+
 ## Linking nodes to code
 
 Two mechanisms, no custom syntax:
 
-1. **Automatic.** A node whose label matches a symbol name in the IDB links
-   itself. Since generated flowcharts usually label steps with the real callee
-   names, most nodes link with no annotation at all.
+1. **Automatic**, by a cascade over the label: the whole label, then each of
+   its lines, then individual identifier tokens within it. That is what makes
+   `Install IRP_MJ_CREATE<br/>DispatchCreate` reach `DispatchCreate` on line
+   two. Since generated flowcharts label steps with the real callee names,
+   most nodes link with no annotation at all.
+
+   A single-token match is the weakest evidence here, so it is fenced in: the
+   token must be at least 5 characters, must not be one of the verbs and nouns
+   every flowchart is built from (`install`, `register`, `process`, ...), and
+   **must name a function start**. Without that last rule, `Register
+   process-handle filter / Altitude 321500` links to a global called
+   `Altitude`. An exact label or line may still resolve to data -- that is a
+   deliberate choice by whoever wrote it.
 2. **Explicit**, via Mermaid's own `click` directive — so the source still
    renders unchanged in mermaid.live or any Markdown viewer:
 
@@ -65,7 +87,10 @@ A **name is preferred over a raw address**: an address dies the moment the IDB
 is rebased, whereas a name that stops resolving simply leaves the node
 unlinked, which is a visible signal rather than a silent wrong jump.
 
-Linked nodes are tinted green and carry their address as a second line.
+Linked nodes are tinted green and carry their address as a second line. The
+hover hint says *how* a node matched -- `matched by label 'DispatchCreate'`
+versus `matched by token 'ProtectionWorkerThread' in the label` -- so a wrong
+link is legible rather than mysterious.
 
 ## Supported syntax
 
