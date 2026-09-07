@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python tools/check.py:*)",
+      "Bash(python tools/ida_api_lint.py:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "PowerShell(python tools/check.py:*)",
+      "PowerShell(python tools/ida_api_lint.py:*)"
+    ]
+  }
+}

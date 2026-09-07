@@ -1,0 +1,11 @@
+{
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "Skeleton",
+    "entryPoint": "skeleton_plugin.py",
+    "idaVersions": ">=9.0",
+    "version": "0.1.0",
+    "description": "Skeleton plugin: cancellable batch over selected or all functions.",
+    "categories": ["api-scripting-and-automation"]
+  }
+}
