@@ -31,6 +31,8 @@ import ida_bytes
 import ida_funcs
 import ida_kernwin
 import ida_name
+import ida_nalt
+import ida_segment
 import idautils
 
 from cfs5 import VERSION
@@ -62,8 +64,22 @@ SELECTED_HOTKEY = "Ctrl+Shift+E"
 PROGRESS_EVERY = 10
 
 # Globals named g_* are almost always deliberate even if the user-name flag is
-# not set; whitelist that prefix in addition to the has_user_name gate.
+# not set; whitelist that prefix in addition to the has_user_name gate. It is
+# also what rescues the handful of genuine tier0 globals that arrive as imports.
 _GLOBAL_PREFIX_RE = re.compile(r"^g_")
+
+# A global worth a byte signature lives in a data segment. `.text` only ever
+# yields IDA's own jump tables, and `.pdata`/`.reloc`/`.tls` only loader
+# structures. `.idata` is allowed in so a g_* import can still be rescued.
+_GLOBAL_SEGMENTS = frozenset((".data", ".rdata", ".bss", ".idata"))
+
+# Analyzer- and loader-produced data names that are shaped like plain C
+# identifiers, so the human-name heuristic alone cannot reject them: IDA's jump
+# tables and jump-table defaults, its `funcs_<ea>` pointer arrays, and the PE
+# directory labels the loader plants.
+_AUTO_DATA_RE = re.compile(
+    r"^(jpt_|def_|funcs_)|^(TlsDirectory|TlsIndex|ExceptionDir)$"
+)
 
 # A human's interactive rename is a plain C identifier. Compiler/tool-emitted
 # names are not: MSVC RTTI/vftable/method symbols carry `?@` (e.g.
@@ -178,9 +194,52 @@ def get_all_user_named_function_eas():
     return result
 
 
+def _import_thunk_eas():
+    """Every IAT slot address, across all imported modules.
+
+    IDA sets the user-name flag on import thunks, so without this they dominate
+    the "all globals" export -- measured at 438 of 560 kept names (78%) on cs2
+    client.dll. A byte signature for an import is also strictly worse than the
+    import table a consumer can already read by name.
+    """
+    eas = set()
+
+    def collect(ea, name, ordinal):
+        eas.add(ea)
+        return True
+
+    try:
+        for index in range(ida_nalt.get_import_module_qty()):
+            try:
+                ida_nalt.enum_import_names(index, collect)
+            except Exception as exc:
+                msg("IMPORT_ENUM_FAILED module %d: %s" % (index, exc))
+    except Exception as exc:
+        msg("IMPORT_ENUM_FAILED: %s (imports will not be filtered)" % exc)
+    return eas
+
+
+def _segment_name(ea):
+    try:
+        seg = ida_segment.getseg(ea)
+        if seg is None:
+            return ""
+        return ida_segment.get_segm_name(seg) or ""
+    except Exception:
+        return ""
+
+
 def get_user_global_eas():
-    """Human-named (or g_*) data globals: not code, not a function, not a tail,
-    and a plain identifier rather than a compiler/RTTI/vftable symbol."""
+    """Human-named (or g_*) data globals worth a byte signature.
+
+    The name-shape heuristic alone is not enough: `RegCloseKey` and
+    `jpt_234F55` are both valid plain identifiers and both carry the user-name
+    flag. So location and producer are gated too -- the address must sit in a
+    data segment, must not be an import thunk (unless it is a g_* tier0 global),
+    and must not carry an analyzer/loader-generated data name.
+    """
+    imports = _import_thunk_eas()
+
     result = []
     for ea, name in idautils.Names():
         if not name:
@@ -190,9 +249,18 @@ def get_user_global_eas():
             continue
         if ida_funcs.get_func(ea) is not None:
             continue
-        if not (ida_bytes.has_user_name(flags) or _GLOBAL_PREFIX_RE.match(name)):
+        is_prefixed = bool(_GLOBAL_PREFIX_RE.match(name))
+        if not (ida_bytes.has_user_name(flags) or is_prefixed):
             continue
         if not _is_human_named(name):
+            continue
+        if _AUTO_DATA_RE.match(name):
+            continue
+        if _segment_name(ea) not in _GLOBAL_SEGMENTS:
+            continue
+        # An import is resolvable by name from the import table; only a
+        # deliberately g_*-named one (tier0's exported globals) earns a slot.
+        if ea in imports and not is_prefixed:
             continue
         result.append(ea)
     return sorted(set(result))

@@ -79,6 +79,19 @@ Types move as **binary `tinfo_t`**, never C source.
 - Export: `build_local_type_index` → `export_type_payload(tif, …)` walks referenced ordinals, computes the transitive closure, `materialize_full_definition` (typeref → concrete detached UDT/enum via `get_*_details` + `create_*`), rewrites ordinals→names (`replace_ordinal_typerefs`), `serialize(SUDT_FAST)`. `export_type_payload` is shared by functions (`get_function_export_tinfo`) and globals (`get_global_export_tinfo`); the shared `exported_types` dict dedups across both. Invariant: a real struct exports its **full body**, not `struct Foo;`.
 - Import: `register_missing_types` is non-destructive/multi-pass — existing full type immutable, existing forward upgradable, missing type gets a forward placeholder then its body. Function prototype merge (`merge_function_tinfos`/`type_specificity`) is field-by-field; global types are applied unless the destination already has a user/more-specific type.
 
+## Global discovery is gated on location, not just name shape
+
+`get_user_global_eas()` cannot rely on `has_user_name` + a plain-identifier
+test: IDA sets that flag on **import thunks** and on its own **`jpt_*` jump
+tables**, and `RegCloseKey` / `jpt_234F55` are both valid C identifiers. Measured
+on cs2 `client.dll`, the name-shape filter alone kept 560 addresses of which 438
+(78%) were `.idata` IAT slots and 69 were jump tables — 8% signal. So the
+predicate also requires a data segment (`_GLOBAL_SEGMENTS`), rejects import
+thunks unless the name is `g_*` (tier0 exports its globals), and rejects
+analyzer/loader data names (`_AUTO_DATA_RE`). That yields 47, all genuine. Do
+not loosen these back to a pure name test. The *selected*-globals action
+deliberately bypasses the whole heuristic — the user picked those explicitly.
+
 ## Conventions
 
 - Nearly every IDA call is wrapped in `try/except` with an `msg(...)` diagnostic — IDA's Python bindings raise inconsistently across type shapes. Match this; one unhandled exception aborts a whole export/import loop.

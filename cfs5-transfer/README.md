@@ -51,6 +51,14 @@ prototypes/types + dependent local types.
   the Names window). Explicitly selected items skip the human-name heuristic.
 - *Export ALL user-named globals* — every user global, **no functions**.
 
+"User global" is gated on location as well as name shape, because IDA sets the
+user-name flag on import thunks and on its own jump tables, and both are shaped
+like plain C identifiers. A global must sit in a data segment, must not be an
+import thunk (unless it is `g_*`, which rescues tier0's exported globals), and
+must not carry an analyzer/loader name (`jpt_`, `def_`, `funcs_`,
+`TlsDirectory`, `TlsIndex`, `ExceptionDir`). On cs2 `client.dll` this is the
+difference between 560 candidates (78% of them IAT slots) and 47 real globals.
+
 Each action asks for an output `.cfs` path. So you can export functions only,
 globals only, a hand-picked subset of either, or everything.
 
