@@ -100,3 +100,61 @@ IDB or crashes IDA.
   and even `nullsub_N` stubs all set it. If you need real user renames, filter
   further — `cfs5-transfer/cvutils-cfs-exporter.py` has a worked example
   (plain-C-identifier gate + exclusion regex + demangle backstop).
+
+## UI traps that cost real debugging time
+
+All of these were hit while building `cfs5-transfer`. They are cheap to avoid
+and expensive to diagnose, because each one fails *silently* or with a message
+that points at the wrong thing.
+
+- **`Choose` callbacks return a flat `[change_flag, line, line, ...]`.** The
+  stub docstrings say "a tuple (changed, selection)" and that is wrong:
+  returning the selection nested gives `ValueError: Sequence item #1 cannot be
+  converted`. Invisible in a single-select chooser (where `sel` is an int that
+  happens to convert) and fatal the moment you add `CH_MULTI`, where `sel` is a
+  `sizevec_t`. Same trap in `adjust_last_item(n)` — it evaluates `n >= cnt`, so
+  pass **one line number**, never the selection.
+- **Don't overload `CH_CAN_EDIT`/`OnEditLine` for a custom action.** IDA's Edit
+  is single-item by nature and has no documented shortcut. Use
+  `Choose.AddCommand(caption, shortcut=...)` + `OnCommand(n, cmd_id)` — but note
+  IDA calls `OnCommand` **once per selected row**, so a whole-selection action
+  (an export, a summary) must not live there.
+- **`Choose.OnPopup` runs at `populating_widget_popup` time**, which is too
+  early for `attach_action_to_popup` to stick. Attach registered actions from
+  your own `UI_Hooks.finish_populating_widget_popup` instead. A custom chooser
+  has no distinctive `widget_type`, so match it by `get_widget_title`.
+- **Read the Local Types selection from `action_ctx_base_t.type_ref`**
+  (a `til_type_ref_t`, carrying `.tif` and `.ordinal`), not by parsing chooser
+  columns. There are no type ordinals on the context, which misleads you toward
+  `get_chooser_data`; that depends on column order and on the view not printing
+  a `struct` keyword.
+- **`PLUGIN_HIDE` keeps a plugin out of the Plugins list entirely.** Fine for a
+  pure right-click plugin, wrong the moment `run()` does something useful.
+- **Never make a UI action dead-end.** If the context yields nothing, fall back
+  to a picker (`ida_kernwin.choose_struct`, `ida_typeinf.choose_named_type`)
+  rather than warning the user to do what they just did. And when a lookup can
+  fail for several reasons, report *which* — a single generic warning covering
+  three causes is the bug that hides the other two.
+- **Wait boxes nest as a stack.** `show_wait_box` pushes, `hide_wait_box` pops,
+  so nested scans are fine *provided the calls are balanced* — always pair them
+  with `try/finally`.
+
+## Caching rules for expensive analysis
+
+- **Never cache a cancelled or failed result.** A wait-boxed scan that the user
+  cancels must not be memoized, or a transient interruption becomes a permanent
+  wrong answer for the rest of the session.
+- **Build the thing before computing its cache key.** If the key includes state
+  that the build itself initializes (a "database generation" token that starts
+  as `None`), keying beforehand files the result under a key no later call can
+  reproduce — so the cache either never hits or hits only in the failure case.
+- **A cache hit should log.** A silent hit is indistinguishable from "the code
+  never ran", which is exactly the ambiguity you will be debugging.
+
+## Sentinels are not `None`
+
+`BADADDR` and a `-1` operand index are *values*. If a model tests `is None` to
+mean "absent", passing a sentinel stores it as real data: it renders as
+`BADADDR` in the UI and gets fed downstream as a genuine address. Normalize
+sentinels to `None` **inside the model's constructor**, not at each call site —
+records written before the fix then repair themselves on load.

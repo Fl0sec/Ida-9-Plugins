@@ -103,6 +103,31 @@ Rules that make this work:
   (`[MYPLUGIN] ...`). With no in-IDA test harness these are the primary
   debugging channel — be generous and specific with them.
 
+## UI, caching and sentinels — read before touching a `Choose` or an action
+
+These are the repo's scar tissue. Each one fails *silently* or blames the wrong
+thing, so re-deriving them costs an in-IDA debugging round trip every time. Full
+detail with the stub evidence is in
+[docs/ida9-api.md](docs/ida9-api.md#ui-traps-that-cost-real-debugging-time).
+
+- **`Choose` callbacks return a flat `[flag, line, ...]`, not `(flag, selection)`** —
+  despite what the stub docstrings say. Nesting the selection raises
+  `ValueError: Sequence item #1 cannot be converted`, and it only shows up once
+  you add `CH_MULTI`. Same for `adjust_last_item(n)`: pass one line number.
+- **Custom chooser actions go through `AddCommand` + `OnCommand`**, never by
+  hijacking `CH_CAN_EDIT`. `OnCommand` fires **once per selected row**, so
+  whole-selection work does not belong in it.
+- **Attach actions in `UI_Hooks.finish_populating_widget_popup`**, not in
+  `Choose.OnPopup` (which IDA drives too early for them to stick).
+- **A UI action must never dead-end.** No context → open a picker, don't warn
+  the user to do what they just did. And when a lookup can fail three ways, say
+  *which* — one generic message hides the other two causes.
+- **Never cache a cancelled or failed scan**, build the value *before* computing
+  its cache key (or the key is stale on the very first call), and **log cache
+  hits** so a hit is distinguishable from "never ran".
+- **`BADADDR`/`-1` are values, not `None`.** Normalize sentinels to `None` in the
+  model's constructor so already-stored records repair themselves on load.
+
 ## Verification: what you can prove offline
 
 Run before every commit, and after every non-trivial edit:
