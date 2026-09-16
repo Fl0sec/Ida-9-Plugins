@@ -1,4 +1,4 @@
-# CFS5 Exporter for IDA Pro 9.0 / IDAPython 9.0
+# CFS6 Exporter for IDA Pro 9.0 / IDAPython 9.0
 #
 # Fast name/type-transfer signatures for large binaries. Exports user-named
 # functions AND user-named global variables to a portable .cfs file:
@@ -24,7 +24,6 @@ if _HERE not in sys.path:
 for _modname in [n for n in list(sys.modules) if n == "cfs5" or n.startswith("cfs5.")]:
     del sys.modules[_modname]
 
-import csv
 import re
 
 import idaapi
@@ -35,9 +34,10 @@ import ida_name
 import idautils
 
 from cfs5 import VERSION
-from cfs5 import cfsfile
-from cfs5.common import (
-    BADADDR, ea_str, get_search_ranges, msg, pack_bytes, pack_json, safe_name,
+from cfs5 import cfs6
+from cfs5.common import BADADDR, ea_str, get_search_ranges, msg, safe_name
+from cfs5.image import (
+    BodyOwnership, describe_image, detect_build, get_imagebase, open_image_view,
 )
 from cfs5.sigs import choose_function_candidates, choose_global_candidates
 from cfs5.typeio import (
@@ -50,7 +50,7 @@ from cfs5.typeio import (
 )
 
 
-PLUGIN_NAME = "CFS5 Exporter (IDA 9)"
+PLUGIN_NAME = "CFS6 Exporter (IDA 9)"
 # Functions window actions.
 ACTION_SEL_FUNCS = "cfs5:export_sel_funcs"
 ACTION_ALL_FUNCS = "cfs5:export_all_funcs"
@@ -270,6 +270,11 @@ class _ExportState:
         self.user_prototypes = 0
         self.guessed_prototypes = 0
         self.mode_counts = {"ENTRY": 0, "BODY": 0, "REL": 0}
+        # How many items got 1, 2, 3, 4 candidates -- the diversity metric.
+        self.candidate_counts = {}
+        # BODY candidates a .pdata-based consumer cannot resolve.
+        self.ida_only_bodies = 0
+        self.ownership = None
 
 
 def _write_function(writer, state, func_ea, ranges):
@@ -279,7 +284,9 @@ def _write_function(writer, state, func_ea, ranges):
         return None
 
     try:
-        candidates, xref_count, xrefs_tested = choose_function_candidates(func_ea, ranges)
+        candidates, coverage, xref_count, xrefs_tested = choose_function_candidates(
+            func_ea, ranges, ownership=state.ownership
+        )
     except Exception as exc:
         state.failures += 1
         msg("FAIL %-45s @ %s error=%s" % (name, ea_str(func_ea), exc))
@@ -290,7 +297,18 @@ def _write_function(writer, state, func_ea, ranges):
         msg("NO_UNIQUE_CANDIDATE %-31s @ %s" % (name, ea_str(func_ea)))
         return None
 
-    group_id = state.functions
+    item_id = writer.write_item(
+        cfs6.REC_FUNCTION, name, len(candidates), coverage
+    )
+    for rank, cand in enumerate(candidates):
+        writer.write_candidate(item_id, rank, cand)
+        state.function_candidates += 1
+        state.mode_counts[cand.mode] = state.mode_counts.get(cand.mode, 0) + 1
+        if cand.mode == "BODY" and cand.ownership != "pdata":
+            state.ida_only_bodies += 1
+    state.candidate_counts[len(candidates)] = (
+        state.candidate_counts.get(len(candidates), 0) + 1
+    )
 
     quality, prototype_raw, deps = "NONE", None, []
     try:
@@ -306,31 +324,23 @@ def _write_function(writer, state, func_ea, ranges):
         quality, prototype_raw, deps = "NONE", None, []
         msg("TYPE_EXPORT_FAIL %-36s @ %s error=%s" % (name, ea_str(func_ea), exc))
 
-    proto = prototype_raw if prototype_raw is not None else (None, None, None)
-    writer.writerow(cfsfile.meta_row(
-        group_id, name, quality,
-        pack_bytes(proto[0]), pack_bytes(proto[1]), pack_bytes(proto[2]),
-        pack_json(deps), is_global=False,
-    ))
     if prototype_raw is not None:
+        writer.write_item_type(
+            item_id, name, quality, prototype_raw, deps, is_global=False
+        )
         state.function_prototypes += 1
         if quality == "USER":
             state.user_prototypes += 1
         elif quality == "GUESSED":
             state.guessed_prototypes += 1
 
-    for rank, c in enumerate(candidates):
-        writer.writerow(cfsfile.signature_row(group_id, rank, name, c, is_global=False))
-        state.function_candidates += 1
-        state.mode_counts[c.mode] = state.mode_counts.get(c.mode, 0) + 1
-
     primary = candidates[0]
     xref_note = " xrefs=%d tested=%d" % (xref_count, xrefs_tested) if xref_count else ""
     type_note = " type=%s deps=%d" % (quality, len(deps)) if prototype_raw is not None else ""
     msg(
-        "EXPORTED %-39s mode=%s bytes=%d exact=%d backup=%d%s%s"
-        % (name, primary.mode, primary.byte_len, primary.exact,
-           max(0, len(candidates) - 1), xref_note, type_note)
+        "EXPORTED %-39s n=%d modes=%s bytes=%d exact=%d%s%s"
+        % (name, len(candidates), "/".join(c.mode for c in candidates),
+           primary.byte_len, primary.exact, xref_note, type_note)
     )
     state.functions += 1
     return name
@@ -343,7 +353,9 @@ def _write_global(writer, state, global_ea, ranges):
         return None
 
     try:
-        candidates, xref_count, xrefs_tested = choose_global_candidates(global_ea, ranges)
+        candidates, coverage, xref_count, xrefs_tested = choose_global_candidates(
+            global_ea, ranges
+        )
     except Exception as exc:
         state.failures += 1
         msg("GLOB_FAIL %-40s @ %s error=%s" % (name, ea_str(global_ea), exc))
@@ -354,7 +366,11 @@ def _write_global(writer, state, global_ea, ranges):
         msg("GLOB_NO_XREF_ANCHOR %-31s @ %s" % (name, ea_str(global_ea)))
         return None
 
-    group_id = state.globals
+    item_id = writer.write_item(cfs6.REC_GLOBAL, name, len(candidates), coverage)
+    for rank, cand in enumerate(candidates):
+        writer.write_candidate(item_id, rank, cand)
+        state.global_candidates += 1
+        state.mode_counts[cand.mode] = state.mode_counts.get(cand.mode, 0) + 1
 
     quality, type_raw, deps = "NONE", None, []
     try:
@@ -370,28 +386,66 @@ def _write_global(writer, state, global_ea, ranges):
         quality, type_raw, deps = "NONE", None, []
         msg("GLOB_TYPE_FAIL %-35s @ %s error=%s" % (name, ea_str(global_ea), exc))
 
-    payload = type_raw if type_raw is not None else (None, None, None)
-    writer.writerow(cfsfile.meta_row(
-        group_id, name, quality,
-        pack_bytes(payload[0]), pack_bytes(payload[1]), pack_bytes(payload[2]),
-        pack_json(deps), is_global=True,
-    ))
     if type_raw is not None:
+        writer.write_item_type(
+            item_id, name, quality, type_raw, deps, is_global=True
+        )
         state.global_types += 1
-
-    for rank, c in enumerate(candidates):
-        writer.writerow(cfsfile.signature_row(group_id, rank, name, c, is_global=True))
-        state.global_candidates += 1
 
     primary = candidates[0]
     xref_note = " xrefs=%d tested=%d" % (xref_count, xrefs_tested) if xref_count else ""
     type_note = " type=%s deps=%d" % (quality, len(deps)) if type_raw is not None else ""
     msg(
-        "GLOB_EXPORTED %-34s bytes=%d exact=%d%s%s"
-        % (name, primary.byte_len, primary.exact, xref_note, type_note)
+        "GLOB_EXPORTED %-34s n=%d bytes=%d exact=%d%s%s"
+        % (name, len(candidates), primary.byte_len, primary.exact,
+           xref_note, type_note)
     )
     state.globals += 1
     return name
+
+
+# Remembered for the rest of the session so a multi-part export of one IDB
+# cannot end up with disagreeing build numbers across its files.
+_CONFIRMED_BUILD = {"number": None, "source": None}
+
+
+def _ask_build_number():
+    """(number_or_None, source) -- detected from the path, confirmed by the user.
+
+    A build number is never invented: an unparseable or empty answer is stored
+    as null with source "unknown".
+    """
+    if _CONFIRMED_BUILD["source"] is not None:
+        return _CONFIRMED_BUILD["number"], _CONFIRMED_BUILD["source"]
+
+    detected, detected_source = detect_build()
+    default = "" if detected is None else str(detected)
+    answer = ida_kernwin.ask_str(
+        default, 0,
+        "Build number for this image (blank = unknown):"
+    )
+
+    if answer is None:
+        # Cancelled prompt: fall back to whatever the path said, if anything.
+        number, source = detected, detected_source
+    else:
+        answer = answer.strip()
+        if not answer:
+            number, source = None, "unknown"
+        elif answer.isdigit():
+            number = int(answer)
+            source = (
+                "path-confirmed"
+                if detected is not None and number == detected else "user"
+            )
+        else:
+            msg("BUILD_IGNORED: %r is not a number; recording build as unknown"
+                % answer)
+            number, source = None, "unknown"
+
+    _CONFIRMED_BUILD["number"] = number
+    _CONFIRMED_BUILD["source"] = source
+    return number, source
 
 
 def export_items(function_eas, global_eas, title):
@@ -409,12 +463,33 @@ def export_items(function_eas, global_eas, title):
     if not path.lower().endswith(".cfs"):
         path += ".cfs"
 
+    # Open the PE view once: the header identity and the .pdata ownership
+    # index both come from it, so they can never describe different images.
+    imagebase = get_imagebase()
+    view, view_source = open_image_view()
+    image, image_notes = describe_image(view, view_source)
+    for note in image_notes:
+        msg("IMAGE_NOTE: %s" % note)
+
+    build_number, build_source = _ask_build_number()
+    msg(
+        "SOURCE image=%s arch=%s size=%s build=%s (%s) imagebase=%s headers=%s"
+        % (image.get("name"), image.get("architecture"),
+           image.get("size_of_image"),
+           "unknown" if build_number is None else build_number,
+           build_source, ea_str(imagebase), view_source)
+    )
+
     ranges = get_search_ranges()
     if not ranges:
         ida_kernwin.warning("No executable/code search ranges found.")
         return False
 
     state = _ExportState()
+    state.ownership = BodyOwnership.for_current_idb(view, imagebase)
+    if state.ownership.available:
+        msg("PDATA: %d runtime functions (source=%s)"
+            % (state.ownership.index.count, state.ownership.source))
     try:
         state.local_type_index = build_local_type_index()
     except Exception as exc:
@@ -425,18 +500,14 @@ def export_items(function_eas, global_eas, title):
 
     ida_kernwin.clr_cancelled()
     ida_kernwin.show_wait_box(
-        "NODELAY\nBuilding optimized CFS5 signatures + binary types...\n"
+        "NODELAY\nBuilding optimized CFS6 signatures + binary types...\n"
         "Press Cancel to stop."
     )
 
     try:
         with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f, lineterminator="\n")
-            f.write("# CFS5 %s\n" % VERSION)
-            f.write("# CFS2 / CFS2G signature rows retained for backwards compatibility.\n")
-            f.write("# CFS4FUNC / CFS5GLOB,group_id,name,quality,type,fields,fldcmts,deps\n")
-            f.write("# CFS4TYPE,name,kind,type,fields,fldcmts (full materialized bodies)\n")
-            f.write("# binary payloads are zlib+base64; deps payload is compressed JSON\n")
+            writer = cfs6.Cfs6Writer(f, imagebase=imagebase)
+            writer.write_header(image, build_number, build_source)
 
             done = 0
             cancelled = False
@@ -447,7 +518,7 @@ def export_items(function_eas, global_eas, title):
                 done += 1
                 if done == 1 or done == total or done % PROGRESS_EVERY == 0:
                     ida_kernwin.replace_wait_box(
-                        "Building CFS5 signatures + types...\n%d / %d\n"
+                        "Building CFS6 signatures + types...\n%d / %d\n"
                         "Functions: %d  Globals: %d  Types: %d  No anchor: %d"
                         % (done, total, state.functions, state.globals,
                            len(state.exported_types), state.no_candidate)
@@ -462,7 +533,7 @@ def export_items(function_eas, global_eas, title):
                     done += 1
                     if done == 1 or done == total or done % PROGRESS_EVERY == 0:
                         ida_kernwin.replace_wait_box(
-                            "Building CFS5 signatures + types...\n%d / %d\n"
+                            "Building CFS6 signatures + types...\n%d / %d\n"
                             "Functions: %d  Globals: %d  Types: %d  No anchor: %d"
                             % (done, total, state.functions, state.globals,
                                len(state.exported_types), state.no_candidate)
@@ -477,42 +548,49 @@ def export_items(function_eas, global_eas, title):
             # safe multi-pass registration.
             for type_name in sorted(state.exported_types):
                 info = state.exported_types[type_name]
-                type_blob, fields_blob, cmts_blob = info["raw"]
-                writer.writerow(cfsfile.type_row(
-                    info["name"], info["kind"],
-                    pack_bytes(type_blob), pack_bytes(fields_blob), pack_bytes(cmts_blob),
-                ))
+                writer.write_local_type(info["name"], info["kind"], info["raw"])
 
     except OSError as exc:
-        ida_kernwin.warning("Unable to write CFS5 file:\n%s" % exc)
+        ida_kernwin.warning("Unable to write CFS6 file:\n%s" % exc)
         return False
     finally:
         ida_kernwin.hide_wait_box()
         ida_kernwin.clr_cancelled()
 
+    spread = " ".join(
+        "%dx%d" % (count, n)
+        for n, count in sorted(state.candidate_counts.items())
+    ) or "none"
+
     summary = (
-        "CFS5 export complete\n\n"
+        "CFS6 export complete\n\n"
         "Functions exported: %d\n"
-        "Function candidate rows: %d\n"
+        "Function candidates: %d\n"
+        "  Candidates per function: %s\n"
         "Function prototypes: %d\n"
         "  User prototypes: %d\n"
         "  Guessed prototypes: %d\n"
         "Globals exported: %d\n"
-        "Global candidate rows: %d\n"
+        "Global candidates: %d\n"
         "Global types: %d\n"
         "Local type definitions: %d\n"
         "ENTRY / BODY / REL candidates: %d / %d / %d\n"
+        "  BODY not resolvable from .pdata (IDA-only): %d\n"
         "No unique candidate / no anchor: %d\n"
-        "Failures: %d\n\n"
+        "Failures: %d\n"
+        "Build: %s (%s)\n\n"
         "%s"
         % (
-            state.functions, state.function_candidates, state.function_prototypes,
+            state.functions, state.function_candidates, spread,
+            state.function_prototypes,
             state.user_prototypes, state.guessed_prototypes,
             state.globals, state.global_candidates, state.global_types,
             len(state.exported_types),
             state.mode_counts.get("ENTRY", 0), state.mode_counts.get("BODY", 0),
-            state.mode_counts.get("REL", 0),
-            state.no_candidate, state.failures, path,
+            state.mode_counts.get("REL", 0), state.ida_only_bodies,
+            state.no_candidate, state.failures,
+            "unknown" if build_number is None else build_number, build_source,
+            path,
         )
     )
     msg(summary.replace("\n", " | "))
@@ -538,7 +616,7 @@ class ExportSelFuncsHandler(ida_kernwin.action_handler_t):
         if not eas:
             ida_kernwin.warning("No functions selected.")
             return 1
-        export_items(eas, [], "Export selected functions to CFS5")
+        export_items(eas, [], "Export selected functions to CFS6")
         return 1
 
     def update(self, ctx):
@@ -553,10 +631,10 @@ class ExportAllFuncsHandler(ida_kernwin.action_handler_t):
             return 1
         if ida_kernwin.ask_yn(
             ida_kernwin.ASKBTN_YES,
-            "Export %d user-named functions (no globals) to CFS5?" % len(eas),
+            "Export %d user-named functions (no globals) to CFS6?" % len(eas),
         ) != ida_kernwin.ASKBTN_YES:
             return 1
-        export_items(eas, [], "Export ALL user-named functions to CFS5")
+        export_items(eas, [], "Export ALL user-named functions to CFS6")
         return 1
 
     def update(self, ctx):
@@ -572,11 +650,11 @@ class ExportAllBothHandler(ida_kernwin.action_handler_t):
             return 1
         if ida_kernwin.ask_yn(
             ida_kernwin.ASKBTN_YES,
-            "Export %d user-named functions and %d user-named globals to CFS5?"
+            "Export %d user-named functions and %d user-named globals to CFS6?"
             % (len(funcs), len(globs)),
         ) != ida_kernwin.ASKBTN_YES:
             return 1
-        export_items(funcs, globs, "Export ALL user functions + globals to CFS5")
+        export_items(funcs, globs, "Export ALL user functions + globals to CFS6")
         return 1
 
     def update(self, ctx):
@@ -591,7 +669,7 @@ class ExportSelGlobalsHandler(ida_kernwin.action_handler_t):
         if not eas:
             ida_kernwin.warning("No data globals selected in the Names window.")
             return 1
-        export_items([], eas, "Export selected globals to CFS5")
+        export_items([], eas, "Export selected globals to CFS6")
         return 1
 
     def update(self, ctx):
@@ -606,10 +684,10 @@ class ExportAllGlobalsHandler(ida_kernwin.action_handler_t):
             return 1
         if ida_kernwin.ask_yn(
             ida_kernwin.ASKBTN_YES,
-            "Export %d user-named globals (no functions) to CFS5?" % len(globs),
+            "Export %d user-named globals (no functions) to CFS6?" % len(globs),
         ) != ida_kernwin.ASKBTN_YES:
             return 1
-        export_items([], globs, "Export ALL user-named globals to CFS5")
+        export_items([], globs, "Export ALL user-named globals to CFS6")
         return 1
 
     def update(self, ctx):
@@ -621,27 +699,27 @@ class Hooks(ida_kernwin.UI_Hooks):
         wt = ida_kernwin.get_widget_type(widget)
         if wt == ida_kernwin.BWN_FUNCS:
             for aid in (ACTION_SEL_FUNCS, ACTION_ALL_FUNCS, ACTION_ALL_BOTH):
-                ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS5/")
+                ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS6/")
         elif wt == ida_kernwin.BWN_NAMES:
             for aid in (ACTION_SEL_GLOBALS, ACTION_ALL_GLOBALS):
-                ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS5/")
+                ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS6/")
 
 
 # (action_id, label, handler_factory, hotkey, tooltip)
 _ACTIONS = [
-    (ACTION_SEL_FUNCS, "Export selected functions to CFS5",
+    (ACTION_SEL_FUNCS, "Export selected functions to CFS6",
      ExportSelFuncsHandler, SELECTED_HOTKEY,
      "Export the functions selected in the Functions window"),
-    (ACTION_ALL_FUNCS, "Export ALL user-named functions to CFS5",
+    (ACTION_ALL_FUNCS, "Export ALL user-named functions to CFS6",
      ExportAllFuncsHandler, None,
      "Export every user-named function (no globals)"),
-    (ACTION_ALL_BOTH, "Export ALL user functions + globals to CFS5",
+    (ACTION_ALL_BOTH, "Export ALL user functions + globals to CFS6",
      ExportAllBothHandler, None,
      "Export every user-named function and global"),
-    (ACTION_SEL_GLOBALS, "Export selected globals to CFS5",
+    (ACTION_SEL_GLOBALS, "Export selected globals to CFS6",
      ExportSelGlobalsHandler, None,
      "Export the globals selected in the Names window"),
-    (ACTION_ALL_GLOBALS, "Export ALL user-named globals to CFS5",
+    (ACTION_ALL_GLOBALS, "Export ALL user-named globals to CFS6",
      ExportAllGlobalsHandler, None,
      "Export every user-named global (no functions)"),
 ]
@@ -649,10 +727,10 @@ _ACTIONS = [
 
 class CFS5ExporterPlugin(idaapi.plugin_t):
     flags = idaapi.PLUGIN_PROC | idaapi.PLUGIN_HIDE
-    comment = "Optimized CFS5 signature + type exporter for IDA 9 (functions + globals)"
+    comment = "CFS6 signature + type exporter for IDA 9 (functions + globals)"
     help = (
-        "Functions window -> right click -> CFS5 (functions). "
-        "Names window -> right click -> CFS5 (globals). Exports short unique "
+        "Functions window -> right click -> CFS6 (functions). "
+        "Names window -> right click -> CFS6 (globals). Exports short unique "
         "ENTRY/BODY/REL function signatures, REL-anchored global signatures, "
         "and function/global/local types."
     )
@@ -679,8 +757,8 @@ class CFS5ExporterPlugin(idaapi.plugin_t):
 
     def run(self, arg):
         ida_kernwin.info(
-            "Functions window -> right-click -> CFS5 (functions).\n"
-            "Names window -> right-click -> CFS5 (globals)."
+            "Functions window -> right-click -> CFS6 (functions).\n"
+            "Names window -> right-click -> CFS6 (globals)."
         )
 
     def term(self):

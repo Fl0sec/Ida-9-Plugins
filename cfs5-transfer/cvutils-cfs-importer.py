@@ -1,4 +1,4 @@
-# CFS5 Importer for IDA Pro 9.0 / IDAPython 9.0
+# CFS6 Importer for IDA Pro 9.0 / IDAPython 9.0
 #
 # Imports a .cfs file into the current IDB:
 #   * resolves each function via its ranked ENTRY/BODY/REL signatures, renames
@@ -7,9 +7,11 @@
 #     and applies its transported type;
 #   * registers missing named Local Types (multi-pass, non-destructive).
 #
-# Accepts CFS5, CFS4, CFS3, CFS2 and legacy Cra0 rows. Shared machinery lives
-# in the importable `cfs5` package; this file is resolution/apply orchestration
-# and the IDA plugin/UI glue.
+# Reads CFS6 (UTF-8 JSONL) only; pre-CFS6 CSV files are rejected with a clear
+# re-export message. Every candidate of an item is evaluated, not just the
+# first that resolves: agreement is evidence and disagreement is a conflict.
+# Shared machinery lives in the importable `cfs5` package; this file is
+# resolution/apply orchestration and the IDA plugin/UI glue.
 #
 # Target: IDA Professional 9.0 / Python 3.12.
 
@@ -33,8 +35,9 @@ import ida_typeinf
 import ida_ua
 
 from cfs5 import VERSION
-from cfs5 import cfsfile
+from cfs5 import cfs6
 from cfs5.common import BADADDR, ea_str, find_up_to_two, get_search_ranges, msg
+from cfs5.image import describe_image
 from cfs5.typeio import (
     deserialize_binary_tinfo,
     function_tinfo_from_meta,
@@ -47,10 +50,10 @@ from cfs5.typeio import (
 )
 
 
-PLUGIN_NAME = "CFS5 Importer (IDA 9)"
+PLUGIN_NAME = "CFS6 Importer (IDA 9)"
 PLUGIN_HOTKEY = "Ctrl+Shift+I"
 ACTION_ID = "cfs5:import_file"
-ACTION_LABEL = "CFS5 / CFS File..."
+ACTION_LABEL = "CFS6 / CFS File..."
 
 CREATE_MISSING_FUNCTIONS = True
 PROGRESS_EVERY = 10
@@ -71,6 +74,10 @@ class Stats:
         self.unsafe = 0
         self.created_functions = 0
         self.fallback_used = 0
+        # Independent candidates disagreed, or two items wanted one address.
+        self.conflicts = 0
+        # Two or more independent candidates agreed on the same target.
+        self.confirmed = 0
 
         # Globals.
         self.glob_groups = 0
@@ -83,6 +90,8 @@ class Stats:
         self.glob_not_found = 0
         self.glob_ambiguous = 0
         self.glob_unsafe = 0
+        self.glob_conflicts = 0
+        self.glob_confirmed = 0
 
         # Types.
         self.types_total = 0
@@ -112,7 +121,7 @@ class Stats:
 
     def summary(self):
         return (
-            "CFS5 import summary\n\n"
+            "CFS6 import summary\n\n"
             "== Functions ==\n"
             "Processed: %d / %d\n"
             "Renamed: %d\n"
@@ -123,6 +132,8 @@ class Stats:
             "Not found: %d\n"
             "Ambiguous: %d\n"
             "Unsafe/unresolvable: %d\n"
+            "Candidate CONFLICTS (not applied): %d\n"
+            "Confirmed by 2+ candidates: %d\n"
             "Functions created: %d\n"
             "Fallback candidate used: %d\n\n"
             "== Globals ==\n"
@@ -134,7 +145,9 @@ class Stats:
             "Name conflicts: %d\n"
             "Not found: %d\n"
             "Ambiguous: %d\n"
-            "Unsafe/unresolvable: %d\n\n"
+            "Unsafe/unresolvable: %d\n"
+            "Candidate CONFLICTS (not applied): %d\n"
+            "Confirmed by 2+ candidates: %d\n\n"
             "== Types ==\n"
             "Transported named types: %d\n"
             "Types already present (kept): %d\n"
@@ -153,12 +166,13 @@ class Stats:
                 self.processed, self.groups, self.renamed,
                 self.already_named_global, self.already_same,
                 self.skipped_named, self.name_conflicts, self.not_found,
-                self.ambiguous, self.unsafe, self.created_functions,
-                self.fallback_used,
+                self.ambiguous, self.unsafe, self.conflicts, self.confirmed,
+                self.created_functions, self.fallback_used,
                 self.glob_processed, self.glob_groups, self.glob_renamed,
                 self.glob_already_named, self.glob_already_same,
                 self.glob_skipped_named, self.glob_name_conflicts,
                 self.glob_not_found, self.glob_ambiguous, self.glob_unsafe,
+                self.glob_conflicts, self.glob_confirmed,
                 self.types_total, self.types_existing,
                 self.types_registered, self.types_failed,
                 self.func_types_present, self.func_types_applied,
@@ -230,10 +244,21 @@ def resolve_candidate(rec, match_ea):
         owner = ida_funcs.get_func(match_ea)
         if owner is None:
             return "unsafe", BADADDR, "BODY match is not inside an IDA function"
+        # Mirror the ownership rule a non-IDA consumer applies against .pdata:
+        # the recorded body_offset must land exactly on the owning function's
+        # start, so a hit that drifted into a neighbouring function is rejected
+        # rather than silently attributed to it.
+        expected_start = match_ea - rec.body_offset
+        if owner.start_ea != expected_start:
+            return (
+                "unsafe", BADADDR,
+                "BODY owner mismatch (body_offset implies %s, IDA owner starts "
+                "at %s)" % (ea_str(expected_start), ea_str(owner.start_ea))
+            )
         return "ok", owner.start_ea, "body-owner"
 
     if rec.mode == "REL":
-        insn_ea = match_ea + rec.insn_offset
+        insn_ea = match_ea + rec.instruction_offset
         insn = ida_ua.insn_t()
         if ida_ua.decode_insn(insn, insn_ea) <= 0 or insn.size <= 0:
             return "unsafe", BADADDR, "REL xref instruction does not decode"
@@ -246,11 +271,12 @@ def resolve_candidate(rec, match_ea):
                 % (ea_str(expected_end), ea_str(insn_ea + insn.size))
             )
 
-        field_ea = match_ea + rec.rel_offset
-        if not (insn_ea <= field_ea and field_ea + rec.rel_size <= insn_ea + insn.size):
+        field_ea = match_ea + rec.displacement_offset
+        width = rec.displacement_size
+        if not (insn_ea <= field_ea and field_ea + width <= insn_ea + insn.size):
             return "unsafe", BADADDR, "REL field lies outside decoded instruction"
 
-        disp = _read_signed(field_ea, rec.rel_size)
+        disp = _read_signed(field_ea, width)
         if disp is None:
             return "unsafe", BADADDR, "REL displacement bytes unavailable"
 
@@ -262,7 +288,7 @@ def resolve_candidate(rec, match_ea):
             if not _target_is_mapped_codeish(target):
                 return "unsafe", BADADDR, "REL target %s is not mapped code" % ea_str(target)
 
-        return "ok", target, "rel%d" % (rec.rel_size * 8)
+        return "ok", target, "rel%d" % (width * 8)
 
     return "unsafe", BADADDR, "unsupported mode %s" % rec.mode
 
@@ -296,10 +322,10 @@ def _ensure_function_start(target_ea, allow_create=True):
 def _find_unique_target(rec, ranges, match_cache):
     """Resolve one record to (status, target_ea, detail). status in
     {'ok','not-found','ambiguous','unsafe'}."""
-    matches = match_cache.get(rec.signature)
+    matches = match_cache.get(rec.pattern)
     if matches is None:
-        matches = find_up_to_two(rec.signature, ranges)
-        match_cache[rec.signature] = matches
+        matches = find_up_to_two(rec.pattern, ranges)
+        match_cache[rec.pattern] = matches
 
     if len(matches) == 0:
         return "not-found", BADADDR, "no match"
@@ -456,6 +482,54 @@ def apply_global_type_safe(ea, meta, stats):
 # Group resolution + rename
 # ---------------------------------------------------------------------------
 
+def _evaluate_candidates(name, records, ranges, match_cache, prefix):
+    """Resolve **every** candidate of one item, not just the first that works.
+
+    Independent candidates are the whole point of the format: agreement between
+    them is evidence, and disagreement is a conflict that must be surfaced
+    rather than silently decided by rank order.
+
+    Returns (resolved, saw) where resolved is [(rec, target_ea, detail), ...] in
+    rank order and saw records which failure kinds were observed.
+    """
+    resolved = []
+    saw = {"not-found": False, "ambiguous": False, "unsafe": False}
+
+    for rec in records:
+        status, target_ea, detail = _find_unique_target(rec, ranges, match_cache)
+        if status == "ok":
+            resolved.append((rec, target_ea, detail))
+            continue
+
+        saw[status] = True
+        if status == "not-found":
+            msg("%s_NOT_FOUND %-30s rank=%d mode=%s origin=%s"
+                % (prefix, name, rec.rank, rec.mode, rec.origin))
+        elif status == "ambiguous":
+            msg("%s_AMBIGUOUS %-31s rank=%d mode=%s hits=%s"
+                % (prefix, name, rec.rank, rec.mode, detail))
+        else:
+            msg("%s_UNSAFE %-34s rank=%d mode=%s %s"
+                % (prefix, name, rec.rank, rec.mode, detail))
+
+    return resolved, saw
+
+
+def _report_conflict(name, resolved, prefix):
+    """Log and return True when independent candidates disagree on the target."""
+    targets = {target_ea for _rec, target_ea, _detail in resolved}
+    if len(targets) <= 1:
+        return False
+
+    detail = "  ".join(
+        "rank%d/%s/%s=%s" % (rec.rank, rec.mode, rec.origin, ea_str(target_ea))
+        for rec, target_ea, _detail in resolved
+    )
+    msg("%s_CONFLICT %-33s %d distinct targets: %s"
+        % (prefix, name, len(targets), detail))
+    return True
+
+
 def _rename_target(name, func_ea, rec, candidate_index, stats):
     """Shared name-protection + rename for a resolved target. Returns a status
     string; on success performs the rename and returns 'renamed'/'already-same'.
@@ -494,7 +568,8 @@ def _rename_target(name, func_ea, rec, candidate_index, stats):
     return "renamed"
 
 
-def try_apply_function_group(name, records, ranges, match_cache, stats, meta=None):
+def try_apply_function_group(name, records, ranges, match_cache, stats,
+                             claimed, meta=None):
     """Resolve one function group, rename it, then merge its prototype."""
     existing_global = _global_name_ea(name)
     if existing_global != BADADDR:
@@ -509,49 +584,54 @@ def try_apply_function_group(name, records, ranges, match_cache, stats, meta=Non
                 % (name, ea_str(existing_global)))
         return "already-global"
 
-    saw_not_found = saw_ambiguous = saw_unsafe = False
+    resolved, saw = _evaluate_candidates(
+        name, records, ranges, match_cache, "CANDIDATE"
+    )
 
-    for candidate_index, rec in enumerate(records):
-        rstatus, target_ea, detail = _find_unique_target(rec, ranges, match_cache)
-        if rstatus == "not-found":
-            saw_not_found = True
-            msg("CANDIDATE_NOT_FOUND %-32s rank=%d mode=%s" % (name, rec.rank, rec.mode))
-            continue
-        if rstatus == "ambiguous":
-            saw_ambiguous = True
-            msg("CANDIDATE_AMBIGUOUS %-32s rank=%d mode=%s hits=%s"
-                % (name, rec.rank, rec.mode, detail))
-            continue
-        if rstatus != "ok":
-            saw_unsafe = True
-            msg("CANDIDATE_UNSAFE %-35s rank=%d mode=%s %s"
-                % (name, rec.rank, rec.mode, detail))
-            continue
+    if _report_conflict(name, resolved, "FUNC"):
+        stats.conflicts += 1
+        return "conflict"
 
+    for rec, target_ea, _detail in resolved:
         allow_create = rec.mode != "BODY"
-        fstatus, func_ea, created = _ensure_function_start(target_ea, allow_create=allow_create)
+        fstatus, func_ea, created = _ensure_function_start(
+            target_ea, allow_create=allow_create
+        )
 
         if fstatus == "interior":
-            saw_unsafe = True
+            saw["unsafe"] = True
             msg("CANDIDATE_INTERIOR %-33s rank=%d mode=%s target=%s owner=%s"
                 % (name, rec.rank, rec.mode, ea_str(target_ea), ea_str(func_ea)))
             continue
         if fstatus != "ok":
-            saw_unsafe = True
+            saw["unsafe"] = True
             msg("CANDIDATE_NOFUNC %-35s rank=%d mode=%s target=%s"
                 % (name, rec.rank, rec.mode, ea_str(target_ea)))
             continue
+
+        owner = claimed.get(func_ea)
+        if owner is not None and owner != name:
+            stats.conflicts += 1
+            msg("FUNC_TARGET_CLASH %-34s @ %s already claimed by %s"
+                % (name, ea_str(func_ea), owner))
+            return "conflict"
 
         if created:
             stats.created_functions += 1
             msg("CREATED_FUNC %-42s @ %s" % (name, ea_str(func_ea)))
 
-        outcome = _rename_target(name, func_ea, rec, candidate_index, stats)
+        agreed = len(resolved)
+        if agreed > 1:
+            stats.confirmed += 1
+        confirm = " confirmed-by=%d" % agreed if agreed > 1 else ""
+
+        outcome = _rename_target(name, func_ea, rec, rec.rank, stats)
 
         if outcome == "already-same":
             stats.already_same += 1
-            msg("ALREADY_SAME %-41s @ %s via=%s rank=%d"
-                % (name, ea_str(func_ea), rec.mode, rec.rank))
+            claimed[func_ea] = name
+            msg("ALREADY_SAME %-41s @ %s via=%s rank=%d%s"
+                % (name, ea_str(func_ea), rec.mode, rec.rank, confirm))
             apply_function_type_safe(func_ea, meta, stats)
             return "already-same"
         if outcome == "skip-named":
@@ -565,19 +645,20 @@ def try_apply_function_group(name, records, ranges, match_cache, stats, meta=Non
             return "failure"
 
         stats.renamed += 1
-        if candidate_index > 0:
+        if rec.rank > 0:
             stats.fallback_used += 1
-        msg("RENAMED %-46s @ %s via=%s rank=%d%s"
-            % (name, ea_str(func_ea), rec.mode, rec.rank,
-               " FALLBACK" if candidate_index > 0 else ""))
+        claimed[func_ea] = name
+        msg("RENAMED %-46s @ %s via=%s/%s rank=%d%s%s"
+            % (name, ea_str(func_ea), rec.mode, rec.origin, rec.rank,
+               " FALLBACK" if rec.rank > 0 else "", confirm))
         apply_function_type_safe(func_ea, meta, stats)
         return "renamed"
 
-    if saw_unsafe:
+    if saw["unsafe"]:
         stats.unsafe += 1
         msg("UNRESOLVED_UNSAFE %-36s" % name)
         return "unsafe"
-    if saw_ambiguous:
+    if saw["ambiguous"]:
         stats.ambiguous += 1
         msg("UNRESOLVED_AMBIGUOUS %-33s" % name)
         return "ambiguous"
@@ -586,7 +667,8 @@ def try_apply_function_group(name, records, ranges, match_cache, stats, meta=Non
     return "not-found"
 
 
-def try_apply_global_group(name, records, ranges, match_cache, stats, meta=None):
+def try_apply_global_group(name, records, ranges, match_cache, stats,
+                           claimed, meta=None):
     """Resolve one global group by its REL data-anchor(s), rename, apply type."""
     existing_global = _global_name_ea(name)
     if existing_global != BADADDR:
@@ -596,28 +678,34 @@ def try_apply_global_group(name, records, ranges, match_cache, stats, meta=None)
         apply_global_type_safe(existing_global, meta, stats)
         return "already-global"
 
-    saw_not_found = saw_ambiguous = saw_unsafe = False
+    resolved, saw = _evaluate_candidates(
+        name, records, ranges, match_cache, "GLOB_CAND"
+    )
 
-    for candidate_index, rec in enumerate(records):
-        rstatus, target_ea, detail = _find_unique_target(rec, ranges, match_cache)
-        if rstatus == "not-found":
-            saw_not_found = True
-            msg("GLOB_CAND_NOT_FOUND %-32s rank=%d" % (name, rec.rank))
-            continue
-        if rstatus == "ambiguous":
-            saw_ambiguous = True
-            msg("GLOB_CAND_AMBIGUOUS %-32s rank=%d hits=%s" % (name, rec.rank, detail))
-            continue
-        if rstatus != "ok":
-            saw_unsafe = True
-            msg("GLOB_CAND_UNSAFE %-35s rank=%d %s" % (name, rec.rank, detail))
-            continue
+    if _report_conflict(name, resolved, "GLOB"):
+        stats.glob_conflicts += 1
+        return "conflict"
 
-        outcome = _rename_target(name, target_ea, rec, candidate_index, stats)
+    for rec, target_ea, _detail in resolved:
+        owner = claimed.get(target_ea)
+        if owner is not None and owner != name:
+            stats.glob_conflicts += 1
+            msg("GLOB_TARGET_CLASH %-34s @ %s already claimed by %s"
+                % (name, ea_str(target_ea), owner))
+            return "conflict"
+
+        agreed = len(resolved)
+        if agreed > 1:
+            stats.glob_confirmed += 1
+        confirm = " confirmed-by=%d" % agreed if agreed > 1 else ""
+
+        outcome = _rename_target(name, target_ea, rec, rec.rank, stats)
 
         if outcome == "already-same":
             stats.glob_already_same += 1
-            msg("GLOB_ALREADY_SAME %-36s @ %s" % (name, ea_str(target_ea)))
+            claimed[target_ea] = name
+            msg("GLOB_ALREADY_SAME %-36s @ %s%s"
+                % (name, ea_str(target_ea), confirm))
             apply_global_type_safe(target_ea, meta, stats)
             return "already-same"
         if outcome == "skip-named":
@@ -631,17 +719,18 @@ def try_apply_global_group(name, records, ranges, match_cache, stats, meta=None)
             return "failure"
 
         stats.glob_renamed += 1
-        msg("GLOB_RENAMED %-41s @ %s rank=%d%s"
+        claimed[target_ea] = name
+        msg("GLOB_RENAMED %-41s @ %s rank=%d%s%s"
             % (name, ea_str(target_ea), rec.rank,
-               " FALLBACK" if candidate_index > 0 else ""))
+               " FALLBACK" if rec.rank > 0 else "", confirm))
         apply_global_type_safe(target_ea, meta, stats)
         return "renamed"
 
-    if saw_unsafe:
+    if saw["unsafe"]:
         stats.glob_unsafe += 1
         msg("GLOB_UNRESOLVED_UNSAFE %-31s" % name)
         return "unsafe"
-    if saw_ambiguous:
+    if saw["ambiguous"]:
         stats.glob_ambiguous += 1
         msg("GLOB_UNRESOLVED_AMBIGUOUS %-28s" % name)
         return "ambiguous"
@@ -654,23 +743,50 @@ def try_apply_global_group(name, records, ranges, match_cache, stats, meta=None)
 # Import driver
 # ---------------------------------------------------------------------------
 
+def _warn_on_image_mismatch(loaded):
+    """Report, never block, when the file came from a different image.
+
+    A CFS6 file is meant to be applied across builds, so a mismatch is the
+    normal case; the point is that the user sees which image produced it.
+    """
+    image = loaded.image()
+    try:
+        current = describe_image()[0]
+    except Exception:
+        return
+
+    if image.get("sha256") and image.get("sha256") == current.get("sha256"):
+        msg("IMAGE_MATCH: exported from this exact image.")
+        return
+
+    msg(
+        "IMAGE_DIFFERS: file=%s/%s current=%s/%s -- expected when transferring "
+        "across builds; source RVAs in the file are diagnostics only."
+        % (image.get("name"), image.get("size_of_image"),
+           current.get("name"), current.get("size_of_image"))
+    )
+
+
 def import_file(path):
     stats = Stats()
 
     try:
-        loaded = cfsfile.load_records(path)
+        loaded = cfs6.load_cfs6(path, log=msg)
+    except cfs6.Cfs6Error as exc:
+        ida_kernwin.warning("%s" % exc)
+        return False
     except Exception as exc:
-        ida_kernwin.warning("Could not read CFS/CFS2/CFS3/CFS4/CFS5 file:\n%s" % exc)
+        ida_kernwin.warning("Could not read CFS6 file:\n%s" % exc)
         return False
 
     stats.parse_errors = loaded.parse_errors
-    func_groups = cfsfile.group_records(loaded.func_records)
-    glob_groups = cfsfile.group_records(loaded.glob_records)
+    func_groups = loaded.functions()
+    glob_groups = loaded.globals()
     stats.groups = len(func_groups)
     stats.glob_groups = len(glob_groups)
 
     if not func_groups and not glob_groups:
-        ida_kernwin.warning("No valid CFS signature records found.")
+        ida_kernwin.warning("No CFS6 function or global records found.")
         return False
 
     ranges = get_search_ranges()
@@ -678,22 +794,26 @@ def import_file(path):
         ida_kernwin.warning("No executable/code search ranges found.")
         return False
 
+    func_sigs = sum(len(i.candidates) for i in func_groups)
+    glob_sigs = sum(len(i.candidates) for i in glob_groups)
+
     msg("=" * 72)
-    msg("CFS5 Importer %s" % VERSION)
+    msg("CFS6 Importer %s" % VERSION)
     msg("File: %s" % path)
+    msg("Source: %s" % loaded.describe_source())
+    _warn_on_image_mismatch(loaded)
     msg(
         "Functions: %d  Function sigs: %d  Globals: %d  Global sigs: %d  "
-        "Types: %d  Parse errors: %d"
-        % (len(func_groups), len(loaded.func_records),
-           len(glob_groups), len(loaded.glob_records),
-           len(loaded.type_records), loaded.parse_errors)
+        "Types: %d  Parse errors: %d  Skipped records: %d"
+        % (len(func_groups), func_sigs, len(glob_groups), glob_sigs,
+           len(loaded.type_records), loaded.parse_errors, loaded.skipped_records)
     )
     msg("Search ranges: %s"
         % ", ".join("%s[%s-%s]" % (name, ea_str(a), ea_str(b)) for a, b, name in ranges))
     msg("=" * 72)
 
     # Register missing local types once, before any prototype/type application.
-    ida_kernwin.show_wait_box("NODELAY\nRegistering missing CFS5 local types...")
+    ida_kernwin.show_wait_box("NODELAY\nRegistering missing CFS6 local types...")
     try:
         type_state = register_missing_types(loaded.type_records, stats)
     except Exception as exc:
@@ -714,14 +834,17 @@ def import_file(path):
 
     ida_kernwin.clr_cancelled()
     ida_kernwin.show_wait_box(
-        "NODELAY\nImporting CFS5 signatures + prototypes...\nPress Cancel to stop."
+        "NODELAY\nImporting CFS6 signatures + prototypes...\nPress Cancel to stop."
     )
+
+    # Reverse map so two different items resolving to one address is caught.
+    claimed = {}
 
     try:
         done = 0
         cancelled = False
 
-        for (group_id, name), candidates in func_groups:
+        for item in func_groups:
             if ida_kernwin.user_cancelled():
                 cancelled = True
                 break
@@ -729,20 +852,24 @@ def import_file(path):
             if done == 1 or done == total or done % PROGRESS_EVERY == 0:
                 ida_kernwin.replace_wait_box(
                     "Functions...\n%d / %d\nRenamed: %d  Missing: %d  "
-                    "Ambiguous: %d\nTypes applied: %d  Registered UDTs: %d\nCurrent: %s"
+                    "Ambiguous: %d  Conflicts: %d\nTypes applied: %d  "
+                    "Registered UDTs: %d\nCurrent: %s"
                     % (done, total, stats.renamed, stats.not_found, stats.ambiguous,
-                       stats.func_types_applied, stats.types_registered, name)
+                       stats.conflicts, stats.func_types_applied,
+                       stats.types_registered, item.name)
                 )
-            meta = loaded.func_meta.get((group_id, name))
             try:
-                try_apply_function_group(name, candidates, ranges, match_cache, stats, meta=meta)
+                try_apply_function_group(
+                    item.name, item.candidates, ranges, match_cache, stats,
+                    claimed, meta=loaded.item_meta.get(item.id),
+                )
             except Exception as exc:
                 stats.failures += 1
-                msg("FAIL_EXCEPTION %-39s error=%s" % (name, exc))
+                msg("FAIL_EXCEPTION %-39s error=%s" % (item.name, exc))
             stats.processed += 1
 
         if not cancelled:
-            for (group_id, name), candidates in glob_groups:
+            for item in glob_groups:
                 if ida_kernwin.user_cancelled():
                     cancelled = True
                     break
@@ -750,16 +877,19 @@ def import_file(path):
                 if done == 1 or done == total or done % PROGRESS_EVERY == 0:
                     ida_kernwin.replace_wait_box(
                         "Globals...\n%d / %d\nRenamed: %d  Missing: %d  "
-                        "Ambiguous: %d\nTypes applied: %d\nCurrent: %s"
+                        "Ambiguous: %d  Conflicts: %d\nTypes applied: %d\nCurrent: %s"
                         % (done, total, stats.glob_renamed, stats.glob_not_found,
-                           stats.glob_ambiguous, stats.glob_types_applied, name)
+                           stats.glob_ambiguous, stats.glob_conflicts,
+                           stats.glob_types_applied, item.name)
                     )
-                meta = loaded.glob_meta.get((group_id, name))
                 try:
-                    try_apply_global_group(name, candidates, ranges, match_cache, stats, meta=meta)
+                    try_apply_global_group(
+                        item.name, item.candidates, ranges, match_cache, stats,
+                        claimed, meta=loaded.item_meta.get(item.id),
+                    )
                 except Exception as exc:
                     stats.failures += 1
-                    msg("GLOB_FAIL_EXCEPTION %-34s error=%s" % (name, exc))
+                    msg("GLOB_FAIL_EXCEPTION %-34s error=%s" % (item.name, exc))
                 stats.glob_processed += 1
 
         if cancelled:
@@ -780,7 +910,7 @@ def import_file(path):
 
 
 def choose_and_import():
-    path = ida_kernwin.ask_file(False, "*.cfs", "Select CFS5 / CFS signature file to import")
+    path = ida_kernwin.ask_file(False, "*.cfs", "Select CFS6 signature file (.cfs) to import")
     if not path:
         msg("Import cancelled.")
         return False
@@ -804,9 +934,9 @@ class ImportHandler(ida_kernwin.action_handler_t):
 
 class CFS5ImporterPlugin(idaapi.plugin_t):
     flags = idaapi.PLUGIN_PROC
-    comment = "Optimized CFS5 signature + type importer for IDA 9 (functions + globals)"
+    comment = "CFS6 signature + type importer for IDA 9 (functions + globals)"
     help = (
-        "Imports CFS5 signatures, transported local types, function prototypes "
+        "Imports CFS6 signatures, transported local types, function prototypes "
         "and global types, plus CFS4/CFS3/CFS2 and legacy CFS. Destination "
         "names/types are protected."
     )
@@ -825,7 +955,7 @@ class CFS5ImporterPlugin(idaapi.plugin_t):
         ok = ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
                 ACTION_ID, ACTION_LABEL, self.handler, None,
-                "Import CFS5 signatures/types (functions + globals) or legacy CFS", -1,
+                "Import CFS6 signatures/types (functions + globals)", -1,
             )
         )
 

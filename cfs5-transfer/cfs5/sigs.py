@@ -1,20 +1,25 @@
-"""Signature candidate model and finders.
+"""IDA-touching signature finders.
 
 Three resolution modes:
   ENTRY  shortest unique instruction-aligned pattern at a function's start.
-  BODY   unique interior pattern; importer resolves the owning function.
-  REL    pattern at a caller/xref site; importer reads a signed PC-relative
-         displacement to resolve the referenced target (a function OR a global).
+  BODY   unique interior pattern; the consumer maps the hit back to the owning
+         function (IDA: the containing func; a dumper: the .pdata range).
+  REL    pattern at a caller/xref site plus a signed PC-relative displacement
+         that resolves the referenced target (a function OR a global).
+
+Every axis is searched **independently and unconditionally**: a function with a
+perfectly good prologue still gets a caller-side REL anchor, because the two
+fail for unrelated reasons. Scoring, deduplication, ranking and the diversity
+policy live in `cfs5/policy.py`, which is IDA-free and unit tested.
 
 The REL machinery is target-agnostic: pass a code-xref collector to anchor a
-function, or a data-xref collector to anchor a global. Only the importer-side
-validation differs (code target vs mapped-data target).
+function, or a data-xref collector to anchor a global.
 """
 
 import ida_funcs
 import ida_ua
 
-from .common import BADADDR, ea_str, find_up_to_two
+from .common import find_up_to_two
 from .disasm import (
     collect_data_xrefs_to,
     collect_far_xrefs_to,
@@ -22,53 +27,28 @@ from .disasm import (
     infer_pc_relative_field,
     pattern_tokens_for_insn,
 )
+from .policy import (
+    MAX_PATTERN_BYTES,
+    MAX_XREFS_TO_SEARCH,
+    XREF_EARLY_STOP_AFTER,
+    AXIS_BODY,
+    AXIS_ENTRY,
+    AXIS_EXTERNAL_REL,
+    Candidate,
+    ORIGIN_DATA_REF,
+    ORIGIN_ENTRY,
+    ORIGIN_EXTERNAL_CALL,
+    ORIGIN_SELF_CALL,
+    body_origin_for_position,
+    candidate_min_exact,
+    coverage_for,
+    primary_chunk_limit,
+    select_function_candidates,
+    select_global_candidates,
+)
 
-
-# Tuning. Defaults favour speed on very large DLLs.
-MAX_PATTERN_BYTES = 48
-GOOD_ENTRY_BYTES = 24
-BODY_START_SAMPLES = 3
-MAX_XREFS_TO_SEARCH = 24
-XREF_EARLY_STOP_AFTER = 6
-MAX_EXPORTED_CANDIDATES = 2
-MIN_EXACT_BYTES = 6
-MIN_SHORT_EXACT_BYTES = 4
-
-
-class Candidate:
-    __slots__ = (
-        "mode", "signature", "target_delta", "rel_offset", "rel_size",
-        "base_offset", "insn_offset", "byte_len", "wildcards", "exact",
-        "score", "origin"
-    )
-
-    def __init__(
-        self, mode, signature, target_delta=0, rel_offset=0, rel_size=0,
-        base_offset=0, insn_offset=0, byte_len=0, wildcards=0, exact=0,
-        origin=""
-    ):
-        self.mode = mode
-        self.signature = signature
-        self.target_delta = int(target_delta)
-        self.rel_offset = int(rel_offset)
-        self.rel_size = int(rel_size)
-        self.base_offset = int(base_offset)
-        self.insn_offset = int(insn_offset)
-        self.byte_len = int(byte_len)
-        self.wildcards = int(wildcards)
-        self.exact = int(exact)
-        self.origin = origin
-
-        mode_penalty = {"ENTRY": 0, "REL": 12, "BODY": 18}.get(mode, 25)
-        # Length dominates: once a pattern is source-unique, shorter is usually
-        # less flaky across versions. Wildcards get only a small penalty.
-        self.score = self.byte_len * 100 + self.wildcards * 2 + mode_penalty
-
-    def key(self):
-        return (
-            self.mode, self.signature, self.target_delta, self.rel_offset,
-            self.rel_size, self.base_offset, self.insn_offset
-        )
+# Window lengths tried, shortest first, until one is source-unique.
+_WINDOW_THRESHOLDS = [10, 14, 18, 24, 32, 40, 48]
 
 
 def _window_stats(insns, start_idx, end_idx):
@@ -91,16 +71,13 @@ def _window_stats(insns, start_idx, end_idx):
     }
 
 
-def _candidate_min_exact(total_bytes):
-    return MIN_SHORT_EXACT_BYTES if total_bytes < 10 else MIN_EXACT_BYTES
-
-
-def _unique_window_candidate(insns, start_idx, mode, ranges, thresholds):
+def _unique_window(insns, start_idx, ranges):
+    """Shortest source-unique window starting at start_idx, or None."""
     if start_idx < 0 or start_idx >= len(insns):
         return None
 
     tried_ends = set()
-    for threshold in thresholds:
+    for threshold in _WINDOW_THRESHOLDS:
         total = 0
         end_idx = start_idx
         while end_idx < len(insns) and total < threshold and total < MAX_PATTERN_BYTES:
@@ -124,27 +101,29 @@ def _unique_window_candidate(insns, start_idx, mode, ranges, thresholds):
         stats = _window_stats(insns, start_idx, end_idx)
         if stats is None:
             continue
-        if stats["exact"] < _candidate_min_exact(stats["byte_len"]):
+        if stats["exact"] < candidate_min_exact(stats["byte_len"]):
             continue
 
-        matches = find_up_to_two(stats["signature"], ranges)
-        if len(matches) != 1:
-            continue
-
-        return Candidate(
-            mode=mode,
-            signature=stats["signature"],
-            byte_len=stats["byte_len"],
-            wildcards=stats["wildcards"],
-            exact=stats["exact"],
-            origin="%s@%s" % (mode.lower(), ea_str(stats["start_ea"])),
-        )
+        if len(find_up_to_two(stats["signature"], ranges)) == 1:
+            return stats
 
     return None
 
 
-def find_entry_candidate(func_ea, ranges):
+def _func_extent(func_ea):
     f = ida_funcs.get_func(func_ea)
+    if f is None:
+        return None, 0, 0
+    return f, f.start_ea, f.end_ea - f.start_ea
+
+
+# ---------------------------------------------------------------------------
+# ENTRY
+# ---------------------------------------------------------------------------
+
+def find_entry_candidate(func_ea, ranges):
+    """(Candidate or None, decoded instruction list) for a function's start."""
+    f, start_ea, func_size = _func_extent(func_ea)
     if f is None:
         return None, []
 
@@ -152,13 +131,29 @@ def find_entry_candidate(func_ea, ranges):
     if not insns:
         return None, []
 
-    candidate = _unique_window_candidate(
-        insns, 0, "ENTRY", ranges, [10, 14, 18, 24, 32, 40, 48]
-    )
-    return candidate, insns
+    stats = _unique_window(insns, 0, ranges)
+    if stats is None:
+        return None, insns
 
+    return Candidate(
+        mode="ENTRY",
+        signature=stats["signature"],
+        origin=ORIGIN_ENTRY,
+        byte_len=stats["byte_len"],
+        wildcards=stats["wildcards"],
+        exact=stats["exact"],
+        anchor_ea=stats["start_ea"],
+        func_ea=start_ea,
+        func_size=func_size,
+    ), insns
+
+
+# ---------------------------------------------------------------------------
+# BODY
+# ---------------------------------------------------------------------------
 
 def _sample_body_indices(insns):
+    """Early/middle/late instruction indices, never the entry instruction."""
     n = len(insns)
     if n <= 3:
         return []
@@ -169,19 +164,46 @@ def _sample_body_indices(insns):
         idx = min(idx, n - 1)
         if idx not in out and idx != 0:
             out.append(idx)
-    return out[:BODY_START_SAMPLES]
-
-
-def find_body_candidates(insns, ranges):
-    out = []
-    for idx in _sample_body_indices(insns):
-        cand = _unique_window_candidate(
-            insns, idx, "BODY", ranges, [10, 14, 18, 24, 32, 40, 48]
-        )
-        if cand is not None:
-            out.append(cand)
     return out
 
+
+def find_body_candidates(insns, ranges, func_ea, func_size, ownership=None):
+    """Unique interior patterns from structurally distinct regions.
+
+    `ownership` is an image.BodyOwnership (or None): it both biases sampling
+    toward the function's own .pdata chunk and labels whether a non-IDA
+    consumer could recover func_ea from the resulting hit.
+    """
+    out = []
+    limit = primary_chunk_limit(insns, func_ea, ownership)
+    indices = _sample_body_indices(insns[:limit])
+    for position, idx in enumerate(indices):
+        stats = _unique_window(insns, idx, ranges)
+        if stats is None:
+            continue
+        kind = (
+            ownership.classify(func_ea, stats["start_ea"])
+            if ownership is not None else "pdata"
+        )
+        out.append(Candidate(
+            ownership=kind,
+            mode="BODY",
+            signature=stats["signature"],
+            origin=body_origin_for_position(position, len(indices)),
+            byte_len=stats["byte_len"],
+            wildcards=stats["wildcards"],
+            exact=stats["exact"],
+            anchor_ea=stats["start_ea"],
+            func_ea=func_ea,
+            func_size=func_size,
+            body_offset=stats["start_ea"] - func_ea,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# REL
+# ---------------------------------------------------------------------------
 
 def _even_sample(values, limit):
     if len(values) <= limit:
@@ -224,7 +246,9 @@ def _xref_window_specs(xidx, n):
     return clean
 
 
-def find_rel_candidate_for_xref(xref_ea, target_ea, ranges):
+def find_rel_candidate_for_xref(
+    xref_ea, target_ea, ranges, origin, func_ea=0, func_size=0, is_data=False
+):
     """Build a REL Candidate anchored at xref_ea that resolves to target_ea."""
     chunk = ida_funcs.get_fchunk(xref_ea)
     if chunk is None:
@@ -262,164 +286,139 @@ def find_rel_candidate_for_xref(xref_ea, target_ea, ranges):
         stats = _window_stats(insns, a, b)
         if stats is None or stats["byte_len"] > MAX_PATTERN_BYTES:
             continue
-        if stats["exact"] < _candidate_min_exact(stats["byte_len"]):
+        if stats["exact"] < candidate_min_exact(stats["byte_len"]):
+            continue
+        possibilities.append(stats)
+
+    possibilities.sort(key=lambda s: (s["byte_len"], s["wildcards"]))
+
+    for stats in possibilities:
+        if len(find_up_to_two(stats["signature"], ranges)) != 1:
             continue
 
-        rel_offset = (xref_ea - stats["start_ea"]) + rel_off_in_insn
-        base_offset = (xref_ea - stats["start_ea"]) + xinsn.size
         insn_offset = xref_ea - stats["start_ea"]
-
-        possibilities.append((
-            stats["byte_len"], stats["wildcards"], a, b, stats,
-            rel_offset, base_offset, insn_offset
-        ))
-
-    possibilities.sort(key=lambda x: (x[0], x[1]))
-
-    for (
-        _blen, _wild, _a, _b, stats,
-        rel_offset, base_offset, insn_offset
-    ) in possibilities:
-        matches = find_up_to_two(stats["signature"], ranges)
-        if len(matches) != 1:
-            continue
-
         return Candidate(
             mode="REL",
             signature=stats["signature"],
-            target_delta=0,
-            rel_offset=rel_offset,
-            rel_size=rel_size,
-            base_offset=base_offset,
-            insn_offset=insn_offset,
+            origin=origin,
             byte_len=stats["byte_len"],
             wildcards=stats["wildcards"],
             exact=stats["exact"],
-            origin="xref@%s" % ea_str(xref_ea),
+            anchor_ea=stats["start_ea"],
+            func_ea=func_ea,
+            func_size=func_size,
+            target_ea=target_ea,
+            is_data=is_data,
+            rel_offset=insn_offset + rel_off_in_insn,
+            rel_size=rel_size,
+            # End of the *whole* instruction, trailing immediates included.
+            base_offset=insn_offset + xinsn.size,
+            insn_offset=insn_offset,
         )
 
     return None
 
 
-def find_best_rel_candidate(
-    target_ea, ranges, xref_collector=collect_far_xrefs_to, skip_self=True
+def collect_rel_candidates(
+    target_ea, ranges, xref_collector, is_data, func_ea=0, func_size=0
 ):
-    """Best REL Candidate for target_ea across a sampling of its xrefs.
+    """REL Candidates from a bounded, evenly spread sample of target's xrefs.
 
-    xref_collector selects the xref kind: code refs for functions, data refs
-    for globals. Returns (candidate_or_None, total_xrefs, searched).
+    Returns (candidates, total_xrefs, searched). Self-referencing anchors are
+    kept but tagged ORIGIN_SELF_CALL so the policy can prefer external callers.
     """
     all_refs = xref_collector(target_ea)
     if not all_refs:
-        return None, 0, 0
+        return [], 0, 0
 
     sampled = _even_sample(all_refs, MAX_XREFS_TO_SEARCH)
-    best = None
+    found = []
     searched = 0
 
     for xref_ea in sampled:
-        # Recursive/self xrefs can work but external callers are preferable.
-        # Meaningless for globals (owner is never the global), hence skip_self.
-        if skip_self:
-            owner = ida_funcs.get_func(xref_ea)
-            if owner is not None and owner.start_ea == target_ea and len(sampled) > 1:
-                continue
-
         searched += 1
-        cand = find_rel_candidate_for_xref(xref_ea, target_ea, ranges)
-        if cand is not None and (best is None or cand.score < best.score):
-            best = cand
 
+        if is_data:
+            origin = ORIGIN_DATA_REF
+        else:
+            owner = ida_funcs.get_func(xref_ea)
+            origin = (
+                ORIGIN_SELF_CALL
+                if owner is not None and owner.start_ea == target_ea
+                else ORIGIN_EXTERNAL_CALL
+            )
+
+        try:
+            cand = find_rel_candidate_for_xref(
+                xref_ea, target_ea, ranges, origin,
+                func_ea=func_ea, func_size=func_size, is_data=is_data,
+            )
+        except Exception:
+            # One odd instruction must not abort the whole item.
+            continue
+
+        if cand is not None:
+            found.append(cand)
+
+        external = [c for c in found if c.origin != ORIGIN_SELF_CALL]
         if (
-            best is not None
+            external
             and searched >= XREF_EARLY_STOP_AFTER
-            and best.byte_len <= 20
+            and min(c.byte_len for c in external) <= 20
         ):
             break
 
-    return best, len(all_refs), searched
+    return found, len(all_refs), searched
 
 
-def _dedup_and_order(candidates):
-    unique = {}
-    for c in candidates:
-        old = unique.get(c.key())
-        if old is None or c.score < old.score:
-            unique[c.key()] = c
-    return sorted(unique.values(), key=lambda c: c.score)
+# ---------------------------------------------------------------------------
+# Item-level policy entry points
+# ---------------------------------------------------------------------------
 
+def choose_function_candidates(func_ea, ranges, ownership=None):
+    """Ranked, structurally diverse candidates for a function.
 
-def _select_two(ordered):
-    selected = []
-    if ordered:
-        selected.append(ordered[0])
-        # Backup should ideally be a different resolution mode/origin.
-        for c in ordered[1:]:
-            if len(selected) >= MAX_EXPORTED_CANDIDATES:
-                break
-            if c.mode != selected[0].mode or c.origin != selected[0].origin:
-                selected.append(c)
-    return selected
+    Returns (candidates, coverage, total_xrefs, searched_xrefs).
+    """
+    entry, insns = find_entry_candidate(func_ea, ranges)
+    _f, start_ea, func_size = _func_extent(func_ea)
 
-
-def choose_function_candidates(func_ea, ranges):
-    """Up to two ranked candidates for a function (ENTRY/BODY/REL blend)."""
-    entry, entry_insns = find_entry_candidate(func_ea, ranges)
     candidates = []
+    attempted = {AXIS_ENTRY}
     if entry is not None:
         candidates.append(entry)
 
-    f = ida_funcs.get_func(func_ea)
-    func_size = (f.end_ea - f.start_ea) if f is not None else 0
-
-    entry_is_good = (
-        entry is not None
-        and entry.byte_len <= GOOD_ENTRY_BYTES
-        and entry.exact >= MIN_EXACT_BYTES
-        and (entry.wildcards / max(1, entry.byte_len)) <= 0.50
+    # Unconditional: a good prologue says nothing about whether a caller-side
+    # anchor will survive the next build, and vice versa.
+    rels, total_xrefs, searched = collect_rel_candidates(
+        func_ea, ranges, collect_far_xrefs_to, is_data=False,
+        func_ea=start_ea, func_size=func_size,
     )
+    attempted.add(AXIS_EXTERNAL_REL)
+    candidates.extend(rels)
 
-    need_rel = (
-        func_size < 12
-        or entry is None
-        or entry.byte_len > GOOD_ENTRY_BYTES
-        or (entry.wildcards / max(1, entry.byte_len)) > 0.40
-    )
-
-    total_xrefs = 0
-    tested_xrefs = 0
-    if need_rel:
-        rel, total_xrefs, tested_xrefs = find_best_rel_candidate(
-            func_ea, ranges, xref_collector=collect_far_xrefs_to, skip_self=True
+    if insns:
+        attempted.add(AXIS_BODY)
+        candidates.extend(
+            find_body_candidates(
+                insns, ranges, start_ea, func_size, ownership=ownership
+            )
         )
-        if rel is not None:
-            candidates.append(rel)
 
-    if not entry_is_good and entry_insns:
-        candidates.extend(find_body_candidates(entry_insns, ranges))
-
-    ordered = _dedup_and_order(candidates)
-
-    # Tiny functions are weak anchors even when source-unique. Prefer a
-    # validated caller-side REL anchor and keep the tiny one only as fallback.
-    if func_size < 12:
-        rel_candidates = [c for c in ordered if c.mode == "REL"]
-        if rel_candidates:
-            rel_best = min(rel_candidates, key=lambda c: c.score)
-            ordered = [rel_best] + [c for c in ordered if c is not rel_best]
-
-    return _select_two(ordered), total_xrefs, tested_xrefs
+    selected = select_function_candidates(candidates)
+    return selected, coverage_for(selected, attempted), total_xrefs, searched
 
 
 def choose_global_candidates(global_ea, ranges):
-    """Up to two ranked REL candidates for a global via its data xrefs.
+    """Ranked REL candidates for a global via distinct data-xref anchor sites.
 
-    Globals have no instruction body, so only caller-side REL anchors apply.
-    Returns ([], total, tested) when the global has no usable code reference.
+    Globals have no instruction body, so REL is the only applicable axis.
+    Returns (candidates, coverage, total_xrefs, searched_xrefs).
     """
-    best, total_xrefs, tested_xrefs = find_best_rel_candidate(
-        global_ea, ranges, xref_collector=collect_data_xrefs_to, skip_self=False
+    rels, total_xrefs, searched = collect_rel_candidates(
+        global_ea, ranges, collect_data_xrefs_to, is_data=True,
+        func_ea=0, func_size=0,
     )
-    if best is None:
-        return [], total_xrefs, tested_xrefs
-    return [best], total_xrefs, tested_xrefs
+    selected = select_global_candidates(rels)
+    coverage = coverage_for(selected, {AXIS_EXTERNAL_REL})
+    return selected, coverage, total_xrefs, searched

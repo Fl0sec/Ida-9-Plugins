@@ -1,13 +1,10 @@
-"""Cross-cutting primitives: logging, address search ranges, byte-pattern
-search and the zlib+base64 payload codec used by the .cfs format.
+"""Cross-cutting primitives: logging, address search ranges and byte-pattern
+search.
 
-None of this is exporter- or importer-specific; both plugins consume it.
+None of this is exporter- or importer-specific; both plugins consume it. The
+payload codec and pattern normalization live in cfs6.py, beside the format
+definition they belong to.
 """
-
-import base64
-import csv
-import json
-import zlib
 
 import ida_bytes
 import ida_ida
@@ -19,16 +16,9 @@ import ida_segment
 BADADDR = ida_idaapi.BADADDR
 UA_MAXOP = ida_ida.UA_MAXOP
 
-# .cfs payloads can be large (whole struct bodies); lift the csv field cap once.
-try:
-    csv.field_size_limit(16 * 1024 * 1024)
-except Exception:
-    pass
-
-
 def msg(text):
     """Print a prefixed line to IDA's Output window."""
-    ida_kernwin.msg("[CFS5] %s\n" % text)
+    ida_kernwin.msg("[CFS6] %s\n" % text)
 
 
 def ea_str(ea):
@@ -36,7 +26,7 @@ def ea_str(ea):
 
 
 def safe_name(name):
-    """Reject names that would corrupt a CSV row (embedded newlines)."""
+    """Reject names that cannot round-trip as a clean record name."""
     if not name:
         return None
     if "\n" in name or "\r" in name:
@@ -92,51 +82,3 @@ def find_up_to_two(signature, ranges):
             cur = ea + 1
 
     return matches
-
-
-# ---------------------------------------------------------------------------
-# .cfs payload codec (zlib + base64; JSON for dependency lists)
-# ---------------------------------------------------------------------------
-
-def pack_bytes(data):
-    if data is None:
-        return ""
-    raw = bytes(data)
-    if not raw:
-        return ""
-    return base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
-
-
-def pack_json(value):
-    raw = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
-
-
-def unpack_bytes(payload):
-    if not payload:
-        return None
-    raw = base64.b64decode(payload.encode("ascii"), validate=False)
-    return zlib.decompress(raw)
-
-
-def unpack_text(payload):
-    if not payload:
-        return ""
-    raw = base64.b64decode(payload.encode("ascii"), validate=False)
-    return zlib.decompress(raw).decode("utf-8")
-
-
-def unpack_json(payload):
-    text = unpack_text(payload)
-    if not text:
-        return []
-    value = json.loads(text)
-    return value if isinstance(value, list) else []
-
-
-def normalize_signature(sig):
-    """Strip optional surrounding quotes and collapse whitespace in a pattern."""
-    sig = sig.strip()
-    if len(sig) >= 2 and sig[0] == '"' and sig[-1] == '"':
-        sig = sig[1:-1].strip()
-    return " ".join(sig.split())
