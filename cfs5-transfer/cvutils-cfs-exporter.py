@@ -33,15 +33,22 @@ import ida_kernwin
 import ida_name
 import ida_nalt
 import ida_segment
+import ida_typeinf
 import idautils
 
 from cfs5 import VERSION
 from cfs5 import cfs6
+from cfs5 import declare
+from cfs5 import members
+from cfs5 import store
 from cfs5.common import BADADDR, ea_str, get_search_ranges, msg, safe_name
 from cfs5.image import (
     BodyOwnership, describe_image, detect_build, get_imagebase, open_image_view,
 )
-from cfs5.sigs import choose_function_candidates, choose_global_candidates
+from cfs5.sigs import (
+    choose_function_candidates, choose_global_candidates,
+    choose_member_candidates,
+)
 from cfs5.typeio import (
     build_local_type_index,
     export_type_payload,
@@ -60,7 +67,19 @@ ACTION_ALL_BOTH = "cfs5:export_all_both"
 # Names window actions.
 ACTION_SEL_GLOBALS = "cfs5:export_sel_globals"
 ACTION_ALL_GLOBALS = "cfs5:export_all_globals"
+# Disassembly actions: declared members (derived_value items).
+ACTION_DECLARE_MEMBER = "cfs5:declare_member"
+# The member chooser has no fixed widget type, so the popup hook recognizes it
+# by title. Keep the prefix and the title construction together.
+MEMBER_CHOOSER_PREFIX = "CFS6 members of "
+
+ACTION_DECLARE_STRUCT = "cfs5:declare_struct"
+ACTION_MANAGE_DECLS = "cfs5:manage_declarations"
+ACTION_EXPORT_MEMBERS = "cfs5:export_members"
 SELECTED_HOTKEY = "Ctrl+Shift+E"
+DECLARE_HOTKEY = "Ctrl+Shift+M"
+# Opens the dispatcher -- the one shortcut worth remembering.
+DISPATCH_HOTKEY = "Ctrl+Shift+C"
 PROGRESS_EVERY = 10
 
 # Globals named g_* are almost always deliberate even if the user-name flag is
@@ -316,6 +335,519 @@ def get_selected_global_eas(ctx):
 
 
 # ---------------------------------------------------------------------------
+# Declaring a member from a selected operand
+# ---------------------------------------------------------------------------
+
+def _resolve_or_create_member(ea, op_index):
+    """The IDA member this operand refers to, creating it if the user agrees.
+
+    A `member_offset` declaration is an assertion that a named field of a
+    named type lives at some offset. Without a real IDA member behind it that
+    assertion is unverified, `source.expected_value` has nothing to come from,
+    and no struct-offset references can ever be found for it -- so this is a
+    hard gate, not a warning. When the container is known but the field is
+    not, creating the field is offered rather than refusing: that improves the
+    database permanently and makes every *other* member of the same struct
+    easier to declare next time.
+
+    Returns a members.MemberRef, or None when the user backed out.
+    """
+    ref = members.member_from_operand(ea, op_index)
+    if ref is not None:
+        return ref
+
+    insn = members.decode_at(ea)
+    if insn is None:
+        ida_kernwin.warning("Could not decode the instruction at %s."
+                            % ea_str(ea))
+        return None
+
+    displacement, width = members.operand_displacement(insn, op_index)
+    if displacement is None:
+        ida_kernwin.warning(
+            "Operand %d at %s is not a memory access, so it cannot name a "
+            "structure member." % (op_index, ea_str(ea))
+        )
+        return None
+    if displacement < 0:
+        ida_kernwin.warning(
+            "Operand %d at %s has a negative displacement (%d); declare it "
+            "against the type the register really points at."
+            % (op_index, ea_str(ea), displacement)
+        )
+        return None
+
+    owner = ida_kernwin.ask_str(
+        "", 0,
+        "This operand is not marked as a struct offset.\n"
+        "Container structure type for [reg+0x%X]:" % displacement
+    )
+    if not owner:
+        return None
+    owner = owner.strip()
+
+    if members.get_struct_tinfo(owner) is None:
+        ida_kernwin.warning(
+            "%r is not a structure in this database. Create or import the "
+            "type first, then declare the member." % owner
+        )
+        return None
+
+    ref = members.member_at_offset(owner, displacement)
+    if ref is None:
+        spanning = members.enclosing_member_name(owner, displacement)
+        if spanning is not None:
+            ida_kernwin.warning(
+                "%s+0x%X is inside the existing field %s, not the start of a "
+                "field. Fix the layout first." % (owner, displacement, spanning)
+            )
+            return None
+        if ida_kernwin.ask_yn(
+            ida_kernwin.ASKBTN_YES,
+            "%s has no field at 0x%X.\nCreate one now?" % (owner, displacement),
+        ) != ida_kernwin.ASKBTN_YES:
+            return None
+        field_name = ida_kernwin.ask_str(
+            "field_%X" % displacement, 0,
+            "Name for the new %s field at 0x%X (%d bytes):"
+            % (owner, displacement, width or 8)
+        )
+        if not field_name:
+            return None
+        ref = members.create_member(
+            owner, field_name.strip(), displacement, width or 8
+        )
+        if ref is None:
+            ida_kernwin.warning(
+                "Could not create %s.%s at 0x%X -- see the Output window."
+                % (owner, field_name, displacement)
+            )
+            return None
+
+    # Mark the operand so IDA indexes it as a reference to this member. That
+    # is what lets the *next* export find this site (and others) through
+    # member_reference_sites instead of relying on the stored selection alone.
+    if not members.apply_stroff(ea, op_index, ref.owner):
+        msg("DECLARE: could not mark operand %d at %s as a struct offset; "
+            "the declaration still works but will not gain xref candidates"
+            % (op_index, ea_str(ea)))
+
+    return ref
+
+
+def _report_candidate_preview(decl, ref):
+    """Build the member's candidates now and tell the user what was found.
+
+    Immediate feedback matters more here than for functions: coverage depends
+    on how well the container is typed, so a declaration that can only ever
+    produce one candidate should say so while the user is still looking at it.
+    """
+    ranges = get_search_ranges()
+    if not ranges:
+        return "no executable search ranges"
+
+    site = (decl.site_ea, decl.site_op) if decl.has_site else None
+    try:
+        candidates, _coverage, sites, _searched = choose_member_candidates(
+            ref, ranges, selected_site=site, value_adjust=decl.value_adjust,
+            sibling_offsets=_sibling_offsets(ref.owner),
+        )
+    except Exception as exc:
+        msg("DECLARE: candidate preview failed: %s" % exc)
+        return "candidate generation failed: %s" % exc
+
+    if not candidates:
+        return (
+            "no unique signature yet (%d site(s) tried).\nThe declaration is "
+            "stored; type more of the binary and re-export." % sites
+        )
+    origins = sorted(set(c.origin for c in candidates))
+    return "%d candidate(s) from %d site(s): %s" % (
+        len(candidates), sites, ", ".join(origins)
+    )
+
+
+_SIBLING_CACHE = {}
+
+
+def _sibling_offsets(owner):
+    """Every member offset of `owner`, for co-occurrence ranking.
+
+    Cached because an export walks many declarations of the same structure and
+    re-reading the type each time is pure overhead. This only steers *which*
+    functions get decompiled -- it never widens what a candidate may be.
+    """
+    if owner not in _SIBLING_CACHE:
+        _SIBLING_CACHE[owner] = [
+            r.byte_offset for r in members.iter_members(owner)
+        ]
+    return _SIBLING_CACHE[owner]
+
+
+def _store_member_declaration(ref, site_ea=None, site_op=None):
+    """Persist a declaration for `ref`, asking the user nothing.
+
+    The canonical name is the IDA field name. There is no prompt because there
+    is nothing to decide: the database already holds the answer, and asking
+    would only invite a typo that silently renames the exported item.
+
+    "No site" must be `None`, not BADADDR/-1: `Declaration.has_site` only tests
+    for None, so a sentinel is stored as a real site, displayed as `BADADDR`,
+    and then handed to candidate generation as a `selected_operand` -- a
+    provenance claim that is simply false.
+    """
+    if site_ea in (None, BADADDR) or site_op is None or site_op < 0:
+        site_ea, site_op = None, None
+    try:
+        decl = declare.make_member(
+            ref.owner, ref.name, member=ref.name,
+            site_ea=site_ea, site_op=site_op,
+        )
+    except declare.DeclarationError as exc:
+        msg("DECLARE: %s.%s rejected: %s" % (ref.owner, ref.name, exc))
+        return None
+    if not store.save(decl):
+        msg("DECLARE: %s.%s could not be stored" % (ref.owner, ref.name))
+        return None
+    return decl
+
+
+def declare_member_at(ea, op_index):
+    """Full declare-from-operand flow. Returns True when something was stored."""
+    if ea == BADADDR:
+        ida_kernwin.warning("Place the cursor on an instruction operand first.")
+        return False
+
+    ref = _resolve_or_create_member(ea, op_index)
+    if ref is None:
+        return False
+
+    decl = _store_member_declaration(ref, site_ea=ea, site_op=op_index)
+    if decl is None:
+        ida_kernwin.warning(
+            "The declaration could not be stored -- see the Output window."
+        )
+        return False
+
+    ida_kernwin.info(
+        "Declared %s\n\n"
+        "IDA field: %s.%s\n"
+        "Offset (expected_value): 0x%X (%d)\n"
+        "Site: %s operand %d\n\n"
+        "%s"
+        % (decl.id, ref.owner, ref.name, ref.byte_offset, ref.byte_offset,
+           ea_str(ea), op_index, _report_candidate_preview(decl, ref))
+    )
+    return True
+
+
+class MemberChooser(ida_kernwin.Choose):
+    """Pick which members of one structure to declare.
+
+    Declaring is deliberately separated from *previewing candidates*. Storing a
+    declaration is instant; discovering its sites decompiles functions. Doing
+    both at once meant a 200-member structure paid for 200 discovery passes
+    nobody asked for, so the scan is on demand (Ctrl+E) over the selected rows
+    only.
+    """
+
+    def __init__(self, owner):
+        # The title is the window's identity (and what the popup hook matches
+        # on), so key hints live in the popup and the status column instead of
+        # bloating it -- a long title just gets truncated in the tab.
+        ida_kernwin.Choose.__init__(
+            self,
+            MEMBER_CHOOSER_PREFIX + owner,
+            [[" ", 2], ["Member", 38], ["Offset", 8], ["Size", 5],
+             ["Candidates", 34]],
+            flags=(ida_kernwin.Choose.CH_MULTI
+                   | ida_kernwin.Choose.CH_CAN_DEL),
+        )
+        self.owner = owner
+        self.refs = members.iter_members(owner)
+        # Previews are per session and per member; keeping them means the list
+        # still shows what you learned after a refresh.
+        self.previews = {}
+        # Real named commands in the chooser popup. The built-in Edit action is
+        # single-item by nature and has no reliable shortcut, so overloading it
+        # for "preview" left the feature unreachable except via a toolbar
+        # button.
+        self.cmd_declare_only = self.AddCommand(
+            "Declare without scanning", shortcut="Ctrl+D"
+        )
+        self.cmd_preview = self.AddCommand(
+            "Preview candidates", shortcut="Ctrl+E"
+        )
+
+    def OnCommand(self, n, cmd_id):
+        # IDA invokes this once per selected row, so each branch must be safe
+        # to repeat; both of these are keyed by a single member.
+        if not 0 <= n < len(self.refs):
+            return 1
+        ref = self.refs[n]
+        if cmd_id == self.cmd_declare_only:
+            _store_member_declaration(ref)
+        elif cmd_id == self.cmd_preview:
+            preview_member_candidates(self.owner, [ref], self.previews)
+        self.Refresh()
+        return 1
+
+    # -- Choose plumbing ---------------------------------------------------
+
+    def OnGetSize(self):
+        return len(self.refs)
+
+    def OnGetLine(self, n):
+        ref = self.refs[n]
+        declared = store.load(declare.member_id(self.owner, ref.name)) is not None
+        return [
+            "*" if declared else "",
+            ref.name,
+            "0x%X" % ref.byte_offset,
+            "%d" % ref.byte_size,
+            self.previews.get(ref.name, "" if declared else "not declared"),
+        ]
+
+    def OnRefresh(self, sel):
+        self.refs = members.iter_members(self.owner)
+        # adjust_last_item takes a single line number. Under CH_MULTI `sel`
+        # arrives as a sizevec_t, and comparing that to an int raises, so it is
+        # reduced to one line first.
+        rows = self._rows(sel)
+        return self._result(self.adjust_last_item(rows[0] if rows else 0))
+
+    @staticmethod
+    def _rows(sel):
+        """`sel` as a plain list of ints.
+
+        Under CH_MULTI IDA hands over a `sizevec_t`; single-select choosers
+        pass a bare int. Both shapes reach every callback here.
+        """
+        if sel is None:
+            return []
+        if isinstance(sel, int):
+            return [sel]
+        try:
+            return [int(x) for x in sel]
+        except TypeError:
+            return []
+
+    @staticmethod
+    def _result(rows):
+        """A Choose callback result: `[change_flag, line, line, ...]`.
+
+        The contract is a **flat** sequence of ints, not `(flag, selection)`.
+        Returning the selection as a nested list makes SWIG fail to convert
+        item #1, which is silent under single-select (where it happens to be an
+        int) and fatal under CH_MULTI.
+        """
+        return [ida_kernwin.Choose.ALL_CHANGED] + list(rows)
+
+    def _selected_refs(self, sel):
+        return [self.refs[i] for i in self._rows(sel) if 0 <= i < len(self.refs)]
+
+    # -- Actions -----------------------------------------------------------
+
+    def OnSelectLine(self, sel):
+        # Enter and double-click share this one callback -- IDA does not
+        # distinguish them -- so it does the whole job: declare, then show what
+        # each declaration can actually prove. Declaring without that is half an
+        # action, and the cost stays bounded because only selected rows scan.
+        refs = self._declare(sel)
+        if refs:
+            preview_member_candidates(self.owner, refs, self.previews)
+        return self._result(self._rows(sel))
+
+    def _declare(self, sel):
+        refs = self._selected_refs(sel)
+        stored = [r for r in refs if _store_member_declaration(r) is not None]
+        msg("DECLARE: %s -- stored %d of %d selected member(s)"
+            % (self.owner, len(stored), len(refs)))
+        return stored
+
+    def OnDeleteLine(self, sel):
+        removed = 0
+        for ref in self._selected_refs(sel):
+            if store.delete(declare.member_id(self.owner, ref.name)):
+                removed += 1
+        msg("DECLARE: %s -- removed %d declaration(s)" % (self.owner, removed))
+        # The row list is unchanged -- undeclaring clears a column, it does not
+        # remove a member -- so the selection survives as-is.
+        return self._result(self._rows(sel))
+
+
+
+def preview_member_candidates(owner, refs, out):
+    """Run discovery for `refs` and record a one-line verdict per member.
+
+    This is the expensive half of the feature -- it builds the displacement
+    index on first use and decompiles candidate functions -- so it is only ever
+    invoked for members the user explicitly selected.
+    """
+    ranges = get_search_ranges()
+    if not ranges:
+        ida_kernwin.warning("No executable search ranges; cannot build "
+                            "signatures.")
+        return
+
+    # Every member offset of the type, so the scan can rank functions by
+    # co-occurrence rather than sampling a single common displacement.
+    siblings = _sibling_offsets(owner)
+
+    ida_kernwin.show_wait_box("CFS6: scanning %s..." % owner)
+    try:
+        for i, ref in enumerate(refs):
+            if ida_kernwin.user_cancelled():
+                msg("DECLARE: preview cancelled after %d member(s)" % i)
+                break
+            ida_kernwin.replace_wait_box(
+                "CFS6: %s (%d/%d) %s" % (owner, i + 1, len(refs), ref.name)
+            )
+            try:
+                cands, _cov, sites, _searched = choose_member_candidates(
+                    ref, ranges, sibling_offsets=siblings
+                )
+            except Exception as exc:
+                msg("DECLARE: %s candidates failed: %s" % (ref.fullname, exc))
+                out[ref.name] = "scan failed"
+                continue
+            if cands:
+                out[ref.name] = "%d from %s" % (
+                    len(cands), ",".join(sorted(set(c.origin for c in cands)))
+                )
+            else:
+                out[ref.name] = "none (%d site(s) tried)" % sites
+            msg("  %-40s +0x%-6X %s"
+                % (ref.name, ref.byte_offset, out[ref.name]))
+    finally:
+        ida_kernwin.hide_wait_box()
+
+
+def _type_name_from_ctx(ctx):
+    """Name of the UDT the action context points at, or None.
+
+    `action_ctx_base_t.type_ref` is the channel the Local Types view actually
+    populates -- it carries the selected `tinfo_t` outright. Reading chooser
+    columns instead was the bug: it depends on column order, on the view
+    spelling the name without a `struct` keyword, and silently produced "select
+    a structure first" when it failed. The column read survives only as a
+    fallback, and now says so when it is the thing that failed.
+    """
+    try:
+        ref = getattr(ctx, "type_ref", None)
+        if ref is not None and ref.tif is not None and ref.tif.is_udt():
+            name = str(ref.tif.get_type_name() or "").strip()
+            if name:
+                return name
+    except Exception as exc:
+        msg("DECLARE: ctx.type_ref unusable: %s" % exc)
+
+    rows = list(getattr(ctx, "chooser_selection", None) or [])
+    if not rows:
+        msg("DECLARE: no type_ref and no chooser selection "
+            "(widget_type=%s title=%r)"
+            % (getattr(ctx, "widget_type", "?"),
+               str(getattr(ctx, "widget_title", ""))))
+        return None
+
+    try:
+        data = ida_kernwin.get_chooser_data(str(ctx.widget_title), int(rows[0]))
+    except Exception as exc:
+        msg("DECLARE: get_chooser_data(%r, %d) failed: %s"
+            % (str(getattr(ctx, "widget_title", "")), int(rows[0]), exc))
+        return None
+
+    for cell in list(data or []):
+        name = members.normalize_type_name(cell)
+        if name and members.get_struct_tinfo(name) is not None:
+            return name
+
+    msg("DECLARE: no column of row %d resolved to a UDT; row was %r"
+        % (int(rows[0]), list(data or [])))
+    return None
+
+
+def _pick_struct_name(ctx=None):
+    """The structure to work on: from the context, else ask.
+
+    The action must never dead-end. When the context yields nothing, IDA's own
+    type chooser is one extra click, which beats a warning that tells the user
+    to do the thing they already did.
+    """
+    if ctx is not None:
+        name = _type_name_from_ctx(ctx)
+        if name:
+            return name
+    try:
+        tif = ida_typeinf.tinfo_t()
+        if ida_kernwin.choose_struct(tif, "CFS6: choose a structure"):
+            picked = str(tif.get_type_name() or "").strip()
+            if picked:
+                return picked
+    except Exception as exc:
+        msg("DECLARE: choose_struct failed: %s" % exc)
+    return None
+
+
+class DeclarationChooser(ida_kernwin.Choose):
+    """Lists stored declarations; Del removes one, Enter jumps to its site."""
+
+    def __init__(self):
+        ida_kernwin.Choose.__init__(
+            self, "CFS6 declarations",
+            [["Owner", 22], ["Name", 22], ["IDA field", 22],
+             ["Offset", 10], ["Site", 14]],
+        )
+        self.items = []
+
+    def OnInit(self):
+        self.items = store.load_all()
+        return True
+
+    def OnGetSize(self):
+        return len(self.items)
+
+    def OnGetLine(self, n):
+        decl = self.items[n]
+        ref = members.lookup_member(decl.owner, decl.member)
+        # A missing member is the interesting case: it means the type changed
+        # under a declaration and the next export will skip it.
+        offset = "0x%X" % ref.byte_offset if ref is not None else "MISSING"
+        site = ea_str(decl.site_ea) if decl.has_site else "-"
+        return [decl.owner, decl.name, decl.member, offset, site]
+
+    @staticmethod
+    def _row(sel):
+        """Chooser callbacks pass an index or a selection sequence; accept both."""
+        if isinstance(sel, int):
+            return sel
+        try:
+            rows = [int(x) for x in (sel or [])]
+        except TypeError:
+            return -1
+        return rows[0] if rows else -1
+
+    def OnDeleteLine(self, sel):
+        row = self._row(sel)
+        if 0 <= row < len(self.items):
+            store.delete(self.items[row].id)
+            self.items = store.load_all()
+        # Flat `[flag, line]`, never `(flag, selection)` -- see
+        # MemberChooser._result for why the nested form fails to convert.
+        return [ida_kernwin.Choose.ALL_CHANGED] + self.adjust_last_item(
+            max(row, 0)
+        )
+
+    def OnSelectLine(self, sel):
+        row = self._row(sel)
+        if 0 <= row < len(self.items):
+            decl = self.items[row]
+            if decl.has_site:
+                ida_kernwin.jumpto(decl.site_ea)
+        return [ida_kernwin.Choose.NOTHING_CHANGED, max(row, 0)]
+
+
+# ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
 
@@ -333,6 +865,12 @@ class _ExportState:
         self.globals = 0
         self.global_candidates = 0
         self.global_types = 0
+        self.member_values = 0
+        self.member_candidates = 0
+        # Declarations whose IDA member no longer exists.
+        self.member_unresolved = 0
+        # Candidates dropped for not reproducing the IDA-known offset.
+        self.member_disagreements = 0
         self.no_candidate = 0
         self.failures = 0
         self.user_prototypes = 0
@@ -472,6 +1010,76 @@ def _write_global(writer, state, global_ea, ranges):
     return name
 
 
+def _write_member(writer, state, decl, ranges):
+    """Emit one declared member as a derived_value item plus its candidates.
+
+    Two gates, both hard:
+
+    * the declaration must still name a live IDA member. If the field was
+      renamed or deleted, the offset we would export has no backing and the
+      item is skipped loudly rather than exported as a guess.
+    * every candidate must reproduce that member's offset. Candidates are
+      built by searching for exactly that value, so a disagreement means
+      something is wrong with the extraction rather than with the build --
+      it is dropped, never ranked.
+    """
+    ref = members.lookup_member(decl.owner, decl.member)
+    if ref is None:
+        state.member_unresolved += 1
+        msg(
+            "MEMBER_NO_FIELD %-30s -- %s.%s is not in this database; re-declare "
+            "or restore the type"
+            % (decl.qualified, decl.owner, decl.member)
+        )
+        return None
+
+    expected = ref.byte_offset + decl.value_adjust
+    site = (decl.site_ea, decl.site_op) if decl.has_site else None
+
+    try:
+        candidates, coverage, sites, searched = choose_member_candidates(
+            ref, ranges, selected_site=site, value_adjust=decl.value_adjust,
+            sibling_offsets=_sibling_offsets(ref.owner),
+        )
+    except Exception as exc:
+        state.failures += 1
+        msg("MEMBER_FAIL %-33s error=%s" % (decl.qualified, exc))
+        return None
+
+    agreed = [c for c in candidates if c.value == expected]
+    if len(agreed) != len(candidates):
+        state.member_disagreements += len(candidates) - len(agreed)
+        msg("MEMBER_DISAGREE %-29s dropped %d candidate(s) that did not "
+            "reproduce 0x%X"
+            % (decl.qualified, len(candidates) - len(agreed), expected))
+
+    if not agreed:
+        state.no_candidate += 1
+        msg("MEMBER_NO_CANDIDATE %-25s offset=0x%X sites=%d"
+            % (decl.qualified, expected, sites))
+        return None
+
+    item_id = writer.write_derived_value(
+        cfs6.SEM_MEMBER_OFFSET, decl.owner, decl.name, len(agreed), coverage,
+        expected_value=expected,
+    )
+    for rank, cand in enumerate(agreed):
+        writer.write_candidate(item_id, rank, cand)
+        state.member_candidates += 1
+        state.mode_counts[cand.mode] = state.mode_counts.get(cand.mode, 0) + 1
+
+    primary = agreed[0]
+    msg(
+        "MEMBER_EXPORTED %-29s offset=0x%X n=%d bytes=%d exact=%d sites=%d "
+        "tested=%d origins=%s"
+        % (decl.qualified, expected, len(agreed), primary.byte_len,
+           primary.exact, sites, searched,
+           "/".join(sorted(set(c.origin for c in agreed))))
+    )
+    state.member_values += 1
+    return decl.id
+
+
 # Remembered for the rest of the session so a multi-part export of one IDB
 # cannot end up with disagreeing build numbers across its files.
 _CONFIRMED_BUILD = {"number": None, "source": None}
@@ -516,12 +1124,13 @@ def _ask_build_number():
     return number, source
 
 
-def export_items(function_eas, global_eas, title):
+def export_items(function_eas, global_eas, title, declarations=None):
     function_eas = sorted(set(function_eas or []))
     global_eas = sorted(set(global_eas or []))
+    declarations = sorted(declarations or [], key=lambda d: d.id)
 
-    if not function_eas and not global_eas:
-        ida_kernwin.warning("Nothing to export (no functions and no globals).")
+    if not function_eas and not global_eas and not declarations:
+        ida_kernwin.warning("Nothing to export.")
         return False
 
     path = ida_kernwin.ask_file(True, "*.cfs", title)
@@ -564,7 +1173,14 @@ def export_items(function_eas, global_eas, title):
         msg("TYPE_INDEX_WARN: %s" % exc)
         state.local_type_index = {}
 
-    total = len(function_eas) + len(global_eas)
+    # One work list instead of a loop per item kind: the progress, cancel and
+    # error handling are identical, and a third copy of them would drift.
+    work = (
+        [(_write_function, ea) for ea in function_eas]
+        + [(_write_global, ea) for ea in global_eas]
+        + [(_write_member, decl) for decl in declarations]
+    )
+    total = len(work)
 
     ida_kernwin.clr_cancelled()
     ida_kernwin.show_wait_box(
@@ -579,7 +1195,7 @@ def export_items(function_eas, global_eas, title):
 
             done = 0
             cancelled = False
-            for func_ea in function_eas:
+            for handler, payload in work:
                 if ida_kernwin.user_cancelled():
                     cancelled = True
                     break
@@ -587,26 +1203,13 @@ def export_items(function_eas, global_eas, title):
                 if done == 1 or done == total or done % PROGRESS_EVERY == 0:
                     ida_kernwin.replace_wait_box(
                         "Building CFS6 signatures + types...\n%d / %d\n"
-                        "Functions: %d  Globals: %d  Types: %d  No anchor: %d"
+                        "Functions: %d  Globals: %d  Members: %d  Types: %d\n"
+                        "No anchor: %d"
                         % (done, total, state.functions, state.globals,
-                           len(state.exported_types), state.no_candidate)
+                           state.member_values, len(state.exported_types),
+                           state.no_candidate)
                     )
-                _write_function(writer, state, func_ea, ranges)
-
-            if not cancelled:
-                for global_ea in global_eas:
-                    if ida_kernwin.user_cancelled():
-                        cancelled = True
-                        break
-                    done += 1
-                    if done == 1 or done == total or done % PROGRESS_EVERY == 0:
-                        ida_kernwin.replace_wait_box(
-                            "Building CFS6 signatures + types...\n%d / %d\n"
-                            "Functions: %d  Globals: %d  Types: %d  No anchor: %d"
-                            % (done, total, state.functions, state.globals,
-                               len(state.exported_types), state.no_candidate)
-                        )
-                    _write_global(writer, state, global_ea, ranges)
+                handler(writer, state, payload, ranges)
 
             if cancelled:
                 msg("Export cancelled after %d/%d items." % (done - 1, total))
@@ -641,8 +1244,12 @@ def export_items(function_eas, global_eas, title):
         "Globals exported: %d\n"
         "Global candidates: %d\n"
         "Global types: %d\n"
+        "Declared members exported: %d\n"
+        "  Member candidates: %d\n"
+        "  Declarations with no live IDA field: %d\n"
+        "  Candidates dropped for disagreeing with IDA: %d\n"
         "Local type definitions: %d\n"
-        "ENTRY / BODY / REL candidates: %d / %d / %d\n"
+        "ENTRY / BODY / REL / VALUE candidates: %d / %d / %d / %d\n"
         "  BODY not resolvable from .pdata (IDA-only): %d\n"
         "No unique candidate / no anchor: %d\n"
         "Failures: %d\n"
@@ -653,9 +1260,12 @@ def export_items(function_eas, global_eas, title):
             state.function_prototypes,
             state.user_prototypes, state.guessed_prototypes,
             state.globals, state.global_candidates, state.global_types,
+            state.member_values, state.member_candidates,
+            state.member_unresolved, state.member_disagreements,
             len(state.exported_types),
             state.mode_counts.get("ENTRY", 0), state.mode_counts.get("BODY", 0),
-            state.mode_counts.get("REL", 0), state.ida_only_bodies,
+            state.mode_counts.get("REL", 0), state.mode_counts.get("VALUE", 0),
+            state.ida_only_bodies,
             state.no_candidate, state.failures,
             "unknown" if build_number is None else build_number, build_source,
             path,
@@ -663,7 +1273,7 @@ def export_items(function_eas, global_eas, title):
     )
     msg(summary.replace("\n", " | "))
     ida_kernwin.info(summary)
-    return (state.functions + state.globals) > 0
+    return (state.functions + state.globals + state.member_values) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -713,16 +1323,18 @@ class ExportAllBothHandler(ida_kernwin.action_handler_t):
     def activate(self, ctx):
         funcs = get_all_user_named_function_eas()
         globs = get_user_global_eas()
-        if not funcs and not globs:
-            ida_kernwin.warning("No user-named functions or globals found.")
+        decls = store.load_all()
+        if not funcs and not globs and not decls:
+            ida_kernwin.warning("No user-named functions, globals or members.")
             return 1
         if ida_kernwin.ask_yn(
             ida_kernwin.ASKBTN_YES,
-            "Export %d user-named functions and %d user-named globals to CFS6?"
-            % (len(funcs), len(globs)),
+            "Export %d user-named functions, %d user-named globals and %d "
+            "declared members to CFS6?" % (len(funcs), len(globs), len(decls)),
         ) != ida_kernwin.ASKBTN_YES:
             return 1
-        export_items(funcs, globs, "Export ALL user functions + globals to CFS6")
+        export_items(funcs, globs, "Export ALL user items to CFS6",
+                     declarations=decls)
         return 1
 
     def update(self, ctx):
@@ -762,14 +1374,108 @@ class ExportAllGlobalsHandler(ida_kernwin.action_handler_t):
         return _enable_for(ctx, ida_kernwin.BWN_NAMES)
 
 
+# --- Disassembly view: declared members ---
+
+class DeclareMemberHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        ea = getattr(ctx, "cur_ea", BADADDR)
+        if ea == BADADDR:
+            ea = ida_kernwin.get_screen_ea()
+        op_index = ida_kernwin.get_opnum()
+        if op_index < 0:
+            ida_kernwin.warning(
+                "Put the cursor on the operand that references the member "
+                "(the [reg+offset] part), not on the mnemonic."
+            )
+            return 1
+        declare_member_at(ea, op_index)
+        return 1
+
+    def update(self, ctx):
+        return _enable_for(ctx, ida_kernwin.BWN_DISASM)
+
+
+class DeclareStructHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        owner = _pick_struct_name(ctx)
+        if not owner:
+            return 1
+        chooser = MemberChooser(owner)
+        if not chooser.refs:
+            ida_kernwin.warning(
+                "%s has no declarable members.\n\nBase-class fields belong to "
+                "the base type -- declare them there." % owner
+            )
+            return 1
+        msg("%s: %d member(s). Enter = declare + scan, Ctrl+D = declare only, "
+            "Ctrl+E = scan, Del = undeclare. '*' marks a stored declaration. "
+            "Right-click to export." % (owner, len(chooser.refs)))
+        chooser.Show()
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
+class ManageDeclarationsHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        if store.count() == 0:
+            ida_kernwin.info(
+                "No declarations yet.\n\nIn the disassembly view, put the "
+                "cursor on a [reg+offset] operand and press %s."
+                % DECLARE_HOTKEY
+            )
+            return 1
+        DeclarationChooser().Show()
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
+class ExportMembersHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        decls = store.load_all()
+        if not decls:
+            ida_kernwin.warning("No declarations to export.")
+            return 1
+        export_items([], [], "Export declared members to CFS6",
+                     declarations=decls)
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
 class Hooks(ida_kernwin.UI_Hooks):
     def finish_populating_widget_popup(self, widget, popup_handle, ctx=None):
         wt = ida_kernwin.get_widget_type(widget)
+        # The member chooser: attach here rather than in Choose.OnPopup, which
+        # IDA drives from `populating_widget_popup` -- too early for
+        # attach_action_to_popup to stick.
+        try:
+            title = str(ida_kernwin.get_widget_title(widget) or "")
+        except Exception:
+            title = ""
+        if title.startswith(MEMBER_CHOOSER_PREFIX):
+            for aid in (ACTION_EXPORT_MEMBERS, ACTION_MANAGE_DECLS):
+                ida_kernwin.attach_action_to_popup(
+                    widget, popup_handle, aid, "CFS6/"
+                )
+            return
         if wt == ida_kernwin.BWN_FUNCS:
             for aid in (ACTION_SEL_FUNCS, ACTION_ALL_FUNCS, ACTION_ALL_BOTH):
                 ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS6/")
         elif wt == ida_kernwin.BWN_NAMES:
             for aid in (ACTION_SEL_GLOBALS, ACTION_ALL_GLOBALS):
+                ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS6/")
+        elif wt == ida_kernwin.BWN_TILVIEW:
+            for aid in (ACTION_DECLARE_STRUCT, ACTION_MANAGE_DECLS,
+                        ACTION_EXPORT_MEMBERS):
+                ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS6/")
+        elif wt in (ida_kernwin.BWN_DISASM, ida_kernwin.BWN_PSEUDOCODE):
+            for aid in (ACTION_DECLARE_MEMBER, ACTION_DECLARE_STRUCT,
+                        ACTION_MANAGE_DECLS, ACTION_EXPORT_MEMBERS):
                 ida_kernwin.attach_action_to_popup(widget, popup_handle, aid, "CFS6/")
 
 
@@ -781,20 +1487,115 @@ _ACTIONS = [
     (ACTION_ALL_FUNCS, "Export ALL user-named functions to CFS6",
      ExportAllFuncsHandler, None,
      "Export every user-named function (no globals)"),
-    (ACTION_ALL_BOTH, "Export ALL user functions + globals to CFS6",
+    (ACTION_ALL_BOTH, "Export ALL user functions + globals + members to CFS6",
      ExportAllBothHandler, None,
-     "Export every user-named function and global"),
+     "Export every user-named function and global, plus declared members"),
     (ACTION_SEL_GLOBALS, "Export selected globals to CFS6",
      ExportSelGlobalsHandler, None,
      "Export the globals selected in the Names window"),
     (ACTION_ALL_GLOBALS, "Export ALL user-named globals to CFS6",
      ExportAllGlobalsHandler, None,
      "Export every user-named global (no functions)"),
+    (ACTION_DECLARE_MEMBER, "Declare member from this operand",
+     DeclareMemberHandler, DECLARE_HOTKEY,
+     "Record the structure member this operand references as a CFS6 "
+     "derived_value"),
+    (ACTION_DECLARE_STRUCT, "Declare members of a structure...",
+     DeclareStructHandler, None,
+     "Pick which members of a structure to record as CFS6 derived_values"),
+    (ACTION_MANAGE_DECLS, "Manage CFS6 declarations",
+     ManageDeclarationsHandler, None,
+     "List, inspect and delete the declarations stored in this IDB"),
+    (ACTION_EXPORT_MEMBERS, "Export declared members to CFS6",
+     ExportMembersHandler, None,
+     "Export every declared member as a derived_value item"),
 ]
 
 
+# Always-available entry points, independent of which window has focus.
+_MENU_PATH = "Edit/Export/"
+_MENU_ACTIONS = (ACTION_DECLARE_STRUCT, ACTION_EXPORT_MEMBERS,
+                 ACTION_MANAGE_DECLS)
+
+# The importer is a separate plugin, but registered actions live in one global
+# namespace, so the dispatcher can offer it as long as it is loaded.
+ACTION_IMPORT = "cfs5:import_file"
+
+
+class DispatcherChooser(ida_kernwin.Choose):
+    """One entry point for everything, so nothing depends on right-clicking.
+
+    Every row runs an already-registered action. That keeps this a menu and not
+    a second implementation -- the popups, the main menu and this list all
+    trigger exactly the same code.
+    """
+
+    _ROWS = [
+        ("Declare members of a structure...", "members",
+         "Pick which fields to record, then scan for signatures",
+         ACTION_DECLARE_STRUCT),
+        ("Export declared members only", "members",
+         "Write just the derived_value items",
+         ACTION_EXPORT_MEMBERS),
+        ("Manage declarations", "members",
+         "List, inspect and delete what is stored in this IDB",
+         ACTION_MANAGE_DECLS),
+        ("Export selected functions", "functions",
+         "The functions selected in the Functions window",
+         ACTION_SEL_FUNCS),
+        ("Export ALL user-named functions", "functions",
+         "Every user-named function, no globals",
+         ACTION_ALL_FUNCS),
+        ("Export selected globals", "globals",
+         "The globals selected in the Names window",
+         ACTION_SEL_GLOBALS),
+        ("Export ALL user-named globals", "globals",
+         "Every user-named global, no functions",
+         ACTION_ALL_GLOBALS),
+        ("Export EVERYTHING", "all",
+         "Functions + globals + declared members",
+         ACTION_ALL_BOTH),
+        ("Import a .cfs file...", "import",
+         "Runs the CFS6 importer plugin",
+         ACTION_IMPORT),
+    ]
+
+    def __init__(self):
+        ida_kernwin.Choose.__init__(
+            self, "CFS6",
+            [["Action", 36], ["Kind", 10], ["What it does", 52]],
+            flags=ida_kernwin.Choose.CH_MODAL,
+        )
+
+    def OnGetSize(self):
+        return len(self._ROWS)
+
+    def OnGetLine(self, n):
+        label, kind, tip, _action = self._ROWS[n]
+        return [label, kind, tip]
+
+    def show(self):
+        row = self.Show(modal=True)
+        if row < 0:
+            return
+        label, _kind, _tip, action = self._ROWS[row]
+        if not ida_kernwin.process_ui_action(action):
+            # The selected-items actions are only enabled while their window
+            # has focus, and the importer is a separate plugin that may not be
+            # loaded -- say which, rather than failing mutely.
+            ida_kernwin.warning(
+                "%r could not run.\n\n"
+                "Actions on a selection (functions/globals) need that window "
+                "focused -- select there first, then right-click -> CFS6.\n"
+                "Import needs the CFS6 importer plugin to be loaded."
+                % label
+            )
+
+
 class CFS5ExporterPlugin(idaapi.plugin_t):
-    flags = idaapi.PLUGIN_PROC | idaapi.PLUGIN_HIDE
+    # Not PLUGIN_HIDE: run() is a real dispatcher now, so the plugin belongs in
+    # the Plugins list where it can be found without knowing a right-click.
+    flags = idaapi.PLUGIN_PROC
     comment = "CFS6 signature + type exporter for IDA 9 (functions + globals)"
     help = (
         "Functions window -> right click -> CFS6 (functions). "
@@ -803,7 +1604,7 @@ class CFS5ExporterPlugin(idaapi.plugin_t):
         "and function/global/local types."
     )
     wanted_name = PLUGIN_NAME
-    wanted_hotkey = ""
+    wanted_hotkey = DISPATCH_HOTKEY
 
     def init(self):
         self.handlers = []
@@ -819,21 +1620,32 @@ class CFS5ExporterPlugin(idaapi.plugin_t):
                 msg("Action registration failed: %s" % action_id)
                 return idaapi.PLUGIN_SKIP
 
+        # A permanent home in the main menu. The popups are context-dependent,
+        # and exporting only the declared members should not require finding
+        # the right window to right-click in.
+        for action_id in _MENU_ACTIONS:
+            if not ida_kernwin.attach_action_to_menu(
+                _MENU_PATH, action_id, ida_kernwin.SETMENU_APP
+            ):
+                msg("Could not add %s to %s" % (action_id, _MENU_PATH))
+
         self.hooks.hook()
         msg("%s initialized." % VERSION)
         return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
-        ida_kernwin.info(
-            "Functions window -> right-click -> CFS6 (functions).\n"
-            "Names window -> right-click -> CFS6 (globals)."
-        )
+        DispatcherChooser().show()
 
     def term(self):
         try:
             self.hooks.unhook()
         except Exception:
             pass
+        for action_id in _MENU_ACTIONS:
+            try:
+                ida_kernwin.detach_action_from_menu(_MENU_PATH, action_id)
+            except Exception:
+                pass
         for action_id, _label, _factory, _hotkey, _tip in _ACTIONS:
             ida_kernwin.unregister_action(action_id)
 

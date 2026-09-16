@@ -78,6 +78,47 @@ def rel_candidate(pattern, anchor, insn_offset, disp_offset, disp_size,
     )
 
 
+def value_candidate(pattern, anchor=0x2000, insn_offset=0, field_offset=3,
+                    field_size=4, operand_index=1, origin=None, value=0x1E0,
+                    op=None, extra=None, func=0x2000, size=0x80):
+    tokens = pattern.split()
+    extract = {
+        "op": op or cfs6.OP_DISP,
+        "instruction_offset": insn_offset,
+    }
+    if (op or cfs6.OP_DISP) != cfs6.OP_CONST:
+        extract.update({
+            "field_offset": field_offset,
+            "field_size": field_size,
+            "operand_index": operand_index,
+            "signed": True,
+        })
+    extract.update(extra or {})
+    return Candidate(
+        mode="VALUE", signature=pattern,
+        origin=origin or cfs6.ORIGIN_STROFF_XREF,
+        byte_len=len(tokens), wildcards=tokens.count("?"),
+        exact=len(tokens) - tokens.count("?"),
+        anchor_ea=anchor, func_ea=func, func_size=size,
+        insn_offset=insn_offset, extract=extract, value=value,
+    )
+
+
+def write_member_cfs6(path, members, image=None, build_number=14177):
+    """members: [(owner, name, expected, [Candidate, ...]), ...] -> a file."""
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = cfs6.Cfs6Writer(handle)
+        writer.write_header(image or sample_image(), build_number, "user")
+        for owner, name, expected, candidates in members:
+            iid = writer.write_derived_value(
+                cfs6.SEM_MEMBER_OFFSET, owner, name, len(candidates), {},
+                expected_value=expected,
+            )
+            for rank, cand in enumerate(candidates):
+                writer.write_candidate(iid, rank, cand)
+    return path
+
+
 def write_cfs6(path, items, image=None, build_number=14177,
                build_source="path-confirmed"):
     """items: [(kind, name, [Candidate, ...]), ...] -> a CFS6 file on disk."""

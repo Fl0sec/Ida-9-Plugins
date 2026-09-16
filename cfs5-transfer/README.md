@@ -17,6 +17,9 @@ cfs5-transfer/
     policy.py   # Candidate, scoring, dedup, diversity selection (no ida_*)
     peinfo.py   # PE identity, RVA mapping, .pdata (no ida_*)
     image.py    # source-image identity via ida_nalt
+    declare.py  # the user-declaration model (no ida_*)
+    members.py  # structure-member lookup, creation, reference discovery
+    store.py    # declaration persistence in the IDB (netnodes)
     common.py   disasm.py   sigs.py   typeio.py
   docs/cfs6-format.md   # the authoritative format specification
   tests/                # python -m unittest discover -s tests -t tests
@@ -50,6 +53,12 @@ prototypes/types + dependent local types.
 - *Export selected globals* — only the data globals you selected (pick them in
   the Names window). Explicitly selected items skip the human-name heuristic.
 - *Export ALL user-named globals* — every user global, **no functions**.
+
+*Disassembly* view → right-click → **CFS6/**:
+- *Declare member from this operand* (`Ctrl+Shift+M`) — see
+  [Declared members](#declared-members-derived-values) below.
+- *Manage CFS6 declarations* — list, jump to, or delete stored declarations.
+- *Export declared members* — write every declaration as a `derived_value`.
 
 "User global" is gated on location as well as name shape, because IDA sets the
 user-name flag on import thunks and on its own jump tables, and both are shaped
@@ -106,6 +115,93 @@ filter and is either user-named or starts with `g_`. This keeps hand-renamed
 items and drops the thousands of tool-emitted symbols. **Manual selections in
 the Names window bypass this filter** — if you pick it, it exports.
 
+### Declared members (derived values)
+
+Functions and globals answer *where is this*. A **declared member** answers
+*what integer does this code encode* — the byte offset of a structure field,
+recovered from the instructions that access it. A consumer (a dumper with no
+IDB) resolves it the same way it resolves anything else: find the unique
+pattern, extract, and require independent candidates to agree.
+
+**Declaring them.** *CFS6 → Declare members of a structure…* — from the Local
+Types window (the selected type is used) or from anywhere else (you pick one).
+A list of that type's members opens:
+
+| key | does |
+|---|---|
+| `Enter` | declare the selected rows |
+| `Del` | undeclare them |
+| `Ctrl+E` | preview candidates for the selected rows |
+
+Multi-select works, so "all of them" is just select-all. Nothing else is asked —
+the exported name is the IDA field name.
+
+Declaring is instant. **Previewing is the expensive part** (it builds the
+displacement index on first use, then decompiles), which is why it is a separate
+key over the rows you chose rather than something every declaration pays for.
+
+A member with no candidates is stored, not lost. Type more of the binary and
+re-export.
+
+You can still declare a single member from a `[reg+offset]` operand with
+`Ctrl+Shift+M`; that path additionally marks the operand as a struct offset so
+IDA indexes it from then on.
+
+**A real IDA type and member is required.** `member_offset` is an assertion
+that a named field of a named type lives at an offset; without a member behind
+it that assertion is unverified, there is no trustworthy offset to export, and
+no references can ever be found for it. So this is a hard gate, not a warning.
+If a container genuinely cannot be typed, the honest declaration is a different
+semantic that claims less — not a weakened `member_offset`.
+
+**Declarations live in the IDB**, not only in an exported file. Candidate
+quality improves as you type more of the binary, so re-exporting later picks up
+better evidence without re-declaring anything.
+
+**Where candidates come from** — exactly three places, and nowhere else:
+
+- `stroff_xref` — instructions IDA associates with *that exact member*.
+- `selected_operand` — the operand you explicitly picked.
+- `hexrays_memptr` — instructions the decompiler resolves to that member.
+
+The third exists because **IDA 9.0's member xref index is incomplete**. It
+records member xrefs for objects with concrete storage (a stack variable, a
+directly addressed global) but usually not for objects reached through a typed
+pointer — a function parameter, a loaded global pointer. Hex-Rays still prints
+`pFoo->m_x` correctly; that interpretation just never becomes an xref on the
+underlying `[reg+disp]` operand. Measured on cs2 `client.dll`:
+`CGameTrace::m_flFraction` gains 7 functions the index does not contain, and
+`CGameTrace__DidHit` accesses the member through a correctly typed parameter
+with no index entry at all.
+
+There is still deliberately **no acceptance on displacement value alone**. A
+displacement scan only narrows *where to look*; the decompiler, matched **per
+instruction**, is what decides. Two unrelated classes both having a field at
+`0x10` is coincidence, and a candidate manufactured that way would be read as
+*confirmation* of a value it knows nothing about — worse than no candidate.
+
+Two cases stay out of reach and are reported rather than guessed: a member at
+**offset 0** encodes no displacement to scan for, and a **stack-folded** access
+(`filter.m_mode` compiled to `mov [rbp-68h], 3`) does not encode the member
+offset anywhere at all.
+
+**Extraction metadata is derived, never typed in.** The field offset, width and
+operand index come from IDA's decoded operand (`infer_displacement_field`, the
+member analogue of the PC-relative inference used for `REL`), and are only
+accepted when the byte span the decoder assigned reproduces the same value.
+Ambiguity means no candidate. If you ever find yourself typing a hex offset into
+a dialog, something has gone wrong.
+
+**`expected_value`.** Every declared member carries the offset IDA held at
+export time. At export it is a hard gate — a candidate that does not reproduce
+it is dropped rather than ranked. At resolution it is diagnostic: a newer build
+moving a field is **drift**, reported and resolved to the new value, not a
+failure. Nothing like this is expressible in a hand-written signature table.
+
+Expect uneven coverage at first. A well-typed container yields three
+independent candidates; a member you just spotted in one function yields one.
+That is honest, and it is reported per item rather than hidden.
+
 ### `cvutils-cfs-importer.py` — CFS6 Importer
 
 Imports a `.cfs` file into the current IDB: renames matched functions and
@@ -152,6 +248,7 @@ globals, registers missing local types, merges prototypes, applies global types.
 | `header`        | format version + source image identity (first line)  |
 | `function`      | a function item                                      |
 | `global`        | a global-variable item                               |
+| `derived_value` | an item whose value is an integer extracted from code |
 | `candidate`     | one signature candidate, referencing its item by id  |
 | `function_type` | optional IDA `tinfo_t` prototype payload             |
 | `global_type`   | optional IDA `tinfo_t` type payload                  |
@@ -169,6 +266,14 @@ Key contract points:
   addresses.
 - `base_offset` (end of the whole anchor instruction) is **stored, not inferred**.
 - A pattern that does not match exactly once never resolves.
+- `semantic`, extraction `op` and `VALUE` `origin` are **closed sets**: a
+  consumer rejects a value it does not know rather than guessing.
+- `source.expected_value` is a hard gate at export and a drift signal at
+  resolution — never a reason to reject a resolution.
+
+`derived_value` / `VALUE` arrived in **schema revision 1**. The addition is
+purely additive: a revision-0 reader skips them as unknown record kinds, which
+is why `version` stays `6`.
 
 Filenames carry no meaning: `f.cfs` / `g.cfs` / `all.cfs` are cosmetic and every
 file is fully self-describing.

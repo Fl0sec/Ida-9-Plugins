@@ -96,12 +96,15 @@ def field_span_for_offb(insn, offb):
     return max(0, end - offb)
 
 
-def pattern_tokens_for_insn(insn, force_rel=None):
+def pattern_tokens_for_insn(insn, force_wildcard=None):
     """Exact instruction bytes with address-dependent operand bytes wildcarded.
 
-    force_rel=(offb, width) additionally wildcards the validated relative field,
-    guaranteeing the displacement bytes become `?` even if IDA's operand
-    metadata is odd for that instruction.
+    force_wildcard=(offb, width) additionally wildcards one validated field --
+    a REL displacement, or the field a VALUE candidate extracts -- guaranteeing
+    those bytes become `?` even if IDA's operand metadata is odd for that
+    instruction. Both callers rely on it for the same reason: the field is
+    expected to differ in another build, so pinning it would defeat the
+    pattern.
     """
     raw = ida_bytes.get_bytes(insn.ea, insn.size)
     if raw is None or len(raw) != insn.size:
@@ -120,8 +123,8 @@ def pattern_tokens_for_insn(insn, force_rel=None):
                 for j in range(offb, min(end_off, insn.size)):
                     wildcard.add(j)
 
-    if force_rel is not None:
-        offb, width = force_rel
+    if force_wildcard is not None:
+        offb, width = force_wildcard
         for j in range(offb, min(offb + width, insn.size)):
             wildcard.add(j)
 
@@ -159,6 +162,82 @@ def decode_chunk(start_ea, end_ea):
         ea += insn.size
 
     return insns
+
+
+def signed_le(value, nbytes):
+    """Reinterpret the low `nbytes` of `value` as a signed little-endian int."""
+    bits = nbytes * 8
+    value &= (1 << bits) - 1
+    if value & (1 << (bits - 1)):
+        value -= 1 << bits
+    return value
+
+
+def displacement_operands(insn):
+    """Operand indices of `insn` that carry a memory displacement."""
+    out = []
+    for i in range(UA_MAXOP):
+        op = insn.ops[i]
+        if op.type == ida_ua.o_void:
+            break
+        if op.type == ida_ua.o_displ:
+            out.append(i)
+    return out
+
+
+def infer_displacement_field(insn, expected_value):
+    """Locate the encoded displacement field whose value is `expected_value`.
+
+    The derived_value analogue of `infer_pc_relative_field`, and deliberately
+    stricter. It does **not** search instruction bytes for a matching number:
+    it walks the operands the decoder reported, takes each one's own
+    displacement (`op.addr`), and only then confirms that the byte span the
+    decoder assigned to that operand reproduces the same value when read as a
+    signed little-endian integer. Both halves must agree, so the offset and
+    width written into the file are the decoder's, never a guess -- and a
+    consumer reading those bytes is guaranteed to get what we saw.
+
+    Ambiguity is failure: if two operands could both be meant, there is no
+    candidate. Returns a dict with operand_index / field_offset (relative to
+    the instruction) / field_size, or None.
+    """
+    raw = ida_bytes.get_bytes(insn.ea, insn.size)
+    if raw is None or len(raw) != insn.size:
+        return None
+
+    expected = int(expected_value)
+    matches = []
+
+    for i in displacement_operands(insn):
+        op = insn.ops[i]
+        # op.addr is unsigned 64-bit; a negative displacement arrives as its
+        # two's-complement, so compare after sign extension.
+        if signed_le(int(op.addr), 8) != expected:
+            continue
+
+        offb = int(op.offb)
+        # offb == 0 means the decoder did not record a position (byte 0 is the
+        # opcode), so there is nothing a consumer could read.
+        if not 0 < offb < insn.size:
+            continue
+
+        size = field_span_for_offb(insn, offb)
+        if size not in (1, 2, 4, 8) or offb + size > insn.size:
+            continue
+
+        field = int.from_bytes(raw[offb:offb + size], byteorder="little")
+        if signed_le(field, size) != expected:
+            continue
+
+        matches.append({
+            "operand_index": i,
+            "field_offset": offb,
+            "field_size": size,
+        })
+
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def infer_pc_relative_field(insn, target_ea):

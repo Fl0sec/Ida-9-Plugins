@@ -789,6 +789,14 @@ def import_file(path):
         ida_kernwin.warning("No CFS6 function or global records found.")
         return False
 
+    # derived_value items (member offsets and friends) carry no name or type to
+    # apply to an IDB -- they exist for a non-IDA consumer. Say so rather than
+    # letting the user wonder why the counts do not add up.
+    derived = loaded.derived_values()
+    if derived:
+        msg("Skipping %d derived_value item(s): they resolve to integers for "
+            "an external consumer, not to anything importable." % len(derived))
+
     ranges = get_search_ranges()
     if not ranges:
         ida_kernwin.warning("No executable/code search ranges found.")

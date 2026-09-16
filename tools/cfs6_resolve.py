@@ -100,7 +100,47 @@ def resolve(image, cand):
         disp = int.from_bytes(raw, "little", signed=True)
         return match_rva + cand.base_offset + disp + cand.target_delta, None
 
+    if cand.mode == "VALUE":
+        return resolve_value(image, cand, match_rva)
+
     return None, "unsupported mode %s" % cand.mode
+
+
+def resolve_value(image, cand, match_rva):
+    """(value, error) for a VALUE candidate. The result is a number, not an RVA.
+
+    NOTE for a full consumer: this reference has no disassembler, so it can
+    only check that the recorded field lies inside its own instruction. A
+    consumer that *can* decode must additionally confirm the field belongs to
+    `resolve.operand_index` before trusting the number -- that check is why
+    the field is described by operand as well as by position.
+    """
+    if cand.op == cfs6.OP_CONST:
+        return cand.const_value + cand.value_adjust, None
+
+    insn_rva = match_rva + cand.instruction_offset
+    field_rva = match_rva + cand.field_offset
+    size = cand.field_size
+
+    if field_rva < insn_rva:
+        return None, "the extracted field starts before its own instruction"
+
+    raw = image.read(field_rva, size)
+    if raw is None:
+        return None, "field bytes are not mapped"
+    value = int.from_bytes(raw, "little", signed=cand.field_signed)
+
+    if cand.op == cfs6.OP_DISP:
+        result = value
+    elif cand.op == cfs6.OP_DISP_PLUS_WIDTH:
+        result = value + cand.access_width
+    else:
+        return None, "unsupported extraction op %s" % cand.op
+
+    result += cand.value_adjust
+    if cand.alignment > 1:
+        result = -(-result // cand.alignment) * cand.alignment
+    return result, None
 
 
 def resolve_item(image, item):
@@ -150,11 +190,14 @@ def main(argv=None):
     wanted = set(args.name)
     counts = {"ok": 0, "conflict": 0, "unresolved": 0}
     confirmed = 0
+    drifted = 0
 
     for item in loaded.items:
         if wanted and item.name not in wanted:
             continue
 
+        is_value = item.kind == cfs6.REC_DERIVED_VALUE
+        label = item.qualified_name if is_value else item.name
         target, status, details = resolve_item(image, item)
         counts[status] += 1
 
@@ -162,20 +205,28 @@ def main(argv=None):
             agreed = sum(1 for d in details if "->" in d)
             if agreed > 1:
                 confirmed += 1
-            print("OK        %-44s 0x%-8X (%d/%d candidates)"
-                  % (item.name, target, agreed, len(item.candidates)))
+            note = ""
+            if is_value and item.expected_value is not None:
+                # A different value on a newer image is drift, not failure:
+                # the recipe worked, the field moved. Report it and keep going.
+                if target != item.expected_value:
+                    drifted += 1
+                    note = "  DRIFT was 0x%X" % item.expected_value
+            print("OK        %-44s 0x%-8X (%d/%d candidates)%s"
+                  % (label, target, agreed, len(item.candidates), note))
         elif status == "conflict":
-            print("CONFLICT  %-44s candidates disagree" % item.name)
+            print("CONFLICT  %-44s candidates disagree" % label)
         else:
-            print("MISSING   %-44s no candidate resolved" % item.name)
+            print("MISSING   %-44s no candidate resolved" % label)
 
         if args.verbose or status != "ok":
             for line in details:
                 print("            %s" % line)
 
     print("-" * 72)
-    print("resolved=%d confirmed-by-2+=%d conflict=%d unresolved=%d"
-          % (counts["ok"], confirmed, counts["conflict"], counts["unresolved"]))
+    print("resolved=%d confirmed-by-2+=%d drifted=%d conflict=%d unresolved=%d"
+          % (counts["ok"], confirmed, drifted, counts["conflict"],
+             counts["unresolved"]))
     return 0 if counts["conflict"] == 0 and counts["unresolved"] == 0 else 1
 
 

@@ -11,4 +11,4 @@ format version. The format the plugins read and write is CFS6; see
 Target: IDA Professional 9.0 / IDAPython 9.0 / Python 3.12.
 """
 
-VERSION = "6.2.0-ida9"
+VERSION = "6.3.0-ida9"

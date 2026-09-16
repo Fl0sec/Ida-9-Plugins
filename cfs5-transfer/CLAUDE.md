@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Use the `ida-pro-mcp:idapython` skill to check API surface, and treat the modules already imported in `cfs5/` as the known-good ground truth for this codebase.
 - These are IDA **plugins**, not standalone scripts. There is no build/test harness inside IDA. "Running" means loading the two entry `.py` files (with the `cfs5/` package beside them) into IDA's `plugins/` directory and exercising the UI actions against a real IDB. You cannot fully validate behavior outside IDA.
 - You *can* cheaply catch syntax + cross-module wiring errors outside IDA: `python tools/check.py cfs5-transfer` (compile + IDA-9.0 symbol existence + stubbed import).
-- **Four modules are deliberately free of any `ida_*` import and are unit tested**: `cfs5/cfs6.py` (the format), `cfs5/policy.py` (scoring + selection), `cfs5/peinfo.py` (PE/RVA/.pdata) and `tools/cfs6_resolve.py` (the reference resolver). Keep them that way — `cd cfs5-transfer && python -m unittest discover -s tests -t tests` is the only real test harness this repo has. Anything needing IDA goes in the adapter layer (`sigs.py`, `image.py`, the two entry files).
+- **Five modules are deliberately free of any `ida_*` import and are unit tested**: `cfs5/cfs6.py` (the format), `cfs5/policy.py` (scoring + selection), `cfs5/declare.py` (the declaration model), `cfs5/peinfo.py` (PE/RVA/.pdata) and `tools/cfs6_resolve.py` (the reference resolver). Keep them that way — `cd cfs5-transfer && python -m unittest discover -s tests -t tests` is the only real test harness this repo has. Anything needing IDA goes in the adapter layer (`sigs.py`, `image.py`, `members.py`, `store.py`, the two entry files).
 
 ## What this repo is
 
@@ -25,8 +25,13 @@ cfs5-transfer/
     policy.py   # Candidate, score, dedup, diversity selection       [no ida_*]
     peinfo.py   # PE identity, RVA mapping, .pdata runtime functions [no ida_*]
     image.py    # image identity + build detection + .pdata ownership (IDB-first)
+    declare.py  # user-declaration model for derived values              [no ida_*]
+    members.py  # struct-member lookup/creation/enumeration + stroff xrefs
+    memberscan.py # displacement index + Hex-Rays ctree member-site discovery
+    store.py    # declaration persistence in the IDB (one netnode each)
     common.py   # constants, msg/ea_str, search ranges, byte search
-    disasm.py   # insn decode, operand-aware tokenizer, PC-relative inference, xref iters
+    disasm.py   # insn decode, operand-aware tokenizer, PC-relative + displacement
+                # field inference, xref iters
     sigs.py     # IDA-touching ENTRY/BODY/REL finders (rules live in policy.py)
     typeio.py   # binary tinfo transport: materialize/serialize/deserialize, register, merge
   docs/cfs6-format.md     # AUTHORITATIVE format spec -- update it with any change
@@ -42,7 +47,9 @@ Internal plugin/class identities are `CFS5ExporterPlugin` / `CFS5ImporterPlugin`
 
 **[docs/cfs6-format.md](docs/cfs6-format.md) is the authoritative specification.** Change the format there *and* in `cfs6.py`, never by hand-formatting a record in an entry file.
 
-UTF-8 JSONL, no BOM, one JSON object per line. Exactly one `header` record, on the first non-empty line; a file that does not start with one is rejected outright ("not a CFS6 file; re-export"). Record kinds: `header`, `function`, `global`, `candidate`, plus the optional IDA-specific `function_type` / `global_type` / `local_type` (independently skippable — resolution never decodes them). Unknown record kinds are reported and skipped; unknown fields are ignored; `version != 6` is fatal. Items carry an `id` (`fn:Name` / `global:Name`) and candidates reference it via `item`, so functions and globals share one namespace without colliding.
+UTF-8 JSONL, no BOM, one JSON object per line. Exactly one `header` record, on the first non-empty line; a file that does not start with one is rejected outright ("not a CFS6 file; re-export"). Record kinds: `header`, `function`, `global`, `derived_value`, `candidate`, plus the optional IDA-specific `function_type` / `global_type` / `local_type` (independently skippable — resolution never decodes them). Unknown record kinds are reported and skipped; unknown fields are ignored; `version != 6` is fatal. Items carry an `id` (`fn:Name` / `global:Name` / `member:Owner::Name`) and candidates reference it via `item`, so all item kinds share one namespace without colliding.
+
+**Two families of item.** `function`/`global` answer *where is this* — a candidate resolves to an address. `derived_value` answers *what integer does this code encode* — a candidate resolves to a number. Same pattern search, same uniqueness rule, same agreement/conflict semantics; only the final arithmetic differs. A `VALUE` candidate may only belong to a `derived_value` and vice versa; the reader enforces it.
 
 Invariants you must not break:
 
@@ -54,6 +61,24 @@ Invariants you must not break:
 - BODY carries `source.body_offset`; ownership requires `match - body_offset` to be a function start *exactly* (a `.pdata` begin for a non-IDA consumer). `function_size` is diagnostic and must never reject a hit.
 - BODY also carries `resolve.ownership`: `"pdata"` or `"ida-only"`. **IDA's function extents and the PE's RUNTIME_FUNCTION table disagree for chunked/outlined functions** — their IDA start is not the `.pdata` begin the body sits in — so such candidates are labelled `ida-only` and a non-IDA consumer must skip them. The exporter classifies this via `image.BodyOwnership`; never emit a bare `"pdata"` without checking.
 - A pattern matching zero or 2+ times never resolves.
+
+## Derived values (`derived_value` + `VALUE`, schema revision 1)
+
+`member_offset` is the only semantic produced today; `element_stride`, `object_extent` and `constant` are reserved. `semantic`, extraction `op` (`CONST`/`DISP`/`IMM`/`SCALE`/`DISP_PLUS_WIDTH`) and `VALUE` `origin` are **closed sets** — a consumer rejects an unknown value rather than interpreting it. No expression strings, ever.
+
+Non-negotiable rules for this family:
+
+- **A `member_offset` requires a real IDA type and member.** No member, no declaration — the semantic is an assertion, and without a backing field it is unverified and produces no `expected_value`. When the container is typed but the field is missing, `_resolve_or_create_member` offers to create it (and then `op_stroff`s the operand so the site is indexed next time). If a container genuinely cannot be typed, the answer is a semantic that claims less, never a weakened `member_offset`.
+- **Candidates come only from `stroff_xref`, `selected_operand` or `hexrays_memptr`.** Every one names a *type-directed* producer of the instruction↔member association. Never accept a site because it encodes the same number: numeric equality does not prove two accesses refer to the same member, and a false candidate is worse than a missing one because agreement would read it as *confirmation*. The reader rejects any other origin, which is what makes the rule checkable rather than a promise.
+- **`hexrays_memptr` compensates for a real IDA 9.0 defect, and is not a loophole.** IDA 9.0 does not record member xrefs for objects reached through a typed pointer (parameters, loaded global pointers), so `stroff_xref` alone leaves most members with zero candidates — see the measurements in `cfs5/memberscan.py`. There, a displacement scan is only a **search-space prefilter**; the discriminator is a `cot_memptr`/`cot_memref` node matched **per instruction** against both the member offset and the owner type name. Do not weaken that to a per-function check (e.g. "the member name appears in the pseudocode") — that accepts unrelated accesses in the same function and same-named fields on other structs.
+- **The displacement index is built once per session** (`memberscan.build_displacement_index`), not per member. Per-member rebuilding makes declaring a whole structure unusable.
+- **Extraction metadata is decoder-derived, never user-entered.** `disasm.infer_displacement_field` walks the operands IDA reported, takes each one's own `op.addr`, and only accepts a field when the byte span the decoder assigned reproduces the same value. Ambiguity → no candidate. This is the member analogue of `infer_pc_relative_field`; keep them symmetrical.
+- **The extracted field is wildcarded in the pattern.** The value is expected to change between builds — pinning it would break the pattern exactly when the answer became interesting.
+- **`source.expected_value` is a hard gate at export, a drift signal at resolution.** `_write_member` drops any candidate that does not reproduce the IDA-known offset. A consumer that extracts a different value on a newer image has found drift, not a failure, and must resolve to the new value. It lives on the item and is never duplicated per candidate.
+- **VALUE patterns have their own exact-byte floor** (`policy.value_min_exact`, 8). `candidate_min_exact`'s short tier (4 exact under 10 bytes) is calibrated for REL, where a 4-byte rel32 is wildcarded. VALUE wildcards a *single* byte, so that tier let a lone 5-byte instruction through with 4 exact bytes — genuinely unique in its own build, but very likely to collide in the next one, and a pattern with 2+ matches resolves to nothing. Don't merge the two floors back together.
+- **A `CONST` candidate is kept only when it is the sole candidate** (`policy.select_value_candidates`). CONST extracts nothing, so several would agree unconditionally — fake confirmation.
+- `declare.Declaration` stores identity only (semantic, owner, canonical name, IDA field name, the selected site). **Never store the offset**: re-deriving it is what makes a better-typed IDB produce a better export, and what makes a moved field visible instead of silently carried forward. `name` and `member` are separate so a project naming convention does not force a rename in the database.
+- Declarations persist in the IDB via `store.py` (one netnode each, blob at index 0, plus an index node), every write read-back-verified.
 
 **No backward compatibility.** The CSV era (`CFS2`/`CFS2G`/`CFS3*`/`CFS4*`/`CFS5GLOB`, legacy Cra0 rows) is deleted, not deprecated. Do not reintroduce it.
 
@@ -96,6 +121,7 @@ deliberately bypasses the whole heuristic — the user picked those explicitly.
 
 - Nearly every IDA call is wrapped in `try/except` with an `msg(...)` diagnostic — IDA's Python bindings raise inconsistently across type shapes. Match this; one unhandled exception aborts a whole export/import loop.
 - Long loops use `show_wait_box`/`replace_wait_box`/`user_cancelled`; keep new long work cancellable.
+- **`Choose` callbacks return a flat `[change_flag, line, line, ...]`, not `(flag, selection)`.** The docstrings say "a tuple (changed, selection)" but the marshaller wants ints all the way down — returning the selection nested raises `ValueError: Sequence item #1 cannot be converted`. This is invisible in a single-select chooser (where `sel` is an int and happens to convert) and fatal the moment you add `CH_MULTI`, where `sel` is a `sizevec_t`. Same trap in `adjust_last_item(n)`: it compares `n >= cnt`, so pass one line number, never the selection. `MemberChooser._rows` / `._result` are the normalizers — use them.
 - `msg` prints to the Output window prefixed `[CFS6]`; the final summary also goes to an `info` popup. With no in-IDA test harness, these diagnostics are the primary debugging channel.
 - **Multi-candidate semantics (importer).** Every candidate of an item is evaluated, not just the first that resolves. Agreement between independent candidates is confirmation and is reported (`confirmed-by=N`); candidates resolving to *different* addresses is a **conflict** — apply nothing and say so loudly. Two items resolving to one address is also a conflict. Never let rank 0 silently win a disagreement.
 - Plugin/class identities (`CFS5ExporterPlugin`, `CFS5ImporterPlugin`, the `cfs5:*` action ids, the `cfs5` package name) are deliberately **unchanged** across the CFS6 format switch — they are the plugin's registered surface, not the format version.

@@ -22,8 +22,11 @@ MAX_XREFS_TO_SEARCH = 24
 XREF_EARLY_STOP_AFTER = 6
 MAX_EXPORTED_CANDIDATES = 4
 MAX_GLOBAL_CANDIDATES = 3
+MAX_VALUE_CANDIDATES = 3
 MIN_EXACT_BYTES = 6
 MIN_SHORT_EXACT_BYTES = 4
+# VALUE wildcards one byte, not a rel32, so it must not inherit the short tier.
+VALUE_MIN_EXACT_BYTES = 8
 
 # Origin categories. These are part of the exported contract.
 ORIGIN_ENTRY = "function_entry"
@@ -31,20 +34,47 @@ ORIGIN_EXTERNAL_CALL = "external_call"
 ORIGIN_SELF_CALL = "self_call"
 ORIGIN_DATA_REF = "data_reference"
 ORIGIN_BODY = ("body_early", "body_middle", "body_late")
+# derived_value origins live in cfs6.py beside the format rule that closes the
+# set; re-exported here so finders import one module.
+ORIGIN_STROFF_XREF = cfs6.ORIGIN_STROFF_XREF
+ORIGIN_SELECTED_OPERAND = cfs6.ORIGIN_SELECTED_OPERAND
+ORIGIN_HEXRAYS_MEMPTR = cfs6.ORIGIN_HEXRAYS_MEMPTR
 
 # Resolution axes an item can be covered by.
 AXIS_ENTRY = "entry"
 AXIS_EXTERNAL_REL = "external_rel"
 AXIS_SELF_REL = "self_rel"
 AXIS_BODY = "body"
+AXIS_VALUE = "value"
 
-_MODE_ORDER = {"ENTRY": 0, "REL": 1, "BODY": 2}
-_MODE_PENALTY = {"ENTRY": 0, "REL": 12, "BODY": 18}
+_MODE_ORDER = {"ENTRY": 0, "REL": 1, "BODY": 2, "VALUE": 3}
+_MODE_PENALTY = {"ENTRY": 0, "REL": 12, "BODY": 18, "VALUE": 12}
 
 
 def candidate_min_exact(total_bytes):
     """Minimum non-wildcard bytes a pattern of this length must carry."""
     return MIN_SHORT_EXACT_BYTES if total_bytes < 10 else MIN_EXACT_BYTES
+
+
+def value_min_exact(total_bytes):
+    """The same floor for VALUE candidates, which needs to be much higher.
+
+    `candidate_min_exact`'s short tier (4 exact bytes under 10 total) is
+    calibrated for REL, where a 4-byte rel32 is wildcarded and a 10-byte
+    pattern legitimately carries only 4-6 concrete bytes.
+
+    A VALUE candidate wildcards a *single* displacement byte, so the same rule
+    lets a lone 5-byte instruction through with 4 exact bytes. That pattern is
+    genuinely unique in the image it was built from -- uniqueness is verified,
+    not assumed -- but uniqueness in one build says very little about the next
+    one, and a pattern that picks up a second match resolves to nothing at all.
+    The member would then stop working silently on a rebuild, which is the
+    exact failure this format exists to prevent.
+
+    So VALUE is held to a flat, higher floor: expand into the neighbouring
+    instructions rather than stop at the first technically-unique window.
+    """
+    return max(VALUE_MIN_EXACT_BYTES, candidate_min_exact(total_bytes))
 
 
 def primary_chunk_limit(insns, func_ea, ownership):
@@ -97,14 +127,15 @@ class Candidate:
         "mode", "signature", "origin", "byte_len", "wildcards", "exact",
         "score", "anchor_ea", "func_ea", "func_size", "body_offset",
         "target_ea", "target_delta", "rel_offset", "rel_size", "base_offset",
-        "insn_offset", "is_data", "ownership",
+        "insn_offset", "is_data", "ownership", "extract", "value",
     )
 
     def __init__(
         self, mode, signature, origin="", byte_len=0, wildcards=0, exact=0,
         anchor_ea=0, func_ea=0, func_size=0, body_offset=0, target_ea=0,
         target_delta=0, rel_offset=0, rel_size=0, base_offset=0,
-        insn_offset=0, is_data=False, ownership="pdata",
+        insn_offset=0, is_data=False, ownership="pdata", extract=None,
+        value=None,
     ):
         self.mode = mode
         self.signature = cfs6.normalize_pattern(signature)
@@ -125,6 +156,12 @@ class Candidate:
         self.is_data = bool(is_data)
         # BODY only: how a consumer can recover the owning function.
         self.ownership = ownership
+        # VALUE only: the extraction recipe, and the integer it produced here.
+        # `value` is an export-time check (every candidate of an item must
+        # agree with the item's expected_value) and is never serialized per
+        # candidate -- the item carries the one authoritative value.
+        self.extract = dict(extract or {})
+        self.value = value
 
         # Lower is better. Length dominates: once a pattern is source-unique,
         # shorter is usually less flaky across versions. Wildcards get only a
@@ -141,6 +178,8 @@ class Candidate:
             return AXIS_ENTRY
         if self.mode == "BODY":
             return AXIS_BODY
+        if self.mode == "VALUE":
+            return AXIS_VALUE
         if self.origin == ORIGIN_SELF_CALL:
             return AXIS_SELF_REL
         return AXIS_EXTERNAL_REL
@@ -195,6 +234,10 @@ class Candidate:
             }
         elif self.mode == "BODY":
             resolve = {"ownership": self.ownership}
+        elif self.mode == "VALUE":
+            # Built entirely by the finder from decoded operand metadata; the
+            # policy layer never invents or edits an extraction field.
+            resolve = dict(self.extract)
         else:
             resolve = {}
         # Optional with a documented default of 0; omit the common case.
@@ -293,6 +336,43 @@ def select_global_candidates(candidates, max_count=MAX_GLOBAL_CANDIDATES):
             continue
         selected.append(cand)
     return selected
+
+
+def select_value_candidates(candidates, max_count=MAX_VALUE_CANDIDATES):
+    """Best distinct anchor sites for a derived_value item.
+
+    There is one axis, so this is a straight best-first pick of
+    non-overlapping sites -- the same shape as globals. What makes the result
+    meaningful is *where* the inputs came from: independent instructions, in
+    different functions, that each encode the same number. Two candidates
+    carved out of one instruction would be one piece of evidence counted
+    twice, which the overlap test rejects.
+
+    A CONST candidate is kept only when it is the sole candidate. CONST
+    extracts nothing from the code, so several of them would agree
+    unconditionally -- fake confirmation rather than evidence.
+    """
+    selected = []
+    for cand in dedup_and_order(candidates):
+        if len(selected) >= max_count:
+            break
+        if any(cand.overlaps(other) for other in selected):
+            continue
+        selected.append(cand)
+
+    real = [c for c in selected if c.extract.get("op") != cfs6.OP_CONST]
+    if real:
+        return real
+    # Nothing but CONSTs: keep one. Several would agree unconditionally, which
+    # would read as confirmation while proving nothing.
+    return selected[:1]
+
+
+def value_coverage(selected):
+    """Coverage for a derived_value item: one axis, honestly reported."""
+    return {
+        AXIS_VALUE: cfs6.COV_SELECTED if selected else cfs6.COV_NONE_UNIQUE
+    }
 
 
 def coverage_for(selected, attempted_axes):
