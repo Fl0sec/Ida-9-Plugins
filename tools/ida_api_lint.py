@@ -1,45 +1,72 @@
-"""Verify that every `ida_*` symbol a source file touches exists in IDA 9.0.
+"""Verify that every `ida_*` symbol a source file touches exists in IDA.
 
 The IDAPython stubs shipped with IDA (`<ida>/python/ida_*.py`) are the ground
-truth for what the 9.0 API actually exposes. They cannot be imported outside
+truth for what the API actually exposes. They cannot be imported outside
 IDA (they load native `_ida_*` extensions), so this parses them with `ast` and
 builds a module -> exported-name table, resolving `from ida_x import *`
 re-exports transitively (that is how `idaapi` gets its surface).
 
 Then every `mod.attr` access and `from mod import name` in the checked sources
 is looked up in that table. An unknown name is almost always an API that was
-removed or renamed in 9.0 (`get_inf_structure`, `ida_struct`, `ida_enum`,
+removed or renamed (`get_inf_structure`, `ida_struct`, `ida_enum`,
 `find_binary`, ...), i.e. exactly the class of bug that only shows up when the
 plugin is loaded into IDA.
 
+The stub tree checked against is the **newest IDA installed**, because that is
+what the plugin is actually loaded into. Symbols do not only disappear between
+versions -- behaviour changes too (the 9.4 Functions window stopped handing a
+usable chooser to action contexts) -- and this tool proves existence only.
+
 Usage:
     python tools/ida_api_lint.py <file-or-dir> [...]
-    IDA_PYTHON_DIR=... python tools/ida_api_lint.py .
+    IDA_PYTHON_DIR=... python tools/ida_api_lint.py .   # pin one tree
 """
 
 import ast
 import os
+import re
 import sys
 
 
-DEFAULT_IDA_PYTHON_DIRS = [
-    r"C:\Program Files\IDA Professional 9.0\python",
-    r"C:\Program Files\IDA Pro 9.0\python",
+# Where IDA installs, newest-first within each root. Order inside a directory
+# is resolved by version number, not by listing order.
+IDA_INSTALL_ROOTS = [
+    r"C:\Program Files",
+    r"C:\Program Files (x86)",
 ]
+_IDA_DIR_RE = re.compile(r"^IDA (?:Professional|Pro|Free) (\d+)\.(\d+)$")
 
 # Modules whose surface we check. Anything else (os, re, csv, project packages)
 # is ignored -- normal tooling already covers those.
 CHECKED_PREFIXES = ("ida_", "idaapi", "idautils", "idc")
 
 
+def find_ida_python_dirs():
+    """Every installed IDA stub tree, newest first."""
+    found = []
+    for root in IDA_INSTALL_ROOTS:
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for name in entries:
+            match = _IDA_DIR_RE.match(name)
+            if not match:
+                continue
+            python_dir = os.path.join(root, name, "python")
+            if os.path.isdir(python_dir):
+                found.append(((int(match.group(1)), int(match.group(2))),
+                              python_dir))
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [path for _version, path in found]
+
+
 def find_ida_python_dir():
     env = os.environ.get("IDA_PYTHON_DIR")
     if env:
         return env
-    for path in DEFAULT_IDA_PYTHON_DIRS:
-        if os.path.isdir(path):
-            return path
-    return None
+    dirs = find_ida_python_dirs()
+    return dirs[0] if dirs else None
 
 
 def _module_exports(path):
@@ -183,6 +210,13 @@ def iter_sources(targets):
                     yield os.path.join(root, name)
 
 
+def _version_label(python_dir):
+    """"IDA 9.4" for a stub path, so a failure names the version it checked."""
+    name = os.path.basename(os.path.dirname(os.path.abspath(python_dir)))
+    match = _IDA_DIR_RE.match(name)
+    return "IDA %s.%s" % match.groups() if match else name
+
+
 def main(argv):
     targets = argv[1:] or ["."]
     python_dir = find_ida_python_dir()
@@ -200,7 +234,8 @@ def main(argv):
             total += 1
             continue
         for lineno, module, name in problems:
-            print("%s:%d: %s.%s not in IDA 9.0" % (path, lineno, module, name))
+            print("%s:%d: %s.%s not in %s"
+                  % (path, lineno, module, name, _version_label(python_dir)))
             total += 1
 
     print("ida_api_lint: %d problem(s) [stubs: %s]" % (total, python_dir))

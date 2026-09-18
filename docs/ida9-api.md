@@ -9,6 +9,31 @@ compiles fine and fails at load time inside IDA.
 (`C:\Program Files\IDA Professional 9.0\python`) — reverify rather than trusting
 this file if the install is ever upgraded.
 
+**The runtime target is now 9.4** (9.0 is still installed alongside it).
+`tools/check.py` lints against the newest installed tree by default, so the 9.0
+deltas below are history rather than the current gate. To compare two versions
+directly, pin one:
+
+```bash
+IDA_PYTHON_DIR="C:\Program Files\IDA Professional 9.0\python" python tools/ida_api_lint.py my-plugin
+```
+
+### 9.4 deltas seen so far
+
+- **`action_ctx_base_t.chooser` + `chooser_selection` are no longer a reliable
+  way to read the Functions window's selection.** Both symbols still exist, so
+  the linter stays silent; what changed is that the context no longer yields a
+  chooser whose `get_ea(row)` maps the selected row — the window is a dirtree,
+  with folders. Read the *widget* instead:
+  `get_chooser_rows(rows, ctx.widget_title, GCRF_SELECTION)` returns the
+  rendered cells, which is layout- and version-independent. Keep the old path
+  as a first attempt, and **log which source answered** — that log line is what
+  turned this from a mystery into a one-line diagnosis.
+- New on the context: `cur_func_info`, `cur_fchunk_info`, `cur_seg_info`
+  (`func_entry_info_t` / `fchunk_info_t` / `segment_info_t`), and
+  `choose_func_ea` alongside `choose_func`. Consistent with `func_t *` becoming
+  less central; prefer the ea-returning forms in new code.
+
 ## Verification: the ground truth is on disk
 
 The IDAPython stubs shipped with IDA are the authoritative list of what exists.

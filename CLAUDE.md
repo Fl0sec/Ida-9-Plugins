@@ -5,19 +5,28 @@ editing any IDA plugin code here.**
 
 ## Hard constraints (non-negotiable)
 
-1. **Target is IDA Professional 9.0 / IDAPython 9.0 / Python 3.12 ONLY.**
-   IDA 9.0 removed and moved a large amount of API surface. Do not write
-   `ida_*` calls from memory of IDA 7.x/8.x or from generic "IDAPython"
-   recall — a call that looks right and does not exist in 9.0 fails only when
-   the plugin is loaded into IDA, where nothing catches it for you.
+1. **Target is IDA Professional 9.4 / IDAPython 9.4 / Python 3.12.** (9.0 is
+   still installed and was the previous target; nothing here may assume a
+   symbol that 9.4 dropped.) IDA 9.0 removed and moved a large amount of API
+   surface and 9.4 moved more. Do not write `ida_*` calls from memory of IDA
+   7.x/8.x or from generic "IDAPython" recall — a call that looks right and
+   does not exist fails only when the plugin is loaded into IDA, where nothing
+   catches it for you.
 2. **Verify every `ida_*` symbol before relying on it.** The ground truth is
    the local stub tree, not your memory:
-   `C:\Program Files\IDA Professional 9.0\python\ida_*.py`.
+   `C:\Program Files\IDA Professional 9.4\python\ida_*.py`.
    `python tools/check.py <plugin-dir>` does this mechanically for the whole
-   file — run it, don't eyeball it. See [docs/ida9-api.md](docs/ida9-api.md)
-   for the known 9.0 deltas and the grep recipes.
-3. **If you cannot verify a symbol exists in 9.0, do not use it.** Find the
-   9.0 replacement, or say the approach is unverified — never guess.
+   file — run it, don't eyeball it. It resolves the **newest installed** IDA
+   automatically; `IDA_PYTHON_DIR=...` pins a different tree if you need to
+   check both. See [docs/ida9-api.md](docs/ida9-api.md) for the known deltas
+   and the grep recipes.
+3. **If you cannot verify a symbol exists, do not use it.** Find the
+   replacement, or say the approach is unverified — never guess.
+   **Existence is not behaviour.** 9.4 kept `action_ctx_base_t.chooser` and
+   `chooser_base_t.get_ea` but stopped giving the Functions window a usable
+   pair of them, and the linter cannot see that. When an API feeds a UI
+   action, log which path produced the answer so a silent change is
+   diagnosable from the Output window instead of a debugging round trip.
 4. **Use modern `ida_*` modules, never `idc`.** `idc` is a legacy compatibility
    shim; its behaviour and return conventions are inconsistent. `idautils` is
    fine for iteration (`Functions()`, `XrefsTo()`, `Heads()`, `Strings()`).
@@ -141,7 +150,7 @@ Three passes, all of which catch real bugs without IDA:
 | Pass | Catches |
 |------|---------|
 | compile | syntax errors in every `.py` |
-| api | `ida_*` symbols that don't exist in IDA 9.0 |
+| api | `ida_*` symbols that don't exist in the newest installed IDA (9.4) |
 | import | broken cross-module wiring, import-time crashes (IDA stubbed out) |
 
 What it **cannot** prove: that a call does the right thing on a real IDB. Pure

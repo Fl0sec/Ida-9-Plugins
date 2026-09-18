@@ -1,10 +1,12 @@
-"""Offline sanity gate for IDA 9.0 plugins -- run this before every commit.
+"""Offline sanity gate for IDA plugins -- run this before every commit.
 
 IDA plugins cannot be unit-tested outside IDA, but three whole classes of bug
 *can* be caught without launching it:
 
   1. compile   -- syntax errors in every .py file.
-  2. api       -- `ida_*` symbols that do not exist in IDA 9.0 (tools/ida_api_lint.py).
+  2. api       -- `ida_*` symbols that do not exist in the IDA the plugin will
+                  be loaded into: the newest installed, or IDA_PYTHON_DIR
+                  (tools/ida_api_lint.py).
   3. import    -- cross-module wiring (bad `from .x import y`, typos in shared
                   helpers, import-time crashes) by importing each module with
                   the IDA modules replaced by permissive stubs.
