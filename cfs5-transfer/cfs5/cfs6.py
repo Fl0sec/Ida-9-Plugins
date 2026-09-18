@@ -389,7 +389,7 @@ class TypeRecord:
 class LoadedCfs:
     __slots__ = (
         "header", "items", "type_records", "item_meta", "parse_errors",
-        "skipped_records",
+        "skipped_records", "lines", "header_line",
     )
 
     def __init__(self, header=None):
@@ -399,6 +399,10 @@ class LoadedCfs:
         self.item_meta = {}      # item id -> ItemMeta
         self.parse_errors = 0
         self.skipped_records = 0
+        # Raw source lines, 0-based, kept so a merge can carry a record over
+        # byte-for-byte instead of re-serializing a parsed approximation of it.
+        self.lines = []
+        self.header_line = 1
 
     def functions(self):
         return [i for i in self.items if i.kind == REC_FUNCTION]
@@ -418,6 +422,14 @@ class LoadedCfs:
 
     def image(self):
         return self.header.get("image") or {}
+
+    def describe_contents(self):
+        """One-line inventory, for a merge prompt."""
+        return (
+            "%d functions, %d globals, %d derived values, %d local types"
+            % (len(self.functions()), len(self.globals()),
+               len(self.derived_values()), len(self.type_records))
+        )
 
     def describe_source(self):
         img = self.image()
@@ -452,6 +464,10 @@ class Cfs6Writer:
         self.imagebase = int(imagebase)
         self.items = 0
         self.candidates = 0
+        # What this run has written, so `carry_over` knows which records of a
+        # file being merged into are superseded by a fresher export.
+        self.item_ids = set()
+        self.type_names = set()
 
     def _emit(self, obj):
         self.handle.write(_dumps(obj))
@@ -479,6 +495,7 @@ class Cfs6Writer:
             "coverage": coverage,
         })
         self.items += 1
+        self.item_ids.add(iid)
         return iid
 
     def write_derived_value(self, semantic, owner, name, candidate_count,
@@ -502,6 +519,7 @@ class Cfs6Writer:
             obj["source"] = {"expected_value": int(expected_value)}
         self._emit(obj)
         self.items += 1
+        self.item_ids.add(iid)
         return iid
 
     def write_candidate(self, iid, rank, cand):
@@ -536,6 +554,7 @@ class Cfs6Writer:
         })
 
     def write_local_type(self, name, kind, blobs):
+        self.type_names.add(name)
         self._emit({
             "record": REC_LOCAL_TYPE,
             "name": name,
@@ -546,6 +565,147 @@ class Cfs6Writer:
             "fields": pack_bytes(blobs[1]),
             "field_comments": pack_bytes(blobs[2]),
         })
+
+
+# ---------------------------------------------------------------------------
+# Merging an export into an existing file
+#
+# A CFS6 file cannot be appended to as raw text: the header is singular and
+# must be first, and a re-exported item would collide with its own previous
+# `id`. So a merge is a rewrite -- write the new export, then carry over the
+# records of the old file that it does not supersede.
+# ---------------------------------------------------------------------------
+
+# Header/image fields that must agree before two exports may share a file.
+# Everything downstream (source RVAs, coverage, the single build number) is
+# stated relative to one image; mixing two makes the header lie about half the
+# records. Fields absent on either side are not evidence of a mismatch.
+_IDENTITY_FIELDS = (
+    ("name", "image name"),
+    ("architecture", "architecture"),
+    ("size_of_image", "size_of_image"),
+    ("sha256", "sha256"),
+)
+
+
+class MergeStats:
+    """What `carry_over` kept and what the new export replaced."""
+
+    __slots__ = ("items", "candidates", "types", "metas",
+                 "replaced_items", "replaced_types", "replaced_lines",
+                 "dropped_lines")
+
+    def __init__(self):
+        self.items = 0
+        self.candidates = 0
+        self.types = 0
+        self.metas = 0
+        self.replaced_items = 0
+        self.replaced_types = 0
+        # Lines the fresh export superseded, kept apart from the unparsable
+        # ones: conflating them reads as a corrupt file when nothing is wrong.
+        self.replaced_lines = 0
+        self.dropped_lines = 0
+
+    def describe(self):
+        return (
+            "carried %d items (%d candidates, %d type payloads, %d local "
+            "types); replaced %d items and %d local types (%d lines); "
+            "dropped %d unparsable lines"
+            % (self.items, self.candidates, self.metas, self.types,
+               self.replaced_items, self.replaced_types, self.replaced_lines,
+               self.dropped_lines)
+        )
+
+
+def merge_conflicts(header, image, build_number=None):
+    """Reasons `header`'s file must not be merged with this image; [] if OK."""
+    old = header.get("image") or {}
+    new = image or {}
+    reasons = []
+
+    for key, label in _IDENTITY_FIELDS:
+        a, b = old.get(key), new.get(key)
+        if a is None or b is None or a == "" or b == "":
+            continue
+        if key == "name":
+            a, b = str(a).replace("\\", "/").rsplit("/", 1)[-1].casefold(), \
+                str(b).replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        if a != b:
+            reasons.append("%s: file has %r, this IDB has %r"
+                           % (label, old.get(key), new.get(key)))
+
+    old_build = (header.get("build") or {}).get("number")
+    if old_build is not None and build_number is not None \
+            and int(old_build) != int(build_number):
+        reasons.append("build: file has %d, this IDB is %d"
+                       % (int(old_build), int(build_number)))
+    return reasons
+
+
+def carry_over(writer, loaded):
+    """Append the records of `loaded` that `writer` has not superseded.
+
+    Lines are copied verbatim, so a record this build does not fully model
+    survives a merge unchanged. Anything the reader could not parse, and any
+    record belonging to an item this export rewrote, is dropped.
+    """
+    stats = MergeStats()
+    live_ids = {item.id for item in loaded.items}
+    keep = set()
+    replaced = set()
+
+    for item in loaded.items:
+        if item.id in writer.item_ids:
+            stats.replaced_items += 1
+            # A superseded item takes its candidates with it: they describe
+            # where the *old* export found it.
+            replaced.add(item.line_no)
+            replaced.update(c.line_no for c in item.candidates)
+            continue
+        keep.add(item.line_no)
+        stats.items += 1
+        for cand in item.candidates:
+            keep.add(cand.line_no)
+            stats.candidates += 1
+
+    for iid, meta in loaded.item_meta.items():
+        # An orphaned payload (its item is gone) is dead weight, not a record.
+        if iid in writer.item_ids or iid not in live_ids:
+            replaced.add(meta.line_no)
+            continue
+        keep.add(meta.line_no)
+        stats.metas += 1
+
+    for name, rec in loaded.type_records.items():
+        if name in writer.type_names:
+            stats.replaced_types += 1
+            replaced.add(rec.line_no)
+            continue
+        keep.add(rec.line_no)
+        stats.types += 1
+
+    for line_no, raw in enumerate(loaded.lines, 1):
+        text = raw.strip()
+        if not text:
+            continue
+        # The old header is intentionally gone: the merged file gets a fresh
+        # one from this run, so it is not an "unusable" line.
+        if line_no == loaded.header_line:
+            continue
+        if line_no not in keep:
+            if line_no in replaced:
+                stats.replaced_lines += 1
+            else:
+                stats.dropped_lines += 1
+            continue
+        writer.handle.write(text)
+        writer.handle.write("\n")
+
+    # The merged file is the union, so the writer's counters must reflect it.
+    writer.items += stats.items
+    writer.candidates += stats.candidates
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +993,8 @@ def load_cfs6(path, log=None):
 
         if loaded is None:
             loaded = LoadedCfs(_parse_header(obj, line_no))
+            loaded.lines = lines
+            loaded.header_line = line_no
             continue
 
         if kind == REC_HEADER:

@@ -1261,6 +1261,87 @@ def _ask_build_number():
     return number, source
 
 
+MERGE_APPEND = "append"
+MERGE_OVERWRITE = "overwrite"
+
+
+def _ask_yes_no(deflt, text):
+    # ask_* take a printf format, so a literal message must escape its percents.
+    return ida_kernwin.ask_yn(deflt, text.replace("%", "%%"))
+
+
+def _ask_merge_mode(path, image, build_number):
+    """Decide what to do about an existing destination file.
+
+    Returns (mode, loaded) where mode is MERGE_APPEND / MERGE_OVERWRITE, or
+    (None, None) when the user cancelled.
+    """
+    if not os.path.exists(path):
+        return MERGE_OVERWRITE, None
+
+    try:
+        loaded = cfs6.load_cfs6(path, log=lambda t: msg("MERGE_READ: %s" % t))
+    except Exception as exc:
+        # Unreadable is not the same as absent: never silently clobber a file
+        # we failed to understand. Say why, and make replacing it a decision.
+        msg("MERGE: %s exists but is not readable as CFS6: %s" % (path, exc))
+        answer = _ask_yes_no(
+            ida_kernwin.ASKBTN_NO,
+            "%s already exists but cannot be read as a CFS6 file:\n\n%s\n\n"
+            "Overwrite it?" % (os.path.basename(path), exc),
+        )
+        if answer == ida_kernwin.ASKBTN_YES:
+            return MERGE_OVERWRITE, None
+        return None, None
+
+    conflicts = cfs6.merge_conflicts(loaded.header, image, build_number)
+    if conflicts:
+        # Appending here would leave one header describing two images, so the
+        # only honest options are replace or stop.
+        for reason in conflicts:
+            msg("MERGE_CONFLICT: %s" % reason)
+        answer = _ask_yes_no(
+            ida_kernwin.ASKBTN_NO,
+            "%s describes a different image, so this export cannot be added "
+            "to it:\n\n  %s\n\nIt currently holds %s.\n\nOverwrite it?"
+            % (os.path.basename(path), "\n  ".join(conflicts),
+               loaded.describe_contents()),
+        )
+        if answer == ida_kernwin.ASKBTN_YES:
+            return MERGE_OVERWRITE, None
+        return None, None
+
+    if loaded.parse_errors:
+        msg("MERGE_WARN: %s has %d unusable line(s); they will not be carried "
+            "over if you append." % (path, loaded.parse_errors))
+
+    answer = ida_kernwin.ask_buttons(
+        "Append", "Overwrite", "Cancel", ida_kernwin.ASKBTN_YES,
+        # The file dialog's own "replace?" prompt has already fired by now and
+        # deleted nothing, so say so -- otherwise this reads as a second,
+        # contradictory question.
+        ("%s already exists and holds %s\n(%s).\n\n"
+         "Append adds this export and refreshes any item it re-exports;\n"
+         "Overwrite discards everything already in the file.\n\n"
+         "Nothing has been written yet."
+         % (os.path.basename(path), loaded.describe_contents(),
+            loaded.describe_source())).replace("%", "%%"),
+    )
+    if answer == ida_kernwin.ASKBTN_YES:
+        return MERGE_APPEND, loaded
+    if answer == ida_kernwin.ASKBTN_NO:
+        return MERGE_OVERWRITE, None
+    return None, None
+
+
+def _discard_temp(tmp_path):
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except OSError as exc:
+        msg("TEMP_CLEANUP_WARN: unable to remove %s: %s" % (tmp_path, exc))
+
+
 def export_items(function_eas, global_eas, title, declarations=None):
     function_eas = sorted(set(function_eas or []))
     global_eas = sorted(set(global_eas or []))
@@ -1294,6 +1375,17 @@ def export_items(function_eas, global_eas, title, declarations=None):
            build_source, ea_str(imagebase), view_source)
     )
 
+    # Asked only now: the identity gate on appending needs the image and the
+    # confirmed build, and both come from the steps above.
+    mode, merge_from = _ask_merge_mode(path, image, build_number)
+    if mode is None:
+        msg("Export cancelled at the existing-file prompt; %s left untouched."
+            % path)
+        return False
+    if merge_from is not None:
+        msg("MERGE: appending to %s (%s)"
+            % (path, merge_from.describe_contents()))
+
     ranges = get_search_ranges()
     if not ranges:
         ida_kernwin.warning("No executable/code search ranges found.")
@@ -1325,8 +1417,14 @@ def export_items(function_eas, global_eas, title, declarations=None):
         "Press Cancel to stop."
     )
 
+    # Build beside the destination and rename over it only once the export is
+    # complete, so a cancel, an exception or a full disk leaves any existing
+    # file exactly as it was.
+    tmp_path = path + ".tmp"
+    merged = None
+
     try:
-        with open(path, "w", encoding="utf-8", newline="") as f:
+        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
             writer = cfs6.Cfs6Writer(f, imagebase=imagebase)
             writer.write_header(image, build_number, build_source)
 
@@ -1349,7 +1447,11 @@ def export_items(function_eas, global_eas, title, declarations=None):
                 handler(writer, state, payload, ranges)
 
             if cancelled:
-                msg("Export cancelled after %d/%d items." % (done - 1, total))
+                # A half-built export is not a usable file and, on append,
+                # would replace a good one with less than it had. Discard.
+                msg("Export cancelled after %d/%d items; nothing written, %s "
+                    "left untouched." % (done - 1, total, path))
+                return False
 
             # Emit each referenced local type exactly once (shared dedup across
             # functions and globals). Order is irrelevant: the importer performs
@@ -1358,17 +1460,32 @@ def export_items(function_eas, global_eas, title, declarations=None):
                 info = state.exported_types[type_name]
                 writer.write_local_type(info["name"], info["kind"], info["raw"])
 
+            # Last, so the records this run produced win over their older
+            # namesakes in the file being merged into.
+            if merge_from is not None:
+                ida_kernwin.replace_wait_box("Merging with the existing file...")
+                merged = cfs6.carry_over(writer, merge_from)
+                msg("MERGE: %s" % merged.describe())
+
+        os.replace(tmp_path, path)
+
     except OSError as exc:
         ida_kernwin.warning("Unable to write CFS6 file:\n%s" % exc)
         return False
     finally:
         ida_kernwin.hide_wait_box()
         ida_kernwin.clr_cancelled()
+        _discard_temp(tmp_path)
 
     spread = " ".join(
         "%dx%d" % (count, n)
         for n, count in sorted(state.candidate_counts.items())
     ) or "none"
+
+    merge_note = (
+        "\nMerged into the existing file: %s\n" % merged.describe()
+        if merged is not None else ""
+    )
 
     summary = (
         "CFS6 export complete\n\n"
@@ -1390,7 +1507,8 @@ def export_items(function_eas, global_eas, title, declarations=None):
         "  BODY not resolvable from .pdata (IDA-only): %d\n"
         "No unique candidate / no anchor: %d\n"
         "Failures: %d\n"
-        "Build: %s (%s)\n\n"
+        "Build: %s (%s)\n"
+        "%s\n"
         "%s"
         % (
             state.functions, state.function_candidates, spread,
@@ -1405,6 +1523,7 @@ def export_items(function_eas, global_eas, title, declarations=None):
             state.ida_only_bodies,
             state.no_candidate, state.failures,
             "unknown" if build_number is None else build_number, build_source,
+            merge_note,
             path,
         )
     )

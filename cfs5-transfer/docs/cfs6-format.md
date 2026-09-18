@@ -22,6 +22,28 @@ signature depends on IDA semantics.
   self-describing. **Filenames carry no meaning** — `f.cfs`, `g.cfs` and
   `all.cfs` are cosmetic, and a consumer must never infer content from them.
 
+### Merging two exports into one file
+
+A `.cfs` file **cannot be appended to as text**: the header is singular and must
+be first, and a re-exported item would collide with its own previous `id`. A
+producer that adds to an existing file MUST rewrite it:
+
+1. Reject the merge unless the two headers describe the same image — `name`
+   (basename, case-insensitive), `architecture`, `size_of_image`, `sha256` and
+   the build number must agree wherever both sides state them. One header
+   describing two images makes every `source.*` RVA, and the single build
+   number, a lie for half the records.
+2. Write one fresh `header`, then the new records.
+3. Carry over the old records the new ones do not supersede. An item `id` or a
+   `local_type` `name` written by the new export replaces the old record *and*
+   everything attached to it (its candidates, its type payload). A line the
+   producer could not parse is dropped, never copied blind.
+4. Rename into place only once the whole file is written, so a failed or
+   cancelled export never replaces a good file with a partial one.
+
+Record order is not significant, so carried-over records may follow the new
+ones; a reader attaches candidates to items only after reading the whole file.
+
 ### Numbers
 
 All offsets, sizes and RVAs are **JSON decimal integers**. Hex string forms are

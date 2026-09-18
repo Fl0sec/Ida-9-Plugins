@@ -60,6 +60,29 @@ prototypes/types + dependent local types.
 - *Manage CFS6 declarations* — list, jump to, or delete stored declarations.
 - *Export declared members* — write every declaration as a `derived_value`.
 
+### Appending to an existing file
+
+Every export action asks for a destination. **Pick a file that already exists
+and the plugin offers Append / Overwrite / Cancel**, so functions, globals and
+declared members can accumulate in one `.cfs` instead of one file per action.
+
+- *Append* adds this export and **refreshes** anything it re-exports: a
+  function, global, member or local type written now replaces its older record
+  (and that record's candidates and type payload) rather than duplicating it.
+  Re-export a function you just improved and the file simply gets the better
+  version.
+- Appending is refused when the file describes a **different image or build** —
+  a `.cfs` states one image identity in its single header, and mixing two makes
+  the provenance of half its records wrong. The plugin says which field differs
+  and offers Overwrite / Cancel.
+- A file that exists but does not parse as CFS6 is never silently clobbered:
+  you get the parse error and an explicit overwrite question.
+- The export is built in a `.cfs.tmp` beside the destination and renamed over it
+  only on success. **Cancelling (or any error) writes nothing** and leaves the
+  existing file exactly as it was.
+- Note that the file dialog's own "replace?" prompt fires first and deletes
+  nothing; the Append/Overwrite question is the one that decides.
+
 "User global" is gated on location as well as name shape, because IDA sets the
 user-name flag on import thunks and on its own jump tables, and both are shaped
 like plain C identifiers. A global must sit in a data segment, must not be an

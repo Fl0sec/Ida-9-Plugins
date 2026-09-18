@@ -80,6 +80,20 @@ Non-negotiable rules for this family:
 - `declare.Declaration` stores identity only (semantic, owner, canonical name, IDA field name, the selected site). **Never store the offset**: re-deriving it is what makes a better-typed IDB produce a better export, and what makes a moved field visible instead of silently carried forward. `name` and `member` are separate so a project naming convention does not force a rename in the database.
 - Declarations persist in the IDB via `store.py` (one netnode each, blob at index 0, plus an index node), every write read-back-verified.
 
+**Appending is a rewrite, never a text append** (`cfs6.merge_conflicts` +
+`cfs6.carry_over`, prompted by `_ask_merge_mode` in the exporter). The header is
+singular and first, and a re-exported item would collide with its own `id`, so
+the exporter writes the new records into `<path>.cfs.tmp`, carries over the old
+records they do not supersede *verbatim* (by line, so a record this build does
+not fully model survives), then `os.replace`s into place. Three rules hold it
+up: a merge is refused unless both headers describe the same image **and**
+build — one header cannot honestly describe two images; a new item id or
+local-type name replaces the old record and everything attached to it (its
+candidates, its type payload), which is what makes "append" also mean "refresh";
+and a cancel or any error writes nothing, leaving the existing file untouched.
+Do not "optimize" the carry-over into re-serializing parsed records — a
+round-trip through this build's model silently drops fields it does not know.
+
 **No backward compatibility.** The CSV era (`CFS2`/`CFS2G`/`CFS3*`/`CFS4*`/`CFS5GLOB`, legacy Cra0 rows) is deleted, not deprecated. Do not reintroduce it.
 
 ## Signature model — `cfs5/sigs.py` (finders) + `cfs5/policy.py` (rules)
