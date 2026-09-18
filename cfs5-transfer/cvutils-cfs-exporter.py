@@ -169,14 +169,95 @@ def _get_function_start(ea):
     return BADADDR if f is None else f.start_ea
 
 
+def _cell_texts(row):
+    """The rendered cells of a chooser_row_info_t, as a list of str."""
+    texts = getattr(row, "texts", None)
+    if texts is None:
+        return []
+    try:
+        return [str(t) for t in texts]
+    except Exception:
+        pass
+    try:
+        return [str(texts.at(i)) for i in range(texts.size())]
+    except Exception:
+        return []
+
+
+def _cell_ea(text):
+    """A chooser cell that spells an address -> that address, else BADADDR.
+
+    Handles both the bare form and IDA's `.text:0000000180001000`.
+    """
+    token = str(text).strip().rsplit(":", 1)[-1].replace("`", "")
+    if not token or len(token) < 4 or len(token) > 18:
+        return BADADDR
+    try:
+        return int(token, 16)
+    except ValueError:
+        return BADADDR
+
+
+def _row_function_ea(texts):
+    """Map one rendered chooser row to a function start.
+
+    The name column is tried first (exact and unambiguous), then any cell that
+    parses as hex *and* lands on a function start -- which rejects the Length
+    and flag columns without having to know the window's column layout.
+    """
+    for text in texts:
+        try:
+            ea = ida_name.get_name_ea(BADADDR, str(text).strip())
+        except Exception:
+            ea = BADADDR
+        start = _get_function_start(ea)
+        if start != BADADDR:
+            return start
+    for text in texts:
+        start = _get_function_start(_cell_ea(text))
+        if start != BADADDR:
+            return start
+    return BADADDR
+
+
+def _selected_rows(title):
+    """Rendered selected rows of the chooser captioned `title`.
+
+    Reads the *widget* rather than the `chooser` object handed to the action
+    context: a built-in window does not necessarily expose one, and when it
+    does, its row indices are not necessarily the ones `get_ea` expects (the
+    Functions window has folders). This path only depends on what is on
+    screen, so it survives that.
+    """
+    try:
+        rows = ida_kernwin.chooser_row_info_vec_t()
+        if not ida_kernwin.get_chooser_rows(
+            rows, title, ida_kernwin.GCRF_SELECTION
+        ):
+            return []
+        return [_cell_texts(rows.at(i)) for i in range(rows.size())]
+    except Exception as exc:
+        msg("SELECTION: get_chooser_rows(%r) failed: %s" % (title, exc))
+        return []
+
+
 def get_selected_function_eas(ctx):
+    """Function starts selected in the Functions window.
+
+    Three independent sources, because none of them is reliable across IDA
+    versions: the action context's chooser object, the rendered selection of
+    the widget, and finally the current row. Which one answered is logged --
+    "nothing selected" on a window with a visible selection is otherwise
+    indistinguishable from "this IDA reports selections differently".
+    """
     if ctx is None or getattr(ctx, "widget_type", None) != ida_kernwin.BWN_FUNCS:
         return []
 
     eas = []
     chooser = getattr(ctx, "chooser", None)
-    if chooser is not None:
-        for row in _selected_indices(ctx):
+    rows = _selected_indices(ctx)
+    if chooser is not None and rows:
+        for row in rows:
             try:
                 start = _get_function_start(chooser.get_ea(row))
             except Exception as exc:
@@ -184,13 +265,47 @@ def get_selected_function_eas(ctx):
                 continue
             if start != BADADDR:
                 eas.append(start)
+        if eas:
+            msg("SELECTION: %d function(s) from the action context chooser."
+                % len(set(eas)))
 
     if not eas:
-        start = _get_function_start(getattr(ctx, "cur_ea", BADADDR))
+        texts = _selected_rows(getattr(ctx, "widget_title", "Functions"))
+        for cells in texts:
+            start = _row_function_ea(cells)
+            if start != BADADDR:
+                eas.append(start)
+            else:
+                msg("SELECTION: no function for row %r" % (cells[:3],))
+        if eas:
+            msg("SELECTION: %d function(s) from the rendered selection "
+                "(context chooser gave %d row(s))." % (len(set(eas)), len(rows)))
+
+    if not eas:
+        func = getattr(ctx, "cur_func", None)
+        start = _get_function_start(getattr(func, "start_ea", BADADDR)
+                                    if func is not None else BADADDR)
+        if start == BADADDR:
+            start = _get_function_start(getattr(ctx, "cur_ea", BADADDR))
         if start != BADADDR:
             eas.append(start)
+            msg("SELECTION: falling back to the current row (%s)."
+                % ea_str(start))
 
     return sorted(set(eas))
+
+
+def prompt_for_function_ea():
+    """Ask for a function when the window's selection could not be read.
+
+    A UI action must not dead-end by telling the user to do the thing they
+    just did.
+    """
+    func = ida_kernwin.choose_func(
+        "Select a function to export to CFS6", BADADDR
+    )
+    start = getattr(func, "start_ea", BADADDR) if func is not None else BADADDR
+    return _get_function_start(start)
 
 
 def get_all_user_named_function_eas():
@@ -317,6 +432,28 @@ def get_selected_global_eas(ctx):
         ea = _chooser_ea(ctx, row)
         if ea != BADADDR:
             eas.append(ea)
+
+    if not eas:
+        # Same fallback as the Functions window, for the same reason: the
+        # action context does not always carry a usable chooser.
+        for cells in _selected_rows(getattr(ctx, "widget_title", "Names")):
+            ea = BADADDR
+            for text in cells:
+                try:
+                    ea = ida_name.get_name_ea(BADADDR, str(text).strip())
+                except Exception:
+                    ea = BADADDR
+                if ea != BADADDR:
+                    break
+                ea = _cell_ea(text)
+                if ea != BADADDR and ida_bytes.is_mapped(ea):
+                    break
+                ea = BADADDR
+            if ea != BADADDR:
+                eas.append(ea)
+        if eas:
+            msg("SELECTION: %d name(s) from the rendered selection."
+                % len(set(eas)))
 
     if not eas:
         cur = getattr(ctx, "cur_ea", BADADDR)
@@ -1292,8 +1429,14 @@ class ExportSelFuncsHandler(ida_kernwin.action_handler_t):
     def activate(self, ctx):
         eas = get_selected_function_eas(ctx)
         if not eas:
-            ida_kernwin.warning("No functions selected.")
-            return 1
+            # No context is not a reason to send the user back to the window
+            # they just used -- offer the picker instead.
+            msg("SELECTION: no function came back from the Functions window; "
+                "offering the function picker.")
+            start = prompt_for_function_ea()
+            if start == BADADDR:
+                return 1
+            eas = [start]
         export_items(eas, [], "Export selected functions to CFS6")
         return 1
 
