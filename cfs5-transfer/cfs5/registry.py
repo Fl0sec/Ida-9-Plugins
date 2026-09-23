@@ -88,6 +88,27 @@ def normalize(kind, names):
     return ids, rejected
 
 
+def outcome(asked, succeeded, missed):
+    """(ok, partial) for a batch, the one place that decides what `ok` means.
+
+    `ok` is "everything asked for succeeded", never "something worked". An
+    export that writes 51 of 52 items is not ok: an agent that checks `ok` and
+    moves on would sail straight past the missing one, which is exactly how a
+    silent attrition goes unnoticed. It is `partial` instead, and the caller
+    has to look at what was missed to clear it.
+
+    Lives here, ida-free, because it is the rule most worth pinning with a
+    test -- the arithmetic is easy to get subtly wrong when it is inlined at
+    four call sites.
+    """
+    asked, succeeded = int(asked), int(succeeded)
+    missed_count = len(missed) if missed is not None else 0
+
+    ok = succeeded == asked and missed_count == 0
+    partial = (not ok) and succeeded > 0
+    return ok, partial
+
+
 def split_by_kind(ids):
     """{kind: [name, ...]} for stored ids, ignoring anything unparseable."""
     out = {kind: [] for kind in VALID_KINDS}

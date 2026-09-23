@@ -83,5 +83,42 @@ class TestSplitByKind(unittest.TestCase):
         self.assertEqual(sorted(out), sorted(registry.VALID_KINDS))
 
 
+class TestOutcome(unittest.TestCase):
+    """What `ok` means. The rule the whole API contract rests on."""
+
+    def test_everything_succeeded(self):
+        self.assertEqual(registry.outcome(52, 52, []), (True, False))
+
+    def test_partial_success_is_never_ok(self):
+        """51 of 52 must not read as success."""
+        ok, partial = registry.outcome(52, 51, [{"name": "x"}])
+        self.assertFalse(ok)
+        self.assertTrue(partial)
+
+    def test_missed_items_defeat_ok_even_at_full_count(self):
+        """A count that adds up but carries a reported miss is still not ok."""
+        ok, partial = registry.outcome(10, 10, [{"name": "renamed"}])
+        self.assertFalse(ok)
+        self.assertTrue(partial)
+
+    def test_total_failure_is_neither_ok_nor_partial(self):
+        ok, partial = registry.outcome(5, 0, [{"name": "a"}])
+        self.assertFalse(ok)
+        self.assertFalse(partial)
+
+    def test_empty_batch_is_ok(self):
+        self.assertEqual(registry.outcome(0, 0, []), (True, False))
+
+    def test_none_missed_is_treated_as_empty(self):
+        self.assertEqual(registry.outcome(3, 3, None), (True, False))
+
+    def test_ok_and_partial_are_never_both_true(self):
+        for asked in range(0, 6):
+            for done in range(0, asked + 1):
+                for missed in ([], [{"name": "x"}]):
+                    ok, partial = registry.outcome(asked, done, missed)
+                    self.assertFalse(ok and partial)
+
+
 if __name__ == "__main__":
     unittest.main()
