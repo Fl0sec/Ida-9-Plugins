@@ -557,7 +557,7 @@ def deserialize_binary_tinfo(type_blob, fields_blob=None, fldcmts_blob=None):
 
 
 def _incoming_is_forward(rec):
-    if rec is None or not rec.binary or rec.type_blob is None:
+    if rec is None or rec.type_blob is None:
         return False
     tif = deserialize_binary_tinfo(rec.type_blob, rec.fields_blob, rec.fldcmts_blob)
     if tif is None:
@@ -582,7 +582,6 @@ def register_missing_types(type_records, stats):
     idati = ida_typeinf.get_idati()
     preexisting = set()
     pending_binary = {}
-    pending_text = {}
     replaceable_forwards = set()
 
     for name, rec in type_records.items():
@@ -595,7 +594,7 @@ def register_missing_types(type_records, stats):
             except Exception:
                 pass
 
-            incoming_fwd = _incoming_is_forward(rec) if rec.binary else False
+            incoming_fwd = _incoming_is_forward(rec)
 
             if not is_fwd:
                 preexisting.add(name)
@@ -615,10 +614,7 @@ def register_missing_types(type_records, stats):
             replaceable_forwards.add(name)
             msg("TYPE_UPGRADE_FORWARD %-33s kind=%s" % (name, rec.kind))
 
-        if rec.binary:
-            pending_binary[name] = rec
-        else:
-            pending_text[name] = rec
+        pending_binary[name] = rec
 
     registered = set()
     created_forwards = set(replaceable_forwards)
@@ -712,49 +708,13 @@ def register_missing_types(type_records, stats):
         if not progress:
             break
 
-    # Legacy textual CFS3 fallback only.
-    if pending_text:
-        parse_flags = (
-            ida_typeinf.HTI_NWR | ida_typeinf.HTI_HIGH | ida_typeinf.HTI_RELAXED
-        )
-        max_text_passes = min(8, max(2, len(pending_text) + 1))
-        for pass_no in range(1, max_text_passes + 1):
-            if not pending_text:
-                break
-            progress = False
-
-            for name in list(pending_text.keys()):
-                rec = pending_text[name]
-                try:
-                    errors = ida_typeinf.parse_decls(
-                        idati, rec.declaration, None, parse_flags
-                    )
-                except Exception:
-                    errors = 1
-
-                if errors == 0 and _named_type_well_defined(name):
-                    registered.add(name)
-                    stats.types_registered += 1
-                    del pending_text[name]
-                    progress = True
-                    msg(
-                        "TYPE_REGISTERED_LEGACY %-28s shape=%s"
-                        % (name, _named_type_shape(name))
-                    )
-
-            if not progress:
-                break
-
-    failed = set(pending_binary) | set(pending_text)
+    failed = set(pending_binary)
     for name in sorted(failed):
         stats.types_failed += 1
         rec = type_records[name]
         msg(
-            "TYPE_FAILED %-39s kind=%s line=%d format=%s shape=%s"
-            % (
-                name, rec.kind, rec.line_no,
-                "BIN" if rec.binary else "TEXT", _named_type_shape(name),
-            )
+            "TYPE_FAILED %-39s kind=%s line=%d shape=%s"
+            % (name, rec.kind, rec.line_no, _named_type_shape(name))
         )
 
     return {"preexisting": preexisting, "registered": registered, "failed": failed}
@@ -764,42 +724,12 @@ def register_missing_types(type_records, stats):
 # Prototype acquisition + conservative merge (import side)
 # ---------------------------------------------------------------------------
 
-def _parse_function_prototype(declaration):
-    """Legacy CFS3 textual-prototype fallback."""
-    if not declaration:
-        return None
-    idati = ida_typeinf.get_idati()
-    tif = ida_typeinf.tinfo_t()
-    flags = (
-        ida_typeinf.PT_TYP | ida_typeinf.PT_SIL
-        | ida_typeinf.PT_HIGH | ida_typeinf.PT_RELAXED
-    )
-    try:
-        ok = ida_typeinf.parse_decl(tif, idati, declaration, flags)
-    except Exception:
-        ok = False
-    if not ok:
-        return None
-    try:
-        if tif.is_funcptr():
-            tif = tif.get_pointed_object()
-    except Exception:
-        pass
-    try:
-        return tif if tif.is_func() else None
-    except Exception:
-        return None
-
-
 def function_tinfo_from_meta(meta):
     if meta is None:
         return None
-    if meta.binary:
-        tif = deserialize_binary_tinfo(
-            meta.type_blob, meta.fields_blob, meta.fldcmts_blob
-        )
-    else:
-        tif = _parse_function_prototype(meta.prototype)
+    tif = deserialize_binary_tinfo(
+        meta.type_blob, meta.fields_blob, meta.fldcmts_blob
+    )
     if tif is None:
         return None
     try:
@@ -815,7 +745,7 @@ def function_tinfo_from_meta(meta):
 
 def global_tinfo_from_meta(meta):
     """Data tinfo transported for a global (no function-shape requirement)."""
-    if meta is None or not meta.binary:
+    if meta is None:
         return None
     return deserialize_binary_tinfo(
         meta.type_blob, meta.fields_blob, meta.fldcmts_blob
