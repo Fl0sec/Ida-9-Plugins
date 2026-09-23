@@ -423,22 +423,21 @@ class DeclarationTests(unittest.TestCase):
         # worse, is handed to candidate generation as a `selected_operand`.
         decl = declare.make_member(
             "CGameTrace", "m_flFraction",
-            site_ea=0xFFFFFFFFFFFFFFFF, site_op=-1,
+            sites=[(0xFFFFFFFFFFFFFFFF, -1)],
         )
-        self.assertIsNone(decl.site_ea)
-        self.assertIsNone(decl.site_op)
+        self.assertEqual(decl.sites, [])
         self.assertFalse(decl.has_site)
         self.assertFalse(declare.from_dict(decl.to_dict()).has_site)
 
     def test_round_trip(self):
         decl = declare.make_member(
             "CGameSceneNode", "bone_transforms", member="m_pBoneTransforms",
-            site_ea=0x140001000, site_op=1,
+            sites=[(0x140001000, 1)],
         )
         again = declare.from_dict(decl.to_dict())
         self.assertEqual(again.id, decl.id)
         self.assertEqual(again.member, "m_pBoneTransforms")
-        self.assertEqual(again.site_ea, 0x140001000)
+        self.assertEqual(again.sites, [(0x140001000, 1)])
         self.assertTrue(again.has_site)
 
     def test_member_defaults_to_the_canonical_name(self):
@@ -475,6 +474,203 @@ class DeclarationTests(unittest.TestCase):
     def test_non_dict_input_is_refused(self):
         with self.assertRaises(declare.DeclarationError):
             declare.from_dict("member:T::f")
+
+
+class MultiSiteTests(unittest.TestCase):
+    """Sites are evidence locations, and there can be several."""
+
+    def test_sites_are_deduplicated_and_order_stable(self):
+        decl = declare.make_member(
+            "T", "f", sites=[(0x2000, 1), (0x1000, 0), (0x2000, 1)]
+        )
+        self.assertEqual(decl.sites, [(0x2000, 1), (0x1000, 0)])
+
+    def test_dict_and_tuple_sites_are_both_accepted(self):
+        a = declare.make_member("T", "f", sites=[{"ea": 0x1000, "op": 2}])
+        b = declare.make_member("T", "f", sites=[(0x1000, 2)])
+        self.assertEqual(a.sites, b.sites)
+
+    def test_a_malformed_site_is_refused_not_ignored(self):
+        for bad in ([("only-one",)], [("x", "y")], [0x1000]):
+            with self.assertRaises(declare.DeclarationError):
+                declare.make_member("T", "f", sites=bad)
+
+    def test_sentinels_are_dropped_but_real_sites_survive(self):
+        decl = declare.make_member(
+            "T", "f", sites=[(0xFFFFFFFFFFFFFFFF, 0), (0x1000, 1), (0, 0)]
+        )
+        self.assertEqual(decl.sites, [(0x1000, 1)])
+
+    def test_round_trip_preserves_every_site(self):
+        decl = declare.make_member(
+            "T", "f", sites=[(0x1000, 0), (0x2000, 1), (0x3000, 2)]
+        )
+        again = declare.from_dict(decl.to_dict())
+        self.assertEqual(again.sites, decl.sites)
+        self.assertEqual(again.discovery, decl.discovery)
+
+
+class DiscoveryModeTests(unittest.TestCase):
+    def test_sites_only_forbids_scanning(self):
+        decl = declare.make_member(
+            "T", "f", sites=[(0x1000, 0)],
+            discovery=declare.DISCOVER_SITES_ONLY,
+        )
+        self.assertFalse(decl.scan_allowed)
+
+    def test_sites_plus_auto_allows_scanning(self):
+        decl = declare.make_member(
+            "T", "f", sites=[(0x1000, 0)],
+            discovery=declare.DISCOVER_SITES_PLUS_AUTO,
+        )
+        self.assertTrue(decl.scan_allowed)
+
+    def test_no_site_falls_back_to_auto(self):
+        """sites_only with no sites would export nothing, silently."""
+        decl = declare.make_member(
+            "T", "f", discovery=declare.DISCOVER_SITES_ONLY
+        )
+        self.assertEqual(decl.discovery, declare.DISCOVER_AUTO)
+        self.assertTrue(decl.scan_allowed)
+
+    def test_unknown_mode_is_refused(self):
+        with self.assertRaises(declare.DeclarationError):
+            declare.make_member("T", "f", sites=[(1, 0)], discovery="maybe")
+
+
+class V1MigrationTests(unittest.TestCase):
+    """A declaration made before multi-site must not have to be redone."""
+
+    V1 = {
+        "version": 1, "semantic": "member_offset", "owner": "CModel",
+        "name": "m_nBoneCount", "member": "m_nBoneCount",
+        "site_ea": 0x140001000, "site_op": 1, "value_adjust": 0,
+    }
+
+    def test_single_site_becomes_a_one_element_list(self):
+        decl = declare.from_dict(dict(self.V1))
+        self.assertEqual(decl.sites, [(0x140001000, 1)])
+        self.assertEqual(decl.version, declare.DECL_VERSION)
+
+    def test_v1_keeps_scanning(self):
+        """It never asked for sites-only, so narrowing it would be a change."""
+        decl = declare.from_dict(dict(self.V1))
+        self.assertTrue(decl.scan_allowed)
+
+    def test_v1_without_a_site_still_loads(self):
+        data = dict(self.V1, site_ea=None, site_op=None)
+        decl = declare.from_dict(data)
+        self.assertEqual(decl.sites, [])
+        self.assertTrue(decl.scan_allowed)
+
+    def test_v1_sentinel_site_is_still_normalized(self):
+        data = dict(self.V1, site_ea=0xFFFFFFFFFFFFFFFF, site_op=-1)
+        self.assertEqual(declare.from_dict(data).sites, [])
+
+
+class StrideTests(unittest.TestCase):
+    """A stride asserts its value, so the rules around it are stricter."""
+
+    def test_a_stride_needs_sites(self):
+        """Nothing in the database can discover one, so none means none."""
+        with self.assertRaises(declare.DeclarationError):
+            declare.make_stride("CMeshDrawPrimitive", "kStride", 0x30, [])
+
+    def test_a_stride_needs_a_value(self):
+        with self.assertRaises(declare.DeclarationError):
+            declare.Declaration(
+                cfs6.SEM_ELEMENT_STRIDE, "T", "kStride", sites=[(0x1000, 1)]
+            )
+
+    def test_a_member_may_not_assert_a_value(self):
+        """The offset is the database's answer, never the caller's."""
+        with self.assertRaises(declare.DeclarationError):
+            declare.Declaration(
+                cfs6.SEM_MEMBER_OFFSET, "T", "f", sites=[(0x1000, 1)],
+                asserted_value=0x30,
+            )
+
+    def test_a_stride_never_scans(self):
+        decl = declare.make_stride("T", "kStride", 0x30, [(0x1000, 1)])
+        self.assertFalse(decl.scan_allowed)
+        self.assertFalse(decl.needs_ida_member)
+
+    def test_stride_id_is_distinct_from_a_member_of_the_same_name(self):
+        stride = declare.make_stride("T", "n", 4, [(0x1000, 1)])
+        member = declare.make_member("T", "n")
+        self.assertNotEqual(stride.id, member.id)
+        self.assertTrue(stride.id.startswith("stride:"))
+
+    def test_round_trip_keeps_the_asserted_value(self):
+        decl = declare.make_stride("T", "kStride", 0x30, [(0x1000, 1)])
+        again = declare.from_dict(decl.to_dict())
+        self.assertEqual(again.asserted_value, 0x30)
+        self.assertEqual(again.semantic, cfs6.SEM_ELEMENT_STRIDE)
+        self.assertFalse(again.scan_allowed)
+
+
+class StrideFileTests(unittest.TestCase):
+    """A stride must survive the actual file, not just the model.
+
+    `element_stride` was a reserved semantic that nothing ever emitted, so
+    this is the check that the reader really does accept one -- the claim that
+    no schema revision is needed rests on it.
+    """
+
+    def _write(self, path):
+        cand = value_candidate(
+            " ".join(["48"] * 6 + ["?"] + ["90"] * 5),
+            op=cfs6.OP_IMM, value=0x30,
+            origin=cfs6.ORIGIN_SELECTED_OPERAND,
+        )
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            writer = cfs6.Cfs6Writer(handle)
+            writer.write_header(sample_image(), 14182, "user")
+            iid = writer.write_derived_value(
+                cfs6.SEM_ELEMENT_STRIDE, "CMeshDrawPrimitive", "kStride",
+                1, {}, expected_value=0x30,
+            )
+            writer.write_candidate(iid, 0, cand)
+        return iid
+
+    def test_a_stride_item_round_trips_through_the_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "stride.cfs")
+            iid = self._write(path)
+            loaded = cfs6.load_cfs6(path)
+
+            self.assertEqual(loaded.parse_errors, 0)
+            self.assertEqual(loaded.skipped_records, 0)
+            strides = loaded.derived_values(cfs6.SEM_ELEMENT_STRIDE)
+            self.assertEqual(len(strides), 1)
+            item = strides[0]
+            self.assertEqual(item.id, iid)
+            self.assertEqual(item.id, "stride:CMeshDrawPrimitive::kStride")
+            self.assertEqual(item.kind, cfs6.REC_DERIVED_VALUE)
+            self.assertEqual(item.expected_value, 0x30)
+            self.assertEqual(item.qualified_name, "CMeshDrawPrimitive::kStride")
+
+    def test_a_stride_does_not_answer_a_member_offset_query(self):
+        """The semantic is a real discriminator, not a label."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "stride.cfs")
+            self._write(path)
+            loaded = cfs6.load_cfs6(path)
+            self.assertEqual(loaded.derived_values(cfs6.SEM_MEMBER_OFFSET), [])
+
+    def test_the_candidate_keeps_its_immediate_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "stride.cfs")
+            self._write(path)
+            loaded = cfs6.load_cfs6(path)
+            item = loaded.derived_values(cfs6.SEM_ELEMENT_STRIDE)[0]
+            self.assertEqual(len(item.candidates), 1)
+            cand = item.candidates[0]
+            # The extraction recipe travels as `resolve` -- it *is* how the
+            # consumer resolves a VALUE, not metadata attached beside it.
+            self.assertEqual(cand.resolve["op"], cfs6.OP_IMM)
+            self.assertEqual(cand.mode, "VALUE")
+            self.assertEqual(cand.origin, cfs6.ORIGIN_SELECTED_OPERAND)
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +739,48 @@ class ResolveValueTests(unittest.TestCase):
         )
         self.assertIsNone(error)
         self.assertEqual(value, 0)
+
+    def test_imm32_resolves(self):
+        # `add rax, 0x30` -- how a stride is normally encoded.
+        data = bytes([0x48, 0x83, 0xC0, 0x30])
+        value, error = _resolve(
+            {"op": "IMM", "instruction_offset": 0, "field_offset": 3,
+             "field_size": 1, "operand_index": 1, "signed": False},
+            data, pattern="48 83 C0 ?",
+        )
+        self.assertIsNone(error)
+        self.assertEqual(value, 0x30)
+
+    def test_an_unsigned_immediate_is_not_read_as_negative(self):
+        """0x80 as a stride is 128, never -128.
+
+        This is why `signed` is per candidate rather than per op: a
+        displacement must be signed and a magnitude must not be.
+        """
+        data = bytes([0x48, 0x83, 0xC0, 0x80])
+        value, _ = _resolve(
+            {"op": "IMM", "instruction_offset": 0, "field_offset": 3,
+             "field_size": 1, "operand_index": 1, "signed": False},
+            data, pattern="48 83 C0 ?",
+        )
+        self.assertEqual(value, 128)
+
+    def test_a_signed_immediate_still_reads_signed_when_asked(self):
+        data = bytes([0x48, 0x83, 0xC0, 0x80])
+        value, _ = _resolve(
+            {"op": "IMM", "instruction_offset": 0, "field_offset": 3,
+             "field_size": 1, "operand_index": 1, "signed": True},
+            data, pattern="48 83 C0 ?",
+        )
+        self.assertEqual(value, -128)
+
+    def test_an_unknown_op_is_refused_rather_than_guessed(self):
+        value, error = _resolve(
+            dict(self.BASE, op="SCALE"),
+            bytes([0x48, 0x8B, 0x8B, 0x10, 0x00, 0x00, 0x00]),
+        )
+        self.assertIsNone(value)
+        self.assertIn("unsupported extraction op", error)
 
     def test_disp_plus_width_adds_the_access_width(self):
         data = bytes([0x48, 0x8B, 0x8B, 0x10, 0x00, 0x00, 0x00])

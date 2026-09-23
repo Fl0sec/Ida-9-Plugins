@@ -240,6 +240,75 @@ def infer_displacement_field(insn, expected_value):
     return matches[0]
 
 
+def immediate_operands(insn):
+    """Operand indices of `insn` that carry an immediate."""
+    out = []
+    for i in range(UA_MAXOP):
+        op = insn.ops[i]
+        if op.type == ida_ua.o_void:
+            break
+        if op.type == ida_ua.o_imm:
+            out.append(i)
+    return out
+
+
+def infer_immediate_field(insn, expected_value):
+    """Locate the encoded immediate field whose value is `expected_value`.
+
+    The sibling of `infer_displacement_field`, and deliberately identical in
+    discipline: walk the operands the decoder reported, take each one's own
+    value, and only then confirm that the byte span the decoder assigned
+    reproduces it. Ambiguity is failure.
+
+    A member offset is a displacement (`mov rax, [rcx+0x30]`); a stride is
+    usually an immediate (`add rax, 0x30`, `imul rax, rax, 0x30`), which is
+    why this exists at all -- without it `element_stride` could only ever
+    describe the rare stride that happens to be encoded as a displacement.
+
+    An immediate is compared **unsigned as well as signed**: a displacement is
+    signed because a subobject-relative access is legitimately negative, but a
+    stride or a size is a magnitude, and `0x80` as a byte would otherwise only
+    ever match -128.
+    """
+    raw = ida_bytes.get_bytes(insn.ea, insn.size)
+    if raw is None or len(raw) != insn.size:
+        return None
+
+    expected = int(expected_value)
+    matches = []
+
+    for i in immediate_operands(insn):
+        op = insn.ops[i]
+        value = int(op.value)
+        if value != expected and signed_le(value, 8) != expected:
+            continue
+
+        offb = int(op.offb)
+        if not 0 < offb < insn.size:
+            continue
+
+        size = field_span_for_offb(insn, offb)
+        if size not in (1, 2, 4, 8) or offb + size > insn.size:
+            continue
+
+        field = int.from_bytes(raw[offb:offb + size], byteorder="little")
+        if field != expected and signed_le(field, size) != expected:
+            continue
+
+        matches.append({
+            "operand_index": i,
+            "field_offset": offb,
+            "field_size": size,
+            # An immediate holding a magnitude must not be read as negative;
+            # only report signed when the unsigned reading does not match.
+            "signed": field != expected,
+        })
+
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def infer_pc_relative_field(insn, target_ea):
     """Find the encoded signed displacement that resolves to target_ea.
 

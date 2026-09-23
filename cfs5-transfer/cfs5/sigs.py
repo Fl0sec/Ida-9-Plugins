@@ -27,6 +27,7 @@ from .disasm import (
     collect_far_xrefs_to,
     decode_chunk,
     infer_displacement_field,
+    infer_immediate_field,
     infer_pc_relative_field,
     pattern_tokens_for_insn,
 )
@@ -425,8 +426,16 @@ def find_value_candidate_for_site(
         return None
 
     encoded = int(encoded_value)
-    field = infer_displacement_field(insn, encoded)
     const_extract = None
+
+    # A displacement first: it is what a member offset is, and it is the
+    # stricter of the two inferences. An immediate second, because that is how
+    # a stride or a size is normally encoded (`add rax, 0x30`).
+    field = infer_displacement_field(insn, encoded)
+    field_op = cfs6.OP_DISP
+    if field is None:
+        field = infer_immediate_field(insn, encoded)
+        field_op = cfs6.OP_IMM
 
     if field is None:
         # No encoded field: the only legitimate reason is an access to offset
@@ -466,14 +475,16 @@ def find_value_candidate_for_site(
         extract["instruction_offset"] = insn_offset
     else:
         extract = {
-            "op": cfs6.OP_DISP,
+            "op": field_op,
             "instruction_offset": insn_offset,
             "field_offset": insn_offset + field["field_offset"],
             "field_size": field["field_size"],
             "operand_index": field["operand_index"],
-            # Displacements are signed: a subobject-relative access is
-            # legitimately negative, so the consumer must not read unsigned.
-            "signed": True,
+            # A displacement is always signed -- a subobject-relative access is
+            # legitimately negative, so the consumer must not read unsigned. An
+            # immediate reports what it actually is: a stride is a magnitude,
+            # and reading 0x80 as -128 would be wrong.
+            "signed": field.get("signed", True),
         }
     if value_adjust:
         extract["value_adjust"] = int(value_adjust)
@@ -516,22 +527,28 @@ def _zero_offset_extract(insn, encoded, op_hint):
     return None
 
 
-def choose_member_candidates(ref, ranges, selected_site=None, value_adjust=0,
-                             sibling_offsets=None):
-    """Ranked VALUE candidates for one structure member.
+def choose_value_candidates(encoded_value, ranges, selected_sites=(),
+                            ref=None, allow_scan=True, value_adjust=0,
+                            sibling_offsets=None):
+    """Ranked VALUE candidates for one derived value.
 
     Sites come from exactly three producers of a *type-directed* association,
     and a consumer can tell which by the candidate's `origin`:
 
-      * the operand the user explicitly selected when declaring,
+      * the operands the caller explicitly selected when declaring,
       * instructions IDA indexes as struct-offset references to this member,
       * instructions the decompiler resolves to this member (`memberscan`).
 
-    The third exists because IDA 9.0's member xref index misses most accesses
-    made through a typed pointer, which is the common case; `cfs5/memberscan.py`
-    has the measurements. It is still the decompiler, never the displacement,
-    that decides a site belongs to this member -- nothing here accepts an
-    instruction merely because it encodes the same number.
+    The last two need `ref` -- a live IDA member. A semantic with no backing
+    field (a stride constant) has no type-directed producer at all, so it
+    passes `ref=None` and gets exactly the sites it named. Searching for other
+    instructions encoding the same number is *not* a fallback: numeric
+    equality does not prove two instructions mean the same thing, and a false
+    candidate is worse than a missing one because agreement reads as proof.
+
+    `allow_scan=False` keeps the caller's sites and skips discovery entirely.
+    Automatic discovery decompiles, so a caller that already knows where the
+    evidence is should not pay for it -- and gets a deterministic export.
 
     `sibling_offsets` is every member offset of the owning structure. It does
     not widen what is accepted -- only which functions are worth decompiling.
@@ -550,18 +567,19 @@ def choose_member_candidates(ref, ranges, selected_site=None, value_adjust=0,
         seen.add(ea)
         sites.append((ea, op_hint, origin))
 
-    if selected_site is not None:
-        _add(selected_site[0], selected_site[1], ORIGIN_SELECTED_OPERAND)
+    for site_ea, site_op in selected_sites or ():
+        _add(site_ea, site_op, ORIGIN_SELECTED_OPERAND)
 
-    # Cheapest first: a stroff site is already IDA-verified and needs no
-    # decompilation, so it never costs a pass over the ctree.
-    for ea in _even_sample(member_reference_sites(ref), MAX_XREFS_TO_SEARCH):
-        _add(ea, None, ORIGIN_STROFF_XREF)
+    if ref is not None and allow_scan:
+        # Cheapest first: a stroff site is already IDA-verified and needs no
+        # decompilation, so it never costs a pass over the ctree.
+        for ea in _even_sample(member_reference_sites(ref), MAX_XREFS_TO_SEARCH):
+            _add(ea, None, ORIGIN_STROFF_XREF)
 
-    for ea in memberscan.discover_member_sites(
-        ref, exclude=seen, offsets=sibling_offsets
-    ):
-        _add(ea, None, ORIGIN_HEXRAYS_MEMPTR)
+        for ea in memberscan.discover_member_sites(
+            ref, exclude=seen, offsets=sibling_offsets
+        ):
+            _add(ea, None, ORIGIN_HEXRAYS_MEMPTR)
 
     found = []
     searched = 0
@@ -569,7 +587,7 @@ def choose_member_candidates(ref, ranges, selected_site=None, value_adjust=0,
         searched += 1
         try:
             cand = find_value_candidate_for_site(
-                site_ea, ref.byte_offset, ranges, origin,
+                site_ea, encoded_value, ranges, origin,
                 op_hint=op_hint, value_adjust=value_adjust,
             )
         except Exception:
@@ -580,6 +598,16 @@ def choose_member_candidates(ref, ranges, selected_site=None, value_adjust=0,
 
     selected = select_value_candidates(found)
     return selected, value_coverage(selected), len(sites), searched
+
+
+def choose_member_candidates(ref, ranges, selected_sites=(), value_adjust=0,
+                             sibling_offsets=None, allow_scan=True):
+    """VALUE candidates for a structure member, whose value IDA supplies."""
+    return choose_value_candidates(
+        ref.byte_offset, ranges, selected_sites=selected_sites, ref=ref,
+        allow_scan=allow_scan, value_adjust=value_adjust,
+        sibling_offsets=sibling_offsets,
+    )
 
 
 # ---------------------------------------------------------------------------

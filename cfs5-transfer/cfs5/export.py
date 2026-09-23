@@ -14,16 +14,21 @@ import os
 
 import ida_kernwin
 import ida_name
+import ida_ua
 
 from . import cfs6
 from . import members
-from .common import ea_str, msg, safe_name
+from .common import UA_MAXOP, ea_str, msg, safe_name
+from .disasm import (
+    infer_displacement_field, infer_immediate_field, signed_le,
+)
 from .image import (
     BodyOwnership, describe_image, get_imagebase, open_image_view,
 )
+from .members import decode_at
 from .sigs import (
     choose_function_candidates, choose_global_candidates,
-    choose_member_candidates,
+    choose_value_candidates,
 )
 from .typeio import (
     build_local_type_index,
@@ -250,37 +255,82 @@ def write_global(writer, state, global_ea, ranges):
     return name
 
 
+def _contradicting_sites(decl, expected):
+    """[(ea, decoded)] for declared sites that encode a *different* number.
+
+    Deliberately separate from "this site produced no candidate". A site that
+    cannot yield a unique pattern is merely unusable -- short instructions
+    fall below the VALUE exact-byte floor all the time -- and must not condemn
+    a declaration its other sites support. A site that decodes a *different*
+    value is evidence against the claim itself, which is a different thing and
+    is fatal.
+    """
+    out = []
+    for site_ea, site_op in decl.sites:
+        insn = decode_at(site_ea)
+        if insn is None:
+            continue
+        if infer_displacement_field(insn, expected) is not None:
+            continue
+        if infer_immediate_field(insn, expected) is not None:
+            continue
+
+        # Nothing at this site encodes the expected number. Report what it
+        # does hold, when the operand the caller named can say.
+        found = "nothing"
+        try:
+            if 0 <= site_op < UA_MAXOP:
+                op = insn.ops[site_op]
+                if op.type == ida_ua.o_imm:
+                    found = str(int(op.value))
+                elif op.type == ida_ua.o_displ:
+                    found = str(signed_le(int(op.addr), 8))
+        except Exception:
+            pass
+        out.append((site_ea, found))
+    return out
+
+
 def write_member(writer, state, decl, ranges):
-    """Emit one declared member as a derived_value item plus its candidates.
+    """Emit one declared derived value as an item plus its candidates.
 
     Two gates, both hard:
 
-    * the declaration must still name a live IDA member. If the field was
+    * a `member_offset` must still name a live IDA member. If the field was
       renamed or deleted, the offset we would export has no backing and the
-      item is skipped loudly rather than exported as a guess.
-    * every candidate must reproduce that member's offset. Candidates are
-      built by searching for exactly that value, so a disagreement means
-      something is wrong with the extraction rather than with the build --
-      it is dropped, never ranked.
+      item is skipped loudly rather than exported as a guess. A semantic with
+      no backing field asserts its value instead, which is a weaker claim --
+      so it is gated on every one of its sites decoding that same number.
+    * every candidate must reproduce the expected value. Candidates are built
+      by searching for exactly that value, so a disagreement means something
+      is wrong with the extraction rather than with the build -- it is
+      dropped, never ranked.
     """
-    ref = members.lookup_member(decl.owner, decl.member)
-    if ref is None:
-        state.member_unresolved += 1
-        msg(
-            "MEMBER_NO_FIELD %-30s -- %s.%s is not in this database; re-declare "
-            "or restore the type"
-            % (decl.qualified, decl.owner, decl.member)
-        )
-        state._miss("member", decl.qualified, "no live IDA field")
-        return None
+    ref = None
+    if decl.needs_ida_member:
+        ref = members.lookup_member(decl.owner, decl.member)
+        if ref is None:
+            state.member_unresolved += 1
+            msg(
+                "MEMBER_NO_FIELD %-30s -- %s.%s is not in this database; "
+                "re-declare or restore the type"
+                % (decl.qualified, decl.owner, decl.member)
+            )
+            state._miss("member", decl.qualified, "no live IDA field")
+            return None
+        encoded = ref.byte_offset
+    else:
+        # No field to read, so the declaration's own number is the claim; the
+        # sites below are what has to substantiate it.
+        encoded = decl.asserted_value
 
-    expected = ref.byte_offset + decl.value_adjust
-    site = (decl.site_ea, decl.site_op) if decl.has_site else None
+    expected = encoded + decl.value_adjust
 
     try:
-        candidates, coverage, sites, searched = choose_member_candidates(
-            ref, ranges, selected_site=site, value_adjust=decl.value_adjust,
-            sibling_offsets=sibling_offsets(ref.owner),
+        candidates, coverage, sites, searched = choose_value_candidates(
+            encoded, ranges, selected_sites=decl.sites, ref=ref,
+            allow_scan=decl.scan_allowed, value_adjust=decl.value_adjust,
+            sibling_offsets=sibling_offsets(ref.owner) if ref is not None else None,
         )
     except Exception as exc:
         state.failures += 1
@@ -295,16 +345,35 @@ def write_member(writer, state, decl, ranges):
             "reproduce 0x%X"
             % (decl.qualified, len(candidates) - len(agreed), expected))
 
+    # An asserted value has no database behind it, so the sites are the only
+    # thing substantiating it. A site that decodes a *different* number means
+    # the assertion or the site is wrong, and exporting the rest would publish
+    # a number two of its own witnesses disagree with -- reject the whole
+    # declaration rather than quietly keep the agreeing half.
+    if not decl.needs_ida_member:
+        contradicted = _contradicting_sites(decl, encoded)
+        if contradicted:
+            state.member_disagreements += len(contradicted)
+            detail = ", ".join(
+                "%s encodes %s" % (ea_str(ea), found) for ea, found in contradicted
+            )
+            msg("STRIDE_CONTRADICTED %-25s asserted %d but %s"
+                % (decl.qualified, encoded, detail))
+            state._miss("member", decl.qualified,
+                        "asserted value %d contradicted by %s"
+                        % (encoded, detail))
+            return None
+
     if not agreed:
         state.no_candidate += 1
-        msg("MEMBER_NO_CANDIDATE %-25s offset=0x%X sites=%d"
+        msg("MEMBER_NO_CANDIDATE %-25s value=0x%X sites=%d"
             % (decl.qualified, expected, sites))
         state._miss("member", decl.qualified,
-                    "no candidate reproduced offset 0x%X" % expected)
+                    "no candidate reproduced value 0x%X" % expected)
         return None
 
     item_id = writer.write_derived_value(
-        cfs6.SEM_MEMBER_OFFSET, decl.owner, decl.name, len(agreed), coverage,
+        decl.semantic, decl.owner, decl.name, len(agreed), coverage,
         expected_value=expected,
     )
     for rank, cand in enumerate(agreed):

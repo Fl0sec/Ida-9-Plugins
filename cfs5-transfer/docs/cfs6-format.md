@@ -170,8 +170,29 @@ Duplicate `id`, or a candidate naming an unknown `item`, is an error.
 | `constant` | an integer with no further structural meaning |
 
 A consumer **MUST reject** a `semantic` it does not know rather than guess at
-it. Only `member_offset` is produced today; the rest are reserved so a consumer
-written now stays correct when they arrive.
+it. `member_offset` and `element_stride` are produced today; `object_extent`
+and `constant` are reserved so a consumer written now stays correct when they
+arrive.
+
+Resolution arithmetic is **identical for every semantic** — extract a field,
+get a number. The semantic says what the number *means*, not how to obtain it,
+which is why adding `element_stride` needed no schema revision: a consumer that
+already resolved `member_offset` resolves a stride with the same code.
+
+The two differ in what backs the value, and a consumer should know which it is
+holding:
+
+| | `member_offset` | `element_stride` |
+|---|---|---|
+| `expected_value` derived from | a real field in the exporting database | **asserted by the declarer** |
+| candidate origins | any of the three | `selected_operand` only |
+| evidence | type-directed; IDA proves the association | the declarer points at the instructions |
+
+`element_stride` cannot be discovered: nothing in a database associates an
+instruction with "the stride of this array", and accepting another instruction
+because it encodes the same number is exactly the coincidence the origin rules
+forbid. Its `owner` is therefore a **namespace**, not a claim that the type has
+a field of that name.
 
 ### `source.expected_value`
 
@@ -271,14 +292,21 @@ would stop matching exactly when the answer became interesting.
 | `op` | Produces |
 |---|---|
 | `CONST` | `resolve.value` — no field is read (a zero-offset access encodes nothing) |
-| `DISP` | the signed memory displacement at `field_offset` |
+| `DISP` | the memory displacement at `field_offset` |
 | `IMM` | the instruction immediate at `field_offset` |
 | `SCALE` | the SIB index scale factor |
 | `DISP_PLUS_WIDTH` | `DISP` + `access_width` |
 
 There are deliberately **no expression strings and no embedded scripts**. A
-consumer MUST reject an `op` it does not know. Only `CONST` and `DISP` are
-produced today.
+consumer MUST reject an `op` it does not know. `CONST`, `DISP` and `IMM` are
+produced today; `SCALE` and `DISP_PLUS_WIDTH` are reserved.
+
+**Read the field exactly as `resolve.signed` says, per candidate — not per
+`op`.** A displacement is signed, because a subobject-relative access is
+legitimately negative. An immediate holding a magnitude is not: a stride of
+`0x80` in a one-byte field is 128, and reading it signed yields -128. The two
+cases share the `op` table but not the sign convention, so the flag travels
+with the candidate.
 
 ### `resolve` fields for VALUE
 

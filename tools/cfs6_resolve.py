@@ -132,6 +132,12 @@ def resolve_value(image, cand, match_rva):
 
     if cand.op == cfs6.OP_DISP:
         result = value
+    elif cand.op == cfs6.OP_IMM:
+        # An immediate is read exactly as `resolve.signed` says. A stride or a
+        # size is a magnitude, so `0x80` in one byte is 128 -- reading it
+        # signed would silently produce -128. A displacement is the opposite
+        # case, which is why the flag is per candidate and not per op.
+        result = value
     elif cand.op == cfs6.OP_DISP_PLUS_WIDTH:
         result = value + cand.access_width
     else:

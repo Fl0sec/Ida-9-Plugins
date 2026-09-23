@@ -17,6 +17,44 @@ from cfs5 import api
 | `registered()` | the set + anything that no longer resolves |
 | `export(path, merge="append", build=None, include_members=True)` | write the set |
 | `export_list(path, function_names=[], global_names=[], ...)` | explicit list, ignores the set |
+| `declare_members(members_=[], discovery="sites_only")` | declare `member_offset` values |
+| `declare_strides(strides=[])` | declare `element_stride` constants |
+| `undeclare(names=[])` | remove declarations by `"Owner::name"` |
+| `declarations()` | every declaration + how it resolves now |
+
+## Members and strides
+
+```python
+api.declare_members([
+    "CSceneObject::m_hOwnerEntity",                      # scan for sites
+    {"owner": "CModel", "member": "m_nBoneCount",
+     "sites": [{"ea": 0x1234, "op": 1}]},                # or name them
+])
+api.declare_strides([
+    {"owner": "CMeshDrawPrimitive", "name": "kStride", "value": 0x30,
+     "sites": [{"ea": 0x5678, "op": 1}]},
+])
+```
+
+**Sites are evidence locations, never values.** You say where to look; the
+database says what the answer is. A site that decodes a different number is
+dropped, not trusted.
+
+Sites exist because **correct pointer typing does not guarantee IDA member
+xrefs** — a heap-backed object can yield none however well typed it is, so
+automatic discovery can legitimately find nothing.
+
+| | `member_offset` | `element_stride` |
+|---|---|---|
+| value from | the IDA field | you assert it |
+| sites | optional | **required** |
+| discovery | `sites_only` (default) / `sites_plus_auto` / `auto` | never |
+| a site decoding another value | that candidate is dropped | **whole declaration rejected** |
+
+`element_stride` is weaker on purpose: nothing in the database associates an
+instruction with "the stride of this array", so the sites are the only
+evidence and a contradiction among them is fatal. `owner` is a namespace
+there, not a claim that the type has such a field.
 
 `merge`: `"append"` refreshes re-exported items and keeps the rest;
 `"replace"` discards the file. Append is refused across a different image or

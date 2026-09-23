@@ -35,7 +35,9 @@ Registration stores *names*, resolved to addresses only at export time -- see
 import ida_funcs
 import ida_name
 
+from . import declare
 from . import export as _export
+from . import members as _members
 from . import registry
 from . import store
 from .common import BADADDR, ea_str, get_search_ranges, msg
@@ -206,6 +208,197 @@ def registered():
             "members": store.count(),
         },
     )
+
+
+def _split_qualified(entry, key):
+    """(owner, name) from "Owner::name" or from explicit dict keys."""
+    if isinstance(entry, str):
+        owner, sep, name = entry.partition("::")
+        if not sep:
+            raise declare.DeclarationError(
+                "%r is not qualified; write \"Owner::%s\"" % (entry, key)
+            )
+        return owner.strip(), name.strip()
+    if not isinstance(entry, dict):
+        raise declare.DeclarationError("%r is not a string or an object" % (entry,))
+    owner = entry.get("owner")
+    name = entry.get(key) or entry.get("name")
+    if not owner or not name:
+        raise declare.DeclarationError(
+            "an object entry needs 'owner' and '%s'" % key
+        )
+    return owner, name
+
+
+def declare_members(members_=(), discovery=declare.DISCOVER_SITES_ONLY):
+    """Declare `member_offset` values, with explicit evidence sites.
+
+    Each entry is either `"Owner::field"` or a dict:
+
+        {"owner": "CModel", "member": "m_nBoneCount",
+         "name": "bone_count",                 # optional export name
+         "sites": [{"ea": 0x1234, "op": 1}],   # instruction + operand
+         "value_adjust": 0}
+
+    The sites are where *you* know the field is touched. They exist because
+    IDA's member xref index is incomplete: correct pointer typing does not
+    guarantee xrefs for a heap-backed object, so automatic discovery can
+    legitimately find nothing however well typed the database is.
+
+    What a site is **not** is a value. The offset still comes from the IDA
+    member, and a site that decodes a different number is dropped. You supply
+    where to look; the database supplies the answer.
+
+    `discovery="sites_plus_auto"` keeps automatic scanning as well, which buys
+    independent candidates at the cost of decompiling. The default uses only
+    the sites given: deterministic, and fast.
+    """
+    stored, unresolved = [], []
+
+    for entry in members_ or ():
+        try:
+            owner, member = _split_qualified(entry, "member")
+            extra = entry if isinstance(entry, dict) else {}
+            ref = _members.lookup_member(owner, member)
+            if ref is None:
+                raise declare.DeclarationError(
+                    "%s::%s is not a field in this database -- a member_offset "
+                    "requires a real IDA type and member" % (owner, member)
+                )
+            decl = declare.make_member(
+                owner, extra.get("name") or member, member=member,
+                sites=extra.get("sites", ()),
+                discovery=extra.get("discovery", discovery),
+                value_adjust=extra.get("value_adjust", 0),
+            )
+        except declare.DeclarationError as exc:
+            unresolved.append({"kind": "member", "name": str(entry),
+                               "reason": str(exc)})
+            continue
+
+        if not store.save(decl):
+            unresolved.append({"kind": "member", "name": decl.qualified,
+                               "reason": "could not be stored in the IDB"})
+            continue
+        stored.append(decl.qualified)
+
+    ok, partial = registry.outcome(
+        len(stored) + len(unresolved), len(stored), unresolved
+    )
+    msg("API: declared %d member(s), %d unresolved"
+        % (len(stored), len(unresolved)))
+    return _result(ok=ok, partial=partial, unresolved=unresolved,
+                   declared=len(stored), declared_names=sorted(stored))
+
+
+def declare_strides(strides=()):
+    """Declare `element_stride` values: a constant encoded in code.
+
+    Each entry is a dict, because a stride cannot be written as a bare name:
+
+        {"owner": "CMeshDrawPrimitive", "name": "kStride", "value": 0x30,
+         "sites": [{"ea": 0x1234, "op": 1}, ...]}
+
+    Unlike a member offset there is no field in the database to read, so two
+    things differ and both are deliberate. You assert the value, and every
+    site you give must decode exactly it -- one that decodes something else
+    rejects the whole declaration rather than exporting a number its own
+    witnesses contradict. And there is no automatic discovery: nothing in the
+    database associates an instruction with "the stride of this array", and
+    finding other instructions holding the same number would be coincidence,
+    not evidence.
+
+    `owner` is a namespace here, not a claim that the type has such a field.
+    """
+    stored, unresolved = [], []
+
+    for entry in strides or ():
+        try:
+            owner, name = _split_qualified(entry, "name")
+            if not isinstance(entry, dict):
+                raise declare.DeclarationError(
+                    "a stride needs a value and at least one site, so it "
+                    "cannot be declared by name alone"
+                )
+            if entry.get("value") is None:
+                raise declare.DeclarationError("a stride must assert a 'value'")
+            decl = declare.make_stride(
+                owner, name, entry["value"], entry.get("sites", ()),
+                value_adjust=entry.get("value_adjust", 0),
+            )
+        except declare.DeclarationError as exc:
+            unresolved.append({"kind": "stride", "name": str(entry),
+                               "reason": str(exc)})
+            continue
+
+        if not store.save(decl):
+            unresolved.append({"kind": "stride", "name": decl.qualified,
+                               "reason": "could not be stored in the IDB"})
+            continue
+        stored.append(decl.qualified)
+
+    ok, partial = registry.outcome(
+        len(stored) + len(unresolved), len(stored), unresolved
+    )
+    msg("API: declared %d stride(s), %d unresolved"
+        % (len(stored), len(unresolved)))
+    return _result(ok=ok, partial=partial, unresolved=unresolved,
+                   declared=len(stored), declared_names=sorted(stored))
+
+
+def undeclare(names=()):
+    """Remove declarations by qualified name (`"Owner::name"`) or stored id."""
+    by_qualified = {d.qualified: d.id for d in store.load_all()}
+    removed, unresolved = [], []
+
+    for name in names or ():
+        decl_id = by_qualified.get(name, name if str(name).count(":") else None)
+        if decl_id is None:
+            unresolved.append({"kind": "declaration", "name": str(name),
+                               "reason": "not declared"})
+            continue
+        if store.delete(decl_id):
+            removed.append(str(name))
+        else:
+            unresolved.append({"kind": "declaration", "name": str(name),
+                               "reason": "could not be removed"})
+
+    ok, partial = registry.outcome(
+        len(removed) + len(unresolved), len(removed), unresolved
+    )
+    return _result(ok=ok, partial=partial, unresolved=unresolved,
+                   removed=len(removed), removed_names=sorted(removed))
+
+
+def declarations():
+    """Every stored declaration, with how it resolves right now."""
+    out, unresolved = [], []
+    for decl in store.load_all():
+        entry = {
+            "id": decl.id,
+            "semantic": decl.semantic,
+            "qualified": decl.qualified,
+            "member": decl.member,
+            "sites": [{"ea": ea_str(ea), "op": op} for ea, op in decl.sites],
+            "discovery": decl.discovery,
+            "asserted_value": decl.asserted_value,
+        }
+        if decl.needs_ida_member:
+            ref = _members.lookup_member(decl.owner, decl.member)
+            if ref is None:
+                entry["offset"] = None
+                unresolved.append({
+                    "kind": "member", "name": decl.qualified,
+                    "reason": "no live IDA field; the type changed under it",
+                })
+            else:
+                entry["offset"] = ref.byte_offset
+        out.append(entry)
+
+    ok, partial = registry.outcome(len(out), len(out) - len(unresolved),
+                                   unresolved)
+    return _result(ok=ok, partial=partial, unresolved=unresolved,
+                   declarations=out, count=len(out))
 
 
 def _run_export(path, function_eas, global_eas, unresolved, merge, build,

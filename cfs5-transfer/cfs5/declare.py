@@ -22,7 +22,26 @@ from . import cfs6
 
 # Bumped only when a stored declaration's fields change meaning. A declaration
 # written by a newer plugin is refused rather than misread.
-DECL_VERSION = 1
+#
+# 2: `sites` (a list) replaces the single `site_ea`/`site_op` pair, and adds
+#    `discovery` plus `asserted_value`. Version 1 records still load -- their
+#    one site becomes a one-element list -- because re-declaring by hand is
+#    exactly the work this is meant to stop repeating.
+DECL_VERSION = 2
+
+# How a declaration's candidate sites are found.
+#   sites_only      use exactly the sites given; never scan.
+#   sites_plus_auto use the given sites AND automatic discovery, then merge.
+# Default is sites_only: an agent asking for specific evidence should get a
+# deterministic, fast export. sites_plus_auto buys resilience -- independent
+# automatic candidates fail for different reasons than a hand-picked one -- at
+# the cost of decompiling, so it is opt-in.
+DISCOVER_SITES_ONLY = "sites_only"
+DISCOVER_SITES_PLUS_AUTO = "sites_plus_auto"
+DISCOVER_AUTO = "auto"
+VALID_DISCOVERY = (
+    DISCOVER_SITES_ONLY, DISCOVER_SITES_PLUS_AUTO, DISCOVER_AUTO,
+)
 
 # A record name has to survive as a JSON string, an IDB blob and a C++
 # identifier in whatever the consumer generates, so it is a plain identifier.
@@ -55,16 +74,53 @@ def _check_identifier(label, value):
     return text
 
 
+def normalize_sites(sites):
+    """[(ea, op), ...] deduplicated, order-stable, sentinels dropped.
+
+    BADADDR and a negative operand index mean "no site". Normalizing here
+    rather than at every call site is what stops a sentinel from being stored
+    as a real address, rendered as `BADADDR` in the UI, and fed to candidate
+    generation as a `selected_operand` it never was.
+    """
+    out = []
+    seen = set()
+    for site in sites or ():
+        if isinstance(site, dict):
+            ea, op = site.get("ea"), site.get("op")
+        else:
+            try:
+                ea, op = site
+            except (TypeError, ValueError):
+                raise DeclarationError(
+                    "site %r is not an (ea, operand) pair" % (site,)
+                )
+        if ea is None or op is None:
+            continue
+        try:
+            ea, op = int(ea), int(op)
+        except (TypeError, ValueError):
+            raise DeclarationError(
+                "site %r does not hold two integers" % (site,)
+            )
+        if ea == _NO_EA or ea == 0 or op < 0:
+            continue
+        if (ea, op) not in seen:
+            seen.add((ea, op))
+            out.append((ea, op))
+    return out
+
+
 class Declaration:
     """One user-declared derived value, as persisted in the IDB."""
 
     __slots__ = (
-        "semantic", "owner", "name", "member", "site_ea", "site_op",
-        "value_adjust", "version",
+        "semantic", "owner", "name", "member", "sites", "discovery",
+        "asserted_value", "value_adjust", "version",
     )
 
-    def __init__(self, semantic, owner, name, member=None, site_ea=None,
-                 site_op=None, value_adjust=0, version=DECL_VERSION):
+    def __init__(self, semantic, owner, name, member=None, sites=(),
+                 discovery=DISCOVER_SITES_ONLY, asserted_value=None,
+                 value_adjust=0, version=DECL_VERSION):
         if semantic not in cfs6.VALID_SEMANTICS:
             raise DeclarationError("unsupported semantic %r" % (semantic,))
         self.semantic = semantic
@@ -76,16 +132,46 @@ class Declaration:
         # name or it would silently find nothing.
         self.name = _check_identifier("name", name)
         self.member = _check_identifier("member", member or name)
-        # BADADDR and a negative operand index mean "no site". Normalizing here
-        # rather than at every call site is what stops a sentinel from being
-        # stored as a real address, rendered as `BADADDR` in the UI, and fed to
-        # candidate generation as a `selected_operand` it never was.
-        self.site_ea = None if site_ea is None else int(site_ea)
-        self.site_op = None if site_op is None else int(site_op)
-        if self.site_ea == _NO_EA or (self.site_op is not None
-                                      and self.site_op < 0):
-            self.site_ea = None
-            self.site_op = None
+        self.sites = normalize_sites(sites)
+
+        if discovery not in VALID_DISCOVERY:
+            raise DeclarationError(
+                "unknown discovery mode %r (expected one of %s)"
+                % (discovery, ", ".join(VALID_DISCOVERY))
+            )
+        # Sites-based modes without a site would silently produce nothing,
+        # which is the failure this whole model exists to avoid.
+        if not self.sites and discovery != DISCOVER_AUTO:
+            discovery = DISCOVER_AUTO
+        self.discovery = discovery
+
+        # Only a semantic with no backing IDA field may assert its own value;
+        # for a member the offset is read from the database, and accepting a
+        # caller's number there would turn a derived fact into a hand-counted
+        # one -- the exact failure this model was built to prevent.
+        if asserted_value is None:
+            self.asserted_value = None
+        elif semantic == cfs6.SEM_MEMBER_OFFSET:
+            raise DeclarationError(
+                "a member_offset takes its value from the IDA member, never "
+                "from an asserted one"
+            )
+        else:
+            self.asserted_value = int(asserted_value)
+
+        if semantic != cfs6.SEM_MEMBER_OFFSET:
+            if self.asserted_value is None:
+                raise DeclarationError(
+                    "%s has no IDA field to read a value from, so it must "
+                    "assert one" % semantic
+                )
+            if not self.sites:
+                raise DeclarationError(
+                    "%s cannot be discovered -- nothing in the database "
+                    "associates an instruction with it -- so it requires at "
+                    "least one explicit site" % semantic
+                )
+
         self.value_adjust = int(value_adjust)
         self.version = int(version)
 
@@ -99,7 +185,17 @@ class Declaration:
 
     @property
     def has_site(self):
-        return self.site_ea is not None and self.site_op is not None
+        return bool(self.sites)
+
+    @property
+    def scan_allowed(self):
+        """Whether the exporter may spend decompiles discovering more sites."""
+        return self.discovery in (DISCOVER_AUTO, DISCOVER_SITES_PLUS_AUTO)
+
+    @property
+    def needs_ida_member(self):
+        """Whether `expected_value` comes from a live IDA field."""
+        return self.semantic == cfs6.SEM_MEMBER_OFFSET
 
     def to_dict(self):
         return {
@@ -108,8 +204,9 @@ class Declaration:
             "owner": self.owner,
             "name": self.name,
             "member": self.member,
-            "site_ea": self.site_ea,
-            "site_op": self.site_op,
+            "sites": [{"ea": ea, "op": op} for ea, op in self.sites],
+            "discovery": self.discovery,
+            "asserted_value": self.asserted_value,
             "value_adjust": self.value_adjust,
         }
 
@@ -139,22 +236,58 @@ def from_dict(data):
             % (version, DECL_VERSION)
         )
 
+    sites = data.get("sites")
+    if sites is None:
+        # Version 1 stored one site in two scalar fields. Migrate rather than
+        # discard: re-picking a site by hand is exactly the work that
+        # persisting it was meant to stop repeating.
+        sites = [{"ea": data.get("site_ea"), "op": data.get("site_op")}]
+
+    discovery = data.get("discovery")
+    if discovery not in VALID_DISCOVERY:
+        # A v1 record never restricted discovery, so it keeps scanning; the
+        # sites-only default applies to declarations made under v2, which is
+        # where a caller actually asked for exactly those sites.
+        discovery = DISCOVER_AUTO
+
     return Declaration(
         semantic=data.get("semantic"),
         owner=data.get("owner"),
         name=data.get("name"),
         member=data.get("member"),
-        site_ea=data.get("site_ea"),
-        site_op=data.get("site_op"),
+        sites=sites,
+        discovery=discovery,
+        asserted_value=data.get("asserted_value"),
         value_adjust=data.get("value_adjust", 0),
-        version=version or DECL_VERSION,
+        version=DECL_VERSION,
     )
 
 
-def make_member(owner, name, member=None, site_ea=None, site_op=None,
-                value_adjust=0):
-    """A `member_offset` declaration."""
+def make_member(owner, name, member=None, sites=(),
+                discovery=DISCOVER_SITES_ONLY, value_adjust=0):
+    """A `member_offset` declaration. Value always comes from the IDA field."""
     return Declaration(
         cfs6.SEM_MEMBER_OFFSET, owner, name, member=member,
-        site_ea=site_ea, site_op=site_op, value_adjust=value_adjust,
+        sites=sites, discovery=discovery, value_adjust=value_adjust,
+    )
+
+
+def make_stride(owner, name, value, sites, value_adjust=0):
+    """An `element_stride` declaration: a constant encoded in code.
+
+    Unlike a member offset there is no field in the database to read, so the
+    caller asserts the value and must point at the instructions that encode
+    it. That is a weaker guarantee than `member_offset` gets, and deliberately
+    visible as one: the export gate becomes "every supplied site decodes to
+    the asserted number" rather than "every site agrees with IDA".
+
+    It also cannot be discovered. No index, decompiler node or type in the
+    database associates an instruction with "the stride of this array", and
+    finding other instructions encoding the same number would be numeric
+    coincidence, not evidence -- the one thing the candidate rules forbid.
+    """
+    return Declaration(
+        cfs6.SEM_ELEMENT_STRIDE, owner, name, member=name,
+        sites=sites, discovery=DISCOVER_SITES_ONLY,
+        asserted_value=value, value_adjust=value_adjust,
     )

@@ -570,11 +570,12 @@ def _report_candidate_preview(decl, ref):
     if not ranges:
         return "no executable search ranges"
 
-    site = (decl.site_ea, decl.site_op) if decl.has_site else None
     try:
         candidates, _coverage, sites, _searched = choose_member_candidates(
-            ref, ranges, selected_site=site, value_adjust=decl.value_adjust,
+            ref, ranges, selected_sites=decl.sites,
+            value_adjust=decl.value_adjust,
             sibling_offsets=export.sibling_offsets(ref.owner),
+            allow_scan=decl.scan_allowed,
         )
     except Exception as exc:
         msg("DECLARE: candidate preview failed: %s" % exc)
@@ -598,17 +599,24 @@ def _store_member_declaration(ref, site_ea=None, site_op=None):
     is nothing to decide: the database already holds the answer, and asking
     would only invite a typo that silently renames the exported item.
 
-    "No site" must be `None`, not BADADDR/-1: `Declaration.has_site` only tests
-    for None, so a sentinel is stored as a real site, displayed as `BADADDR`,
-    and then handed to candidate generation as a `selected_operand` -- a
-    provenance claim that is simply false.
+    "No site" must be `None`, not BADADDR/-1: `declare.normalize_sites` drops
+    the sentinels, so a site is never stored as a real address, displayed as
+    `BADADDR`, and then handed to candidate generation as a
+    `selected_operand` -- a provenance claim that is simply false.
+
+    A UI declaration keeps automatic discovery. The user clicked one operand;
+    they did not thereby assert that it is the only evidence in the binary,
+    and losing the scan would silently narrow every existing declaration. Only
+    a caller that explicitly asks for `sites_only` gets it.
     """
     if site_ea in (None, BADADDR) or site_op is None or site_op < 0:
-        site_ea, site_op = None, None
+        sites = ()
+    else:
+        sites = [(site_ea, site_op)]
     try:
         decl = declare.make_member(
-            ref.owner, ref.name, member=ref.name,
-            site_ea=site_ea, site_op=site_op,
+            ref.owner, ref.name, member=ref.name, sites=sites,
+            discovery=declare.DISCOVER_SITES_PLUS_AUTO,
         )
     except declare.DeclarationError as exc:
         msg("DECLARE: %s.%s rejected: %s" % (ref.owner, ref.name, exc))
@@ -920,7 +928,14 @@ class DeclarationChooser(ida_kernwin.Choose):
         # A missing member is the interesting case: it means the type changed
         # under a declaration and the next export will skip it.
         offset = "0x%X" % ref.byte_offset if ref is not None else "MISSING"
-        site = ea_str(decl.site_ea) if decl.has_site else "-"
+        # Show the count once there is more than one: a declaration whose
+        # evidence was supplied by an agent routinely has several.
+        if not decl.sites:
+            site = "-"
+        elif len(decl.sites) == 1:
+            site = ea_str(decl.sites[0][0])
+        else:
+            site = "%s +%d" % (ea_str(decl.sites[0][0]), len(decl.sites) - 1)
         return [decl.owner, decl.name, decl.member, offset, site]
 
     @staticmethod
@@ -950,7 +965,7 @@ class DeclarationChooser(ida_kernwin.Choose):
         if 0 <= row < len(self.items):
             decl = self.items[row]
             if decl.has_site:
-                ida_kernwin.jumpto(decl.site_ea)
+                ida_kernwin.jumpto(decl.sites[0][0])
         return [ida_kernwin.Choose.NOTHING_CHANGED, max(row, 0)]
 
 
