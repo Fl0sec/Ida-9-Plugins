@@ -29,6 +29,9 @@ from .declare import DeclarationError, from_dict
 # with an identifier-shaped name in the database.
 _NODE_PREFIX = "$ cfs6 declaration "
 _INDEX_NODE = "$ cfs6 declarations"
+# The export set (registry.py entry ids). One node holding one JSON list --
+# it is pure identity, so unlike a declaration there is nothing to shard.
+_REGISTRY_NODE = "$ cfs6 export set"
 
 _BLOB_TAG = "D"
 _BLOB_INDEX = 0
@@ -106,6 +109,34 @@ def _load_index():
 
 def _save_index(ids):
     return _write_json(_INDEX_NODE, sorted(set(ids)))
+
+
+# ---------------------------------------------------------------------------
+# The export set
+# ---------------------------------------------------------------------------
+
+def load_registry():
+    """Registered entry ids, sorted. Never raises -- absent reads as empty."""
+    value = _read_json(_REGISTRY_NODE)
+    if not isinstance(value, list):
+        return []
+    return sorted({x for x in value if isinstance(x, str) and x})
+
+
+def save_registry(entry_ids):
+    """Replace the export set. Returns True only if the read-back agrees.
+
+    Callers treat a False as "nothing was registered", so the verification is
+    not optional: an agent that is told it registered fifty items and finds
+    none of them at export time has no way to tell which step lied.
+    """
+    wanted = sorted({x for x in entry_ids or () if isinstance(x, str) and x})
+    if not _write_json(_REGISTRY_NODE, wanted):
+        return False
+    if load_registry() != wanted:
+        msg("STORE: export set write-back verification failed")
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------

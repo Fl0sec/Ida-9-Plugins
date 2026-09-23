@@ -34,7 +34,11 @@ cfs5-transfer/
                 # field inference, xref iters
     sigs.py     # IDA-touching ENTRY/BODY/REL finders (rules live in policy.py)
     typeio.py   # binary tinfo transport: materialize/serialize/deserialize, register, merge
+    export.py   # the export engine: UI actions and api.py both call it, never prompts
+    registry.py # the export set: identity + validation                  [no ida_*]
+    api.py      # programmatic export for an agent (no UI) -- docs/agent-api.md
   docs/cfs6-format.md     # AUTHORITATIVE format spec -- update it with any change
+  docs/agent-api.md       # READ BEFORE adding/changing anything in api.py
   tests/                  # stdlib unittest over the ida-free modules
 ../tools/cfs6_resolve.py  # reference CFS6 resolver, no IDA         [no ida_*]
 ```
