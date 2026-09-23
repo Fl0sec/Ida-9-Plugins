@@ -163,6 +163,13 @@ that points at the wrong thing.
 - **Wait boxes nest as a stack.** `show_wait_box` pushes, `hide_wait_box` pops,
   so nested scans are fine *provided the calls are balanced* — always pair them
   with `try/finally`.
+- **An IDA call that opens its own wait box inside yours breaks `user_cancelled`.**
+  `ida_hexrays.decompile()` displays one by default: inside a batch loop it
+  hides your progress text (a slow item looks hung) and swallows the Cancel
+  click, so your loop never sees `user_cancelled()` and cannot be aborted.
+  Pass `DECOMP_NO_WAIT`. Before calling any long IDA API inside a wait-boxed
+  loop, check its flags for an equivalent — the symptom (“stuck, then cancel
+  makes it continue”) reads like a hang and is really a nesting bug.
 
 ## Caching rules for expensive analysis
 

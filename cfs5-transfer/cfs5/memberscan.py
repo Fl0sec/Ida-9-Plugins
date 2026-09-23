@@ -54,25 +54,38 @@ Every surviving site is still gated by `disasm.infer_displacement_field` in
 `sigs.py` before it becomes a candidate, which independently re-proves that
 the bytes at that address encode the offset.
 
-Why the scan is per *structure*, not per member
------------------------------------------------
+Which functions get decompiled, and why
+---------------------------------------
 
-A single displacement is only a useful prefilter when it is **rare**. Measured
-on client.dll, `+0x2090` narrows to 11 functions; `+0x10` narrows to 37918 --
-which is no narrowing at all, and sampling it in address order decompiles the
-lowest-addressed functions in the module, none of which touch the type.
+There is no member->function index to consult; that absence is the whole
+reason this module exists. So the only way to know whether a function uses a
+member is to decompile it and look, and the real problem is choosing which few
+hundred of tens of thousands are worth that. Two tiers, best first:
 
-So the prefilter is the whole structure at once. Every member's offset is
-looked up, and candidate functions are ranked by **how many distinct members
-of this same structure they hit**. A function containing hits for `0x10` *and*
-`0x2090` *and* `0x20C0` is overwhelmingly likely to be a `CGameEntitySystem`
-function; one with only `0x10` is noise. Co-occurrence carries the information
-a common offset cannot, so the rare members effectively rescue the common ones.
+**1. Prototype seeds.** Any function declared `f(CModel *self, ...)` is a
+`CModel` function, and the database already says so in its type information --
+no decompiling, no displacement, no guessing. These are near-certain hits and
+are spent before anything speculative.
 
-This is still only a prefilter -- the ctree remains the sole discriminator.
+**2. Rarity-weighted co-occurrence.** For functions that touch the type
+without being typed for it, every member offset is looked up in the
+displacement index and each hit is weighted by `1/len(bucket)`: an offset
+shared with 11 functions is strong evidence, one shared with 37918 is nearly
+none. Summing those weights lets a function that hits the type's *rare*
+offsets outrank one that merely hits `+0x10`.
 
-It is also what makes the feature affordable: one decompile harvests *every*
-member of the structure that function touches, so scanning a 40-member type
+An earlier version scored by counting *distinct* offsets hit. That works on a
+type with many rare offsets (`CGameEntitySystem`: 14 members, offsets around
+`+0x2090`) and collapses on a small one (`CModel`: 4 members near `+0x70`),
+where every candidate ties at 1 and the sample is effectively random -- which
+is how a correctly typed `CModel` accessor ended up outside a 150-function
+sample of 11480. Rarity weighting fixes the ranking; the prototype tier is
+what makes that case not depend on ranking at all.
+
+Neither tier decides anything -- the ctree remains the sole discriminator.
+
+Scanning per structure is also what makes it affordable: one decompile
+harvests *every* member of the type that function touches, so a 40-member type
 costs about one pass, not forty.
 
 Known limits (documented, not hidden)
@@ -87,12 +100,21 @@ Known limits (documented, not hidden)
     unrecoverable. It is correctly absent rather than wrong.
   * **The owner must match by name exactly.** An access typed as a derived
     class is not matched against a base-class owner.
+  * **Coverage tracks how well typed the database is.** A member only ever
+    reached through untyped `*(_DWORD *)(a1 + 112)` arithmetic cannot be
+    confirmed by any amount of searching, because the decompiler is the
+    discriminator and it has nothing to say. Type the accessing function and
+    rescan; every other member of the type in that function comes along free.
 """
+
+import re
 
 import ida_funcs
 import ida_hexrays
 import ida_kernwin
+import ida_nalt
 import ida_segment
+import ida_typeinf
 import ida_ua
 import idautils
 
@@ -106,10 +128,9 @@ from .disasm import signed_le
 MAX_FUNCS_TO_DECOMPILE = 150
 MAX_VALIDATED_SITES = 8
 
-# A function hitting only one of the structure's offsets is weak evidence. Once
-# the ranking has dropped to singletons, keep going only while the budget is
-# still mostly unspent -- for a small structure that is the only tier there is.
-SINGLE_HIT_BUDGET_FRACTION = 0.5
+# Marks a prototype-seeded function so the budget logic never treats one as a
+# weak single-offset guess. Seeds are certainties, not samples.
+_SEED_RANK = 1 << 30
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +299,22 @@ class _StructSiteVisitor(ida_hexrays.ctree_visitor_t):
 
 
 def _harvest_struct_in(func_ea, owner):
-    """{byte_offset: {ea, ...}} for every `owner` member seen in `func_ea`."""
+    """{byte_offset: {ea, ...}} for every `owner` member seen in `func_ea`.
+
+    DECOMP_NO_WAIT is not an optimization, it is required for correctness here.
+    By default `decompile()` opens its *own* wait box, which nests on top of
+    the scan's: the progress text is hidden for the duration of each function
+    (so a slow one looks hung), and -- worse -- a Cancel click is consumed by
+    the inner box, so `user_cancelled()` never becomes true and the scan cannot
+    be aborted at all.
+
+    The cache is deliberately left on (no DECOMP_NO_CACHE): reusing pseudocode
+    already stored in the IDB is most of what makes a 150-function pass viable.
+    """
     try:
-        cfunc = ida_hexrays.decompile(func_ea)
+        cfunc = ida_hexrays.decompile(
+            func_ea, None, ida_hexrays.DECOMP_NO_WAIT
+        )
     except Exception as exc:
         msg("MEMBERSCAN: decompile %s failed: %s" % (ea_str(func_ea), exc))
         return {}
@@ -296,18 +330,55 @@ def _harvest_struct_in(func_ea, owner):
     return visitor.hits
 
 
-def _rank_functions(offsets):
-    """Candidate functions, best first, by co-occurrence of `offsets`.
+def _prototype_seed(owner):
+    """Functions whose own prototype names `owner` -- the strongest signal.
 
-    The ranking key is how many **distinct** member offsets of the structure a
-    function contains, then how many total hits. That is the whole reason a
-    common offset like `+0x10` becomes tractable: on its own it selects 37918
-    functions, but the ones that also contain the type's rare offsets are the
-    ones that actually use the type.
+    A function declared `f(CModel *self, ...)` is a `CModel` function, and that
+    is recorded in the database as type information: no decompiling, no
+    guessing, no displacement involved. These are near-certain hits and must be
+    spent before any speculative candidate.
+
+    This is the signal the co-occurrence ranking cannot replace. Ranking works
+    on a type with many rare offsets (CGameEntitySystem: 14 members, offsets
+    like +0x2090), but degenerates on a small type whose offsets are all
+    common (CModel: 4 members around +0x70), where every candidate function
+    scores identically and the sample is effectively random.
+
+    Matching is on a word boundary so `CModel` does not also select
+    `CModelDataBlock`. It only decides where to *look*; the ctree still decides
+    what counts.
+    """
+    pattern = re.compile(r"\b%s\b" % re.escape(owner))
+    seeds = []
+    tif = ida_typeinf.tinfo_t()
+    for func_ea in idautils.Functions():
+        try:
+            if not ida_nalt.get_tinfo(tif, func_ea):
+                continue
+            if pattern.search(str(tif)):
+                seeds.append(int(func_ea))
+        except Exception:
+            continue
+    return seeds
+
+
+def _rank_functions(owner, offsets):
+    """Candidate functions, best first: prototype seeds, then co-occurrence.
+
+    Tier 1 is every function typed against `owner` (see `_prototype_seed`).
+
+    Tier 2 scores the rest by the displacement index, weighting each offset by
+    its **rarity**: a hit on an offset shared by 200 functions is weak, one on
+    an offset shared by 11 is strong. Counting distinct offsets instead made
+    every function on a small structure tie at 1, which is how a well-typed
+    `CModel` accessor ended up outside a 150-function sample of 11480.
     """
     index = build_displacement_index()
     if index is None:
         return [], 0
+
+    seeds = _prototype_seed(owner)
+    seeded = set(seeds)
 
     by_func = {}
     total_sites = 0
@@ -317,21 +388,32 @@ def _rank_functions(offsets):
             # Such members are still harvested from functions other members
             # bring in -- they just cannot contribute to the ranking.
             continue
-        for ea in index.get(offset, ()):
+        bucket = index.get(offset, ())
+        # Rarity weight: an offset that appears everywhere says almost nothing.
+        weight = 1.0 / max(1, len(bucket))
+        for ea in bucket:
             func = ida_funcs.get_func(ea)
             if func is None:
                 continue
             total_sites += 1
-            entry = by_func.setdefault(int(func.start_ea), [set(), 0])
+            if int(func.start_ea) in seeded:
+                continue
+            entry = by_func.setdefault(int(func.start_ea), [set(), 0.0])
             entry[0].add(offset)
-            entry[1] += 1
+            entry[1] += weight
 
     ranked = sorted(
         by_func.items(),
-        key=lambda kv: (len(kv[1][0]), kv[1][1], -kv[0]),
+        key=lambda kv: (kv[1][1], len(kv[1][0]), -kv[0]),
         reverse=True,
     )
-    return [(fn, len(hits), total) for fn, (hits, total) in ranked], total_sites
+
+    out = [(fn, _SEED_RANK, 0.0) for fn in seeds]
+    out.extend((fn, len(hits), score) for fn, (hits, score) in ranked)
+    if seeds:
+        msg("MEMBERSCAN: %s -- %d function(s) are typed against it; those are "
+            "searched first" % (owner, len(seeds)))
+    return out, total_sites
 
 
 # Per-structure results, valid for as long as the displacement index is.
@@ -368,37 +450,44 @@ def scan_struct(owner, offsets, force=False):
             % (owner, len(cached)))
         return cached
 
-    ranked, total_sites = _rank_functions(wanted)
+    ranked, total_sites = _rank_functions(owner, wanted)
     if not ranked:
-        msg("MEMBERSCAN: %s -- no instruction in this module encodes any of "
-            "its %d member offset(s)" % (owner, len(wanted)))
+        msg("MEMBERSCAN: %s -- nothing is typed against it and no instruction "
+            "encodes any of its %d member offset(s)" % (owner, len(wanted)))
         _struct_cache[key] = {}
         return {}
 
     found = {}
     examined = 0
+    seeds_done = 0
     cancelled = False
-    single_hit_limit = int(MAX_FUNCS_TO_DECOMPILE * SINGLE_HIT_BUDGET_FRACTION)
-    budget = min(len(ranked), MAX_FUNCS_TO_DECOMPILE)
+    # Seeds are certainties, so the speculative budget is counted separately --
+    # a type with 200 typed functions must not spend its whole allowance before
+    # reaching them, and must not be cut short by them either.
+    seed_count = sum(1 for _fn, rank, _s in ranked if rank == _SEED_RANK)
+    budget = seed_count + min(len(ranked) - seed_count, MAX_FUNCS_TO_DECOMPILE)
 
     ida_kernwin.show_wait_box("CFS6: scanning %s..." % owner)
     try:
-        for func_ea, distinct, _total in ranked:
-            if examined >= MAX_FUNCS_TO_DECOMPILE:
-                break
-            if distinct < 2 and examined >= single_hit_limit:
-                # Nothing but weak, single-offset matches remain.
+        for func_ea, rank, _score in ranked:
+            is_seed = rank == _SEED_RANK
+            if not is_seed and (examined - seeds_done) >= MAX_FUNCS_TO_DECOMPILE:
                 break
             if ida_kernwin.user_cancelled():
                 cancelled = True
                 msg("MEMBERSCAN: %s -- cancelled after %d function(s)"
                     % (owner, examined))
                 break
+            # Naming the function makes a slow one identifiable instead of
+            # just looking hung.
             ida_kernwin.replace_wait_box(
-                "CFS6: %s -- decompiling %d/%d (%d member(s) covered)"
-                % (owner, examined + 1, budget, len(found))
+                "CFS6: %s -- decompiling %d/%d%s\n%s (%d member(s) covered)"
+                % (owner, examined + 1, budget,
+                   " [typed]" if is_seed else "", ea_str(func_ea), len(found))
             )
             examined += 1
+            if is_seed:
+                seeds_done += 1
             for offset, eas in _harvest_struct_in(func_ea, owner).items():
                 if offset in wanted:
                     found.setdefault(offset, set()).update(eas)
@@ -406,9 +495,10 @@ def scan_struct(owner, offsets, force=False):
         ida_kernwin.hide_wait_box()
 
     result = {off: sorted(eas) for off, eas in found.items()}
-    msg("MEMBERSCAN: %s -- %d site(s) across %d function(s); decompiled %d, "
-        "confirmed %d of %d member(s)%s"
-        % (owner, total_sites, len(ranked), examined, len(result), len(wanted),
+    msg("MEMBERSCAN: %s -- %d site(s) across %d function(s); decompiled %d "
+        "(%d typed), confirmed %d of %d member(s)%s"
+        % (owner, total_sites, len(ranked), examined, seeds_done, len(result),
+           len(wanted),
            " (CANCELLED -- partial, not cached)" if cancelled else ""))
     if not cancelled:
         _struct_cache[key] = result

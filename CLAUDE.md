@@ -131,6 +131,10 @@ detail with the stub evidence is in
 - **A UI action must never dead-end.** No context → open a picker, don't warn
   the user to do what they just did. And when a lookup can fail three ways, say
   *which* — one generic message hides the other two causes.
+- **A nested wait box breaks your Cancel.** `ida_hexrays.decompile()` opens its
+  own by default, which hides your progress text and eats the Cancel click, so
+  `user_cancelled()` never fires. Pass `DECOMP_NO_WAIT`, and check any other
+  long IDA call you put inside a wait-boxed loop for the same flag.
 - **Never cache a cancelled or failed scan**, build the value *before* computing
   its cache key (or the key is stale on the very first call), and **log cache
   hits** so a hit is distinguishable from "never ran".
