@@ -35,6 +35,12 @@ _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 _PREFIX = {KIND_FUNCTION: "fn:", KIND_GLOBAL: "global:"}
 
+# Locator kinds a caller may declare. Closed, and separate from the format's
+# candidate modes: this names what the *caller asked for*, which the exporter
+# must verify before it becomes a VTABLE candidate.
+LOCATOR_VTABLE = "vtable"
+VALID_LOCATOR_KINDS = (LOCATOR_VTABLE,)
+
 
 class RegistryError(ValueError):
     """An entry that cannot be stored as written."""
@@ -70,19 +76,95 @@ _NO_EA = 0xFFFFFFFFFFFFFFFF
 
 
 def normalize_entry(kind, entry):
-    """(id, sites) for one entry, which may be a name or an object.
+    """(id, sites, locators) for one entry, which may be a name or an object.
 
-    An entry is either `"Name"` or `{"name": "Name", "sites": [...]}`. The
-    object form exists for the case discovery cannot serve: when no prologue,
-    call site or body window is unique, the only thing left is the anchor the
-    caller found for itself, and there has to be a way to hand it over.
+    An entry is either `"Name"` or an object carrying `sites` and/or locator
+    declarations. Both object forms exist for the case discovery cannot serve:
+    when no prologue, call site or body window is unique, the only thing left
+    is evidence the caller found for itself, and there has to be a way to hand
+    it over.
+
+    `sites` and a locator answer different questions, which is why they are
+    separate keys rather than one. A site says *where a pattern may be
+    anchored* -- discovery still builds the signature. A locator says *how the
+    function is found without a pattern at all*, which is the only thing that
+    works for a member of a clone family.
     """
     if isinstance(entry, dict):
         name = entry.get("name")
         sites = normalize_sites(entry.get("sites", ()))
+        locators = normalize_locators(entry)
     else:
-        name, sites = entry, []
-    return entry_id(kind, name), sites
+        name, sites, locators = entry, [], []
+    iid = entry_id(kind, name)
+    if locators and kind != KIND_FUNCTION:
+        raise RegistryError(
+            "a structural locator names a function; %r is a %s" % (name, kind)
+        )
+    return iid, sites, locators
+
+
+def normalize_locators(entry):
+    """[locator, ...] declared on one entry. Raises on a malformed one.
+
+    Declared through `register`, not a `declare_*` call, because `declare_*`
+    takes an owner and produces a value; these produce a function address, so
+    they belong beside `sites`.
+    """
+    out = []
+    vtable = entry.get("vtable")
+    if vtable is not None:
+        out.append(normalize_vtable_locator(vtable))
+    return out
+
+
+def normalize_vtable_locator(spec):
+    """A validated `{"type": ..., "slot": N}` declaration.
+
+    `type` may be a plain class name or a raw MSVC descriptor; which one the
+    caller passes is a convenience, and the exporter stores the raw descriptor
+    it reads out of the image either way. Nothing here touches IDA -- this
+    validates the *shape* of the claim, and `cfs5/sigs.py` verifies the claim
+    itself against the RTTI table before anything is exported.
+    """
+    if not isinstance(spec, dict):
+        raise RegistryError(
+            "a vtable locator must be an object like "
+            '{"type": "CCSPlayerInventory", "slot": 19}, got %r' % (spec,)
+        )
+
+    type_name = spec.get("type")
+    if not isinstance(type_name, str) or not type_name.strip():
+        raise RegistryError("a vtable locator needs a non-empty 'type'")
+
+    if "slot" not in spec:
+        raise RegistryError("a vtable locator needs a 'slot'")
+    try:
+        slot = int(spec["slot"])
+    except (TypeError, ValueError):
+        raise RegistryError("vtable slot %r is not an integer" % (spec["slot"],))
+    if slot < 0:
+        raise RegistryError("vtable slot must be >= 0, got %d" % slot)
+
+    subobject = spec.get("subobject_offset")
+    if subobject is not None:
+        try:
+            subobject = int(subobject)
+        except (TypeError, ValueError):
+            raise RegistryError(
+                "subobject_offset %r is not an integer" % (subobject,)
+            )
+        if subobject < 0:
+            raise RegistryError(
+                "subobject_offset must be >= 0, got %d" % subobject
+            )
+
+    return {
+        "kind": LOCATOR_VTABLE,
+        "type": type_name.strip(),
+        "slot": slot,
+        "subobject_offset": subobject,
+    }
 
 
 def normalize_sites(sites):
@@ -115,20 +197,22 @@ def normalize_sites(sites):
 
 
 def normalize_entries(kind, entries):
-    """(ids, sites_by_id, rejected) for a batch, order-stable, deduplicated.
+    """(ids, sites_by_id, locators_by_id, rejected) for a batch.
 
-    Never raises on a bad member of the batch: an agent registering fifty
-    names should learn which two were wrong and keep the other forty-eight,
-    not lose the call. Rejections carry a reason for the same reason.
+    Order-stable and deduplicated. Never raises on a bad member of the batch:
+    an agent registering fifty names should learn which two were wrong and keep
+    the other forty-eight, not lose the call. Rejections carry a reason for the
+    same reason.
     """
     ids = []
     seen = set()
     sites_by_id = {}
+    locators_by_id = {}
     rejected = []
 
     for entry in entries or ():
         try:
-            iid, sites = normalize_entry(kind, entry)
+            iid, sites, locators = normalize_entry(kind, entry)
         except RegistryError as exc:
             name = entry.get("name") if isinstance(entry, dict) else entry
             rejected.append({"name": name, "kind": kind, "reason": str(exc)})
@@ -142,13 +226,21 @@ def normalize_entries(kind, entries):
             # to repeat the first one.
             merged = sites_by_id.setdefault(iid, [])
             merged.extend(s for s in sites if s not in merged)
+        for locator in locators:
+            # A re-declared locator of the same kind *replaces* the old one,
+            # unlike sites. Two sites are two pieces of evidence; two vtable
+            # slots for one function are a contradiction, and keeping both
+            # would export a candidate the caller has just corrected.
+            merged = locators_by_id.setdefault(iid, [])
+            merged[:] = [x for x in merged if x["kind"] != locator["kind"]]
+            merged.append(locator)
 
-    return ids, sites_by_id, rejected
+    return ids, sites_by_id, locators_by_id, rejected
 
 
 def normalize(kind, names):
-    """(ids, rejected) for a batch, ignoring any sites the entries carry."""
-    ids, _sites, rejected = normalize_entries(kind, names)
+    """(ids, rejected) for a batch, ignoring sites and locators."""
+    ids, _sites, _locators, rejected = normalize_entries(kind, names)
     return ids, rejected
 
 

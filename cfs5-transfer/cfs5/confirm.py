@@ -58,7 +58,7 @@ from .policy import (
     confirm_min_exact,
     rank_confirm_windows,
 )
-from .sigs import iter_unique_windows, sample_body_indices
+from .windows import iter_unique_windows, sample_body_indices
 
 
 class ConfirmSignature:

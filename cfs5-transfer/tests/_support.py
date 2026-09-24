@@ -104,6 +104,29 @@ def value_candidate(pattern, anchor=0x2000, insn_offset=0, field_offset=3,
     )
 
 
+def vtable_candidate(pattern="48 89 44 24 ? 48 8B CB FF D7", anchor=0x1058,
+                     func=0x1000, size=0x6D, vtable=0x9000, slot=19):
+    tokens = pattern.split()
+    return Candidate(
+        mode=cfs6.MODE_VTABLE, signature=pattern,
+        origin=cfs6.ORIGIN_RTTI_VTABLE_SLOT,
+        byte_len=len(tokens), wildcards=tokens.count("?"),
+        exact=len(tokens) - tokens.count("?"),
+        anchor_ea=anchor, func_ea=func, func_size=size,
+        target_ea=vtable,
+        locator={
+            "type_descriptor": ".?AVCCSPlayerInventory@@",
+            "subobject_offset": 0,
+            "slot": slot,
+            "confirm_offset": anchor - func,
+            "function_size": size,
+            "scan_bound": cfs6.SCAN_BOUND_PDATA_CHAIN,
+            "tokenization": cfs6.TOKENIZATION_STRICT,
+            "image_matches": 1,
+        },
+    )
+
+
 def write_member_cfs6(path, members, image=None, build_number=14177):
     """members: [(owner, name, expected, [Candidate, ...]), ...] -> a file."""
     with open(path, "w", encoding="utf-8", newline="") as handle:

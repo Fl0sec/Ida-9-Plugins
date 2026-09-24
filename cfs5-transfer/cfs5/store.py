@@ -36,6 +36,10 @@ _REGISTRY_NODE = "$ cfs6 export set"
 # in a separate node from the export set so a plugin that does not know about
 # sites still reads and writes the set correctly.
 _SITES_NODE = "$ cfs6 export sites"
+# Structural locator declarations: {entry_id: [locator, ...]}. Its own node for
+# the same reason as the sites node -- a build that does not know about
+# locators still reads and writes the export set correctly.
+_LOCATORS_NODE = "$ cfs6 export locators"
 
 _BLOB_TAG = "D"
 _BLOB_INDEX = 0
@@ -168,6 +172,41 @@ def save_sites(mapping):
         return False
     if load_sites() != wanted:
         msg("STORE: export-site write-back verification failed")
+        return False
+    return True
+
+
+def load_locators():
+    """{entry_id: [locator, ...]} for registered functions. Absent reads empty.
+
+    Each locator is the dict `registry.normalize_vtable_locator` produced, so
+    what comes back out is what the caller declared -- never a re-derived
+    approximation of it.
+    """
+    value = _read_json(_LOCATORS_NODE)
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for key, entries in value.items():
+        if not isinstance(key, str) or not isinstance(entries, list):
+            continue
+        clean = [x for x in entries if isinstance(x, dict) and x.get("kind")]
+        if clean:
+            out[key] = clean
+    return out
+
+
+def save_locators(mapping):
+    """Replace the stored locators. Verified by read-back, like the sites."""
+    wanted = {}
+    for key, entries in (mapping or {}).items():
+        clean = [x for x in (entries or ()) if isinstance(x, dict) and x.get("kind")]
+        if clean:
+            wanted[str(key)] = clean
+    if not _write_json(_LOCATORS_NODE, wanted):
+        return False
+    if load_locators() != wanted:
+        msg("STORE: export-locator write-back verification failed")
         return False
     return True
 

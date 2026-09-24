@@ -8,7 +8,7 @@ import unittest
 import _support
 from _support import (
     body_candidate, entry_candidate, header_line, rel_candidate, write_cfs6,
-    write_lines,
+    vtable_candidate, write_lines,
 )
 
 from cfs5 import cfs6
@@ -28,6 +28,20 @@ class Cfs6TempFileCase(unittest.TestCase):
 
 
 class TestRoundTrip(Cfs6TempFileCase):
+    def test_vtable_candidate_round_trip(self):
+        cand = vtable_candidate()
+        write_cfs6(self.path, [(cfs6.REC_FUNCTION, "notify", [cand])])
+        loaded = self.load()
+        self.assertEqual(loaded.parse_errors, 0)
+        got = loaded.functions()[0].candidates[0]
+        self.assertEqual(got.mode, cfs6.MODE_VTABLE)
+        self.assertEqual(got.type_descriptor, ".?AVCCSPlayerInventory@@")
+        self.assertEqual(got.slot, 19)
+        self.assertEqual(got.confirm_offset, 0x58)
+        self.assertEqual(got.scan_bound, cfs6.SCAN_BOUND_PDATA_CHAIN)
+        self.assertEqual(got.tokenization, cfs6.TOKENIZATION_STRICT)
+        self.assertEqual(got.image_matches, 1)
+
     def test_function_and_global_round_trip(self):
         entry = entry_candidate("40 53 48 83 EC ? 48 8B D9")
         body = body_candidate("48 8B 43 ? F3 0F 10 40 ?", anchor=0x1041)
@@ -261,12 +275,63 @@ class TestValidation(Cfs6TempFileCase):
         self.assertEqual(loaded.parse_errors, 1)
         self.assertIn("body_offset", " ".join(self.logged))
 
-    def test_unsupported_mode_is_an_error(self):
+    def test_unsupported_mode_is_skipped_not_an_error(self):
+        # Revision 2 contract: a newer producer adding a resolution mode must
+        # not make the file unreadable. The candidate is dropped and reported,
+        # exactly like an unknown record kind; the item survives with one
+        # fewer candidate, and only an item left with *none* actually fails.
         loaded = self._item_and(
             '{"record":"candidate","item":"fn:a","rank":0,"mode":"MAGIC",'
             '"pattern":"90 90 90 90 90 90","resolve":{}}'
         )
+        self.assertEqual(loaded.parse_errors, 0)
+        self.assertEqual(loaded.skipped_records, 1)
+        self.assertIn("MAGIC", " ".join(self.logged))
+        self.assertEqual(loaded.functions()[0].candidates, [])
+
+    def test_supported_candidate_survives_rank_gap_from_unknown_mode(self):
+        loaded = self._item_and(
+            '{"record":"candidate","item":"fn:a","rank":0,"mode":"MAGIC",'
+            '"pattern":"90","resolve":{}}',
+            '{"record":"candidate","item":"fn:a","rank":1,"mode":"ENTRY",'
+            '"pattern":"90 90 90 90 90 90","resolve":{}}',
+        )
+        self.assertEqual(loaded.parse_errors, 0)
+        self.assertEqual(loaded.skipped_records, 1)
+        self.assertEqual([c.rank for c in loaded.functions()[0].candidates], [1])
+
+    def test_vtable_validation_and_item_kind(self):
+        base = ('{"record":"candidate","item":"fn:a","rank":0,'
+                '"mode":"VTABLE","pattern":"90","origin":"rtti_vtable_slot",'
+                '"resolve":%s}')
+        valid = {
+            "type_descriptor": ".?AVC@@", "subobject_offset": 0, "slot": 0,
+            "confirm_offset": 0, "function_size": 1,
+            "scan_bound": "pdata_chain", "tokenization": "strict",
+            "image_matches": 1,
+        }
+        for field, value, needle in (
+            ("slot", -1, "slot"),
+            ("type_descriptor", "", "type_descriptor"),
+            ("scan_bound", "future_bound", "scan_bound"),
+        ):
+            resolve = dict(valid)
+            resolve[field] = value
+            loaded = self._item_and(base % json.dumps(resolve))
+            self.assertEqual(loaded.parse_errors, 1)
+            self.assertIn(needle, " ".join(self.logged))
+            self.logged.clear()
+
+        write_lines(self.path, [
+            header_line(),
+            '{"record":"derived_value","id":"member:C::x","name":"x",'
+            '"owner":"C","semantic":"member_offset","source":{"expected_value":0}}',
+            (base % json.dumps(valid)).replace('"item":"fn:a"',
+                                                '"item":"member:C::x"'),
+        ])
+        loaded = self.load()
         self.assertEqual(loaded.parse_errors, 1)
+        self.assertIn("cannot belong", " ".join(self.logged))
 
     def test_pattern_is_normalized(self):
         loaded = self._item_and(

@@ -26,6 +26,9 @@ from .image import (
     BodyOwnership, describe_image, get_imagebase, open_image_view,
 )
 from .members import decode_at
+from .policy import (
+    AXIS_VTABLE, WHY_NOT_ATTEMPTED, WHY_NOT_DECLARED, WHY_SELECTED,
+)
 from .sigs import (
     choose_function_candidates, choose_global_candidates,
     choose_value_candidates,
@@ -91,7 +94,8 @@ class ExportState:
         self.failures = 0
         self.user_prototypes = 0
         self.guessed_prototypes = 0
-        self.mode_counts = {"ENTRY": 0, "BODY": 0, "REL": 0}
+        self.mode_counts = {"ENTRY": 0, "BODY": 0, "REL": 0,
+                            cfs6.MODE_VTABLE: 0}
         # How many items got 1, 2, 3, 4 candidates -- the diversity metric.
         self.candidate_counts = {}
         # BODY candidates a .pdata-based consumer cannot resolve.
@@ -108,6 +112,8 @@ class ExportState:
         self.advisory = []
         # {func_ea: [site_ea, ...]} supplied by the caller.
         self.function_sites = {}
+        # {func_ea: [locator, ...]} -- structural declarations the caller made.
+        self.function_locators = {}
 
     def _miss(self, kind, name, reason, ea=None, diagnosis=None):
         entry = {"kind": kind, "name": name, "reason": reason}
@@ -135,6 +141,19 @@ class ExportState:
                 "ea": bad.get("ea"),
                 "reason": bad.get("reason"),
             })
+        # A declared locator that did not hold up is advisory, not a failure:
+        # the item may still be fully covered by patterns. But it must be said
+        # out loud, because the caller asserted something the database
+        # disagrees with, and silence would read as acceptance.
+        vtable = search.diagnosis.get(AXIS_VTABLE)
+        if vtable and vtable["reason"] not in (WHY_SELECTED, WHY_NOT_DECLARED,
+                                               WHY_NOT_ATTEMPTED):
+            notes.append({
+                "note": "declared vtable locator rejected",
+                "axis": AXIS_VTABLE,
+                "reason": vtable["reason"],
+                "detail": vtable.get("detail", ""),
+            })
         for note in notes:
             entry = {"kind": kind, "name": name}
             if ea is not None:
@@ -154,6 +173,7 @@ def write_function(writer, state, func_ea, ranges):
         search = choose_function_candidates(
             func_ea, ranges, ownership=state.ownership,
             sites=state.function_sites.get(func_ea, ()),
+            locators=state.function_locators.get(func_ea, ()),
         )
     except Exception as exc:
         state.failures += 1
@@ -503,6 +523,7 @@ def summarize(state, path, build_number, build_source, merged=None):
         "Local type definitions: %d\n"
         "ENTRY / BODY / REL / VALUE candidates: %d / %d / %d / %d\n"
         "  BODY not resolvable from .pdata (IDA-only): %d\n"
+        "Structural locators (VTABLE): %d\n"
         "No unique candidate / no anchor: %d\n"
         "Failures: %d\n"
         "Build: %s (%s)\n"
@@ -519,6 +540,7 @@ def summarize(state, path, build_number, build_source, merged=None):
             state.mode_counts.get("ENTRY", 0), state.mode_counts.get("BODY", 0),
             state.mode_counts.get("REL", 0), state.mode_counts.get("VALUE", 0),
             state.ida_only_bodies,
+            state.mode_counts.get(cfs6.MODE_VTABLE, 0),
             state.no_candidate, state.failures,
             "unknown" if build_number is None else build_number, build_source,
             merge_note,
@@ -529,7 +551,8 @@ def summarize(state, path, build_number, build_source, merged=None):
 
 def export_to_path(path, ranges, function_eas=(), global_eas=(),
                    declarations=(), build=(None, "unknown"),
-                   merge=MERGE_APPEND, function_sites=None):
+                   merge=MERGE_APPEND, function_sites=None,
+                   function_locators=None):
     """Write a CFS6 file. Returns a result dict; never prompts, never pops up.
 
     `build` is (number_or_None, source) -- resolved by the caller, because the
@@ -585,6 +608,10 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
     state = ExportState()
     state.function_sites = {
         int(ea): list(sites) for ea, sites in (function_sites or {}).items()
+    }
+    state.function_locators = {
+        int(ea): list(entries)
+        for ea, entries in (function_locators or {}).items()
     }
     state.ownership = BodyOwnership.for_current_idb(view, imagebase)
     if state.ownership.available:

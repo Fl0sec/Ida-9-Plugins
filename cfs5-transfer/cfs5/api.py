@@ -39,6 +39,7 @@ from . import declare
 from . import export as _export
 from . import members as _members
 from . import registry
+from . import rtti
 from . import store
 from .common import BADADDR, ea_str, get_search_ranges, msg
 from .image import detect_build
@@ -79,17 +80,22 @@ def _resolve(kind, name):
     return ea, None
 
 
-def _collect(function_names, global_names, sites_by_id=None):
-    """([function_ea], [global_ea], sites_by_ea, unresolved) for two batches."""
+def _collect(function_names, global_names, sites_by_id=None,
+             locators_by_id=None):
+    """([function_ea], [global_ea], sites_by_ea, locators_by_ea, unresolved)."""
     function_eas, global_eas, unresolved = [], [], []
     sites_by_id = sites_by_id or {}
+    locators_by_id = locators_by_id or {}
     sites_by_ea = {}
+    locators_by_ea = {}
 
     for kind, names, bucket in (
         (registry.KIND_FUNCTION, function_names, function_eas),
         (registry.KIND_GLOBAL, global_names, global_eas),
     ):
-        ids, entry_sites, bad = registry.normalize_entries(kind, names)
+        ids, entry_sites, entry_locators, bad = registry.normalize_entries(
+            kind, names
+        )
         unresolved.extend(bad)
         for iid in ids:
             name = registry.parse_entry_id(iid)[1]
@@ -105,7 +111,41 @@ def _collect(function_names, global_names, sites_by_id=None):
             if merged and kind == registry.KIND_FUNCTION:
                 sites_by_ea[ea] = merged
 
-    return function_eas, global_eas, sites_by_ea, unresolved
+            # A locator named in this call overrides a stored one of the same
+            # kind: it is a correction, not extra evidence.
+            declared = list(locators_by_id.get(iid, ()))
+            for locator in entry_locators.get(iid, ()):
+                declared = [x for x in declared if x["kind"] != locator["kind"]]
+                declared.append(locator)
+            if declared and kind == registry.KIND_FUNCTION:
+                locators_by_ea[ea] = declared
+
+    return function_eas, global_eas, sites_by_ea, locators_by_ea, unresolved
+
+
+def _verify_locators(locators, func_ea):
+    """[(locator, reason_or_None), ...] -- does each claim hold in this IDB?
+
+    Verified at registration rather than at export because a wrong slot number
+    is a mistake the caller can still fix while they have the context in front
+    of them. It also means the stored declaration is one that was true at least
+    once, so a later export failure is drift rather than a typo.
+    """
+    out = []
+    for locator in locators or ():
+        if locator.get("kind") != registry.LOCATOR_VTABLE:
+            out.append((locator, "unknown locator kind %r" % locator.get("kind")))
+            continue
+        try:
+            ok, reason = rtti.verify_slot(
+                locator["type"], locator["slot"], func_ea,
+                locator.get("subobject_offset"),
+            )
+        except Exception as exc:
+            out.append((locator, "vtable lookup failed: %s" % exc))
+            continue
+        out.append((locator, None if ok else reason))
+    return out
 
 
 def register(function_names=(), global_names=()):
@@ -141,18 +181,22 @@ def register(function_names=(), global_names=()):
     """
     existing = set(store.load_registry())
     stored_sites = store.load_sites()
+    stored_locators = store.load_locators()
     added, already, unresolved = [], [], []
     site_count = 0
+    locator_count = 0
 
     for kind, names in (
         (registry.KIND_FUNCTION, function_names),
         (registry.KIND_GLOBAL, global_names),
     ):
-        ids, entry_sites, bad = registry.normalize_entries(kind, names)
+        ids, entry_sites, entry_locators, bad = registry.normalize_entries(
+            kind, names
+        )
         unresolved.extend(bad)
         for iid in ids:
             name = registry.parse_entry_id(iid)[1]
-            _ea, error = _resolve(kind, name)
+            ea, error = _resolve(kind, name)
             if error is not None:
                 unresolved.append({"kind": kind, "name": name, "reason": error})
                 continue
@@ -170,6 +214,27 @@ def register(function_names=(), global_names=()):
                 stored_sites[iid] = merged
                 site_count += len(sites)
 
+            # A locator is verified *now*, against the RTTI in this database,
+            # so a wrong slot number is a registration error the caller sees
+            # while they are still looking at it -- not a silently useless
+            # export later, and never a locator that resolves to a different
+            # function than the one being registered.
+            for locator, reason in _verify_locators(
+                entry_locators.get(iid, ()), ea
+            ):
+                if reason is not None:
+                    unresolved.append({
+                        "kind": kind, "name": name, "reason": reason,
+                    })
+                    continue
+                kept = [
+                    x for x in stored_locators.get(iid, ())
+                    if x["kind"] != locator["kind"]
+                ]
+                kept.append(locator)
+                stored_locators[iid] = kept
+                locator_count += 1
+
             if iid in existing:
                 already.append(name)
                 continue
@@ -186,6 +251,12 @@ def register(function_names=(), global_names=()):
             "kind": registry.KIND_FUNCTION, "name": "<sites>",
             "reason": "the export set was saved but its anchor sites were not",
         })
+    if locator_count and not store.save_locators(stored_locators):
+        unresolved.append({
+            "kind": registry.KIND_FUNCTION, "name": "<locators>",
+            "reason": "the export set was saved but its structural locators "
+                      "were not",
+        })
 
     accepted = len(added) + len(already)
     ok, partial = registry.outcome(accepted + len(unresolved), accepted,
@@ -198,6 +269,7 @@ def register(function_names=(), global_names=()):
         added=len(added), added_names=sorted(added),
         already=len(already),
         sites=site_count,
+        locators=locator_count,
         total=len(existing),
     )
 
@@ -206,6 +278,7 @@ def unregister(function_names=(), global_names=()):
     """Remove names from the export set. Absent names are not an error."""
     existing = set(store.load_registry())
     stored_sites = store.load_sites()
+    stored_locators = store.load_locators()
     removed = []
 
     for kind, names in (
@@ -214,9 +287,11 @@ def unregister(function_names=(), global_names=()):
     ):
         ids, _bad = registry.normalize(kind, names)
         for iid in ids:
-            # Sites go with the entry: leaving them behind would silently
-            # re-attach them if the same name were registered again later.
+            # Sites and locators go with the entry: leaving them behind would
+            # silently re-attach them if the same name were registered again
+            # later, with evidence the caller believes they removed.
             stored_sites.pop(iid, None)
+            stored_locators.pop(iid, None)
             if iid in existing:
                 existing.discard(iid)
                 removed.append(registry.parse_entry_id(iid)[1])
@@ -225,6 +300,7 @@ def unregister(function_names=(), global_names=()):
         return _result(error="could not persist the export set to the IDB",
                        removed=0, total=0)
     store.save_sites(stored_sites)
+    store.save_locators(stored_locators)
     return _result(ok=True, removed=len(removed),
                    removed_names=sorted(removed), total=len(existing))
 
@@ -234,6 +310,7 @@ def clear():
     if not store.save_registry([]):
         return _result(error="could not persist the export set")
     store.save_sites({})
+    store.save_locators({})
     return _result(ok=True, total=0)
 
 
@@ -260,6 +337,13 @@ def registered():
         except registry.RegistryError:
             continue
 
+    locators = {}
+    for iid, entries in store.load_locators().items():
+        try:
+            locators[registry.parse_entry_id(iid)[1]] = list(entries)
+        except registry.RegistryError:
+            continue
+
     resolved = len(ids) - len(unresolved)
     ok, partial = registry.outcome(len(ids), resolved, unresolved)
     return _result(
@@ -268,6 +352,7 @@ def registered():
         functions=by_kind[registry.KIND_FUNCTION],
         globals=by_kind[registry.KIND_GLOBAL],
         sites=sites,
+        locators=locators,
         declared_members=[d.qualified for d in store.load_all()],
         counts={
             "functions": len(by_kind[registry.KIND_FUNCTION]),
@@ -469,7 +554,7 @@ def declarations():
 
 
 def _run_export(path, function_eas, global_eas, unresolved, merge, build,
-                include_members, function_sites=None):
+                include_members, function_sites=None, function_locators=None):
     """Shared tail of `export` and `export_list`."""
     if not isinstance(path, str) or not path:
         return _result(error="path is required", unresolved=unresolved)
@@ -495,6 +580,7 @@ def _run_export(path, function_eas, global_eas, unresolved, merge, build,
         declarations=declarations,
         build=(build_number, build_source), merge=merge,
         function_sites=function_sites,
+        function_locators=function_locators,
     )
 
     # Names that never resolved never reached the engine, so they have to be
@@ -545,12 +631,14 @@ def export(path, merge=_export.MERGE_APPEND, build=None, include_members=True):
     path and never invented (an undetectable build is recorded as unknown).
     """
     by_kind = registry.split_by_kind(store.load_registry())
-    function_eas, global_eas, sites, unresolved = _collect(
+    function_eas, global_eas, sites, locators, unresolved = _collect(
         by_kind[registry.KIND_FUNCTION], by_kind[registry.KIND_GLOBAL],
         sites_by_id=store.load_sites(),
+        locators_by_id=store.load_locators(),
     )
     return _run_export(path, function_eas, global_eas, unresolved,
-                       merge, build, include_members, function_sites=sites)
+                       merge, build, include_members, function_sites=sites,
+                       function_locators=locators)
 
 
 def export_list(path, function_names=(), global_names=(),
@@ -560,11 +648,13 @@ def export_list(path, function_names=(), global_names=(),
     For the case where the agent already knows the whole list and has no use
     for persistence. Nothing here reads or writes the export set.
 
-    Entries may carry `sites` exactly as in `register`, so a one-shot export
-    can hand over an anchor without registering anything first.
+    Entries may carry `sites` or a `vtable` locator exactly as in `register`,
+    so a one-shot export can hand over evidence without registering anything
+    first.
     """
-    function_eas, global_eas, sites, unresolved = _collect(
+    function_eas, global_eas, sites, locators, unresolved = _collect(
         function_names, global_names
     )
     return _run_export(path, function_eas, global_eas, unresolved,
-                       merge, build, include_members, function_sites=sites)
+                       merge, build, include_members, function_sites=sites,
+                       function_locators=locators)

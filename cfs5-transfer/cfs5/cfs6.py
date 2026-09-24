@@ -41,9 +41,18 @@ FORMAT_NAME = "CFS"
 FORMAT_VERSION = 6
 # Revision 1 adds the `derived_value` item kind and the VALUE candidate mode.
 # Additive only: a revision-0 reader skips both as unknown record kinds.
-SCHEMA_REVISION = 1
+#
+# Revision 2 adds *structural locator* modes -- VTABLE, and STRING_REL --
+# which resolve a function by where it sits in the image's own structures
+# rather than by a byte pattern, for functions no pattern can distinguish.
+# Also additive, and made safely so: an unrecognised `mode` is now
+# skip-with-report rather than a parse error, matching how unknown record
+# kinds already behave. An item fails only when no candidate survives, which
+# was always the semantics, so an older reader degrades to "this item has
+# fewer candidates" instead of "this file is broken".
+SCHEMA_REVISION = 2
 GENERATOR_NAME = "cfs5-transfer"
-GENERATOR_VERSION = "6.1.0"
+GENERATOR_VERSION = "6.2.0"
 
 REC_HEADER = "header"
 REC_FUNCTION = "function"
@@ -56,8 +65,45 @@ REC_LOCAL_TYPE = "local_type"
 
 ITEM_KINDS = (REC_FUNCTION, REC_GLOBAL, REC_DERIVED_VALUE)
 ADDRESS_ITEM_KINDS = (REC_FUNCTION, REC_GLOBAL)
-MODES = ("ENTRY", "BODY", "REL", "VALUE")
+MODE_VTABLE = "VTABLE"
+MODES = ("ENTRY", "BODY", "REL", "VALUE", MODE_VTABLE)
+# Modes that locate a function structurally instead of by a unique pattern.
+# Their `pattern` is a *confirm* signature: it is matched only inside the
+# already-located function, so it is not required to be image-unique.
+LOCATOR_MODES = (MODE_VTABLE,)
 VALID_REL_WIDTHS = (1, 2, 4, 8)
+
+# ---------------------------------------------------------------------------
+# Structural locator vocabulary (revision 2). Closed sets, like every other
+# vocabulary here: a consumer rejects a value it does not know.
+# ---------------------------------------------------------------------------
+
+# Which span the producer measured the confirm signature's uniqueness over, and
+# which span a consumer must therefore scan. `pdata_chain` is the contiguous
+# run of RUNTIME_FUNCTION entries beginning at the resolved function -- what a
+# non-IDA consumer can compute for itself. `ida_extent` means the producer had
+# no .pdata and fell back to IDA's idea of the function, so the bound is a hint
+# rather than a table.
+SCAN_BOUND_PDATA_CHAIN = "pdata_chain"
+SCAN_BOUND_IDA_EXTENT = "ida_extent"
+SCAN_BOUNDS = (SCAN_BOUND_PDATA_CHAIN, SCAN_BOUND_IDA_EXTENT)
+
+# How the confirm signature was tokenized. `relaxed` wildcards every encoded
+# immediate and displacement, including stack-relative ones, so it absorbs more
+# build drift; `strict` keeps them, which is sometimes the only way to tell a
+# function from its byte-identical clone siblings. A consumer needs to know
+# which it got in order to weigh a failure to match.
+TOKENIZATION_STRICT = "strict"
+TOKENIZATION_RELAXED = "relaxed"
+TOKENIZATIONS = (TOKENIZATION_STRICT, TOKENIZATION_RELAXED)
+
+# Where a VTABLE candidate came from.
+ORIGIN_RTTI_VTABLE_SLOT = "rtti_vtable_slot"
+VALID_VTABLE_ORIGINS = (ORIGIN_RTTI_VTABLE_SLOT,)
+
+# A raw MSVC type descriptor, never a demangled name: `.?AVCCSPlayerInventory@@`
+# is in the image, `CCSPlayerInventory` is IDA's rendering of it.
+_DESCRIPTOR_PREFIX = ".?"
 
 # ---------------------------------------------------------------------------
 # derived_value vocabulary. All three sets are CLOSED: a consumer must reject
@@ -284,6 +330,52 @@ class CandidateRecord:
     @property
     def access_width(self):
         return int(self.resolve.get("access_width", 0))
+
+    # -- structural locator accessors --------------------------------------
+
+    @property
+    def is_locator(self):
+        return self.mode in LOCATOR_MODES
+
+    @property
+    def type_descriptor(self):
+        return str(self.resolve.get("type_descriptor", ""))
+
+    @property
+    def subobject_offset(self):
+        return int(self.resolve.get("subobject_offset", 0))
+
+    @property
+    def slot(self):
+        return int(self.resolve.get("slot", -1))
+
+    @property
+    def confirm_offset(self):
+        """Where the confirm signature sat in the source build.
+
+        A **hint for bounding the scan, never a correctness input.** If the
+        function grew or was rearranged, the offset drifts and the signature is
+        still the right evidence -- only its absence is fatal.
+        """
+        return int(self.resolve.get("confirm_offset", 0))
+
+    @property
+    def scan_bound(self):
+        return str(self.resolve.get("scan_bound", SCAN_BOUND_IDA_EXTENT))
+
+    @property
+    def tokenization(self):
+        return str(self.resolve.get("tokenization", TOKENIZATION_STRICT))
+
+    @property
+    def image_matches(self):
+        """How many places the confirm signature matched image-wide at export.
+
+        1 means it could also stand alone as a BODY anchor; more means it is
+        confirm-only. **Not** a resolution input: a consumer refuses on 0 or 2+
+        matches *within the scan range*, which is a different number entirely.
+        """
+        return int(self.resolve.get("image_matches", 0))
 
     @property
     def alignment(self):
@@ -741,10 +833,31 @@ def _parse_header(obj, line_no):
     return obj
 
 
+class UnknownMode(Exception):
+    """A candidate mode this build does not model.
+
+    Distinct from a parse error on purpose. A newer producer adding a
+    resolution mode must not make the file unreadable: the item simply has one
+    fewer candidate, and an item fails only when *no* candidate survives, which
+    is already the semantics. The loader reports it as a skip.
+    """
+
+    def __init__(self, message, item="", rank=-1, line_no=0):
+        super().__init__(message)
+        self.item = item
+        self.rank = rank
+        self.line_no = line_no
+
+
 def _parse_candidate(obj, line_no):
     mode = str(obj.get("mode", "")).upper()
     if mode not in MODES:
-        raise ValueError("line %d: unsupported mode %r" % (line_no, mode))
+        raise UnknownMode(
+            "line %d: candidate mode %r is not supported by this build"
+            % (line_no, mode),
+            item=str(obj.get("item", "")), rank=int(obj.get("rank", -1)),
+            line_no=line_no,
+        )
 
     pattern = normalize_pattern(obj.get("pattern", ""))
     if not pattern:
@@ -807,7 +920,67 @@ def _parse_candidate(obj, line_no):
     elif mode == "VALUE":
         _validate_value_candidate(rec, pattern_len, line_no)
 
+    elif mode == MODE_VTABLE:
+        _validate_vtable_candidate(rec, line_no)
+
     return rec
+
+
+def _validate_vtable_candidate(rec, line_no):
+    """Structural checks for a VTABLE locator.
+
+    Note what is *not* checked: the confirm signature's length, exact-byte
+    count and image-wide match count are all unconstrained. Those floors exist
+    to keep an image-wide pattern from collapsing to a coincidence, and this
+    pattern is matched only inside a function the locator already resolved.
+    Applying them here would reject good bounded evidence.
+    """
+    if rec.origin not in VALID_VTABLE_ORIGINS:
+        raise ValueError(
+            "line %d: VTABLE candidate has origin %r, expected one of %r"
+            % (line_no, rec.origin, list(VALID_VTABLE_ORIGINS))
+        )
+
+    descriptor = rec.type_descriptor
+    if not descriptor:
+        raise ValueError("line %d: VTABLE needs resolve.type_descriptor" % line_no)
+    if not descriptor.startswith(_DESCRIPTOR_PREFIX):
+        # A demangled name would be an IDA rendering no other consumer can
+        # reproduce; the raw descriptor is what is actually in the image.
+        raise ValueError(
+            "line %d: type_descriptor %r is not a raw MSVC descriptor "
+            "(expected a %r prefix)" % (line_no, descriptor, _DESCRIPTOR_PREFIX)
+        )
+
+    if "slot" not in rec.resolve:
+        raise ValueError("line %d: VTABLE needs resolve.slot" % line_no)
+    if rec.slot < 0:
+        raise ValueError("line %d: slot must be >= 0, got %d" % (line_no, rec.slot))
+    if rec.subobject_offset < 0:
+        raise ValueError(
+            "line %d: subobject_offset must be >= 0, got %d"
+            % (line_no, rec.subobject_offset)
+        )
+    if rec.confirm_offset < 0:
+        raise ValueError(
+            "line %d: confirm_offset must be >= 0, got %d"
+            % (line_no, rec.confirm_offset)
+        )
+    if rec.scan_bound not in SCAN_BOUNDS:
+        raise ValueError(
+            "line %d: scan_bound %r is not one of %r"
+            % (line_no, rec.scan_bound, list(SCAN_BOUNDS))
+        )
+    if rec.tokenization not in TOKENIZATIONS:
+        raise ValueError(
+            "line %d: tokenization %r is not one of %r"
+            % (line_no, rec.tokenization, list(TOKENIZATIONS))
+        )
+    if rec.image_matches < 1:
+        raise ValueError(
+            "line %d: image_matches must be >= 1 (the signature matched at "
+            "least where it was built), got %d" % (line_no, rec.image_matches)
+        )
 
 
 def _validate_value_candidate(rec, pattern_len, line_no):
@@ -964,6 +1137,7 @@ def load_cfs6(path, log=None):
     by_id = {}
     seen_ranks = {}
     pending = []
+    skipped_ranks = {}
 
     for line_no, raw in enumerate(lines, 1):
         text = raw.strip()
@@ -1044,6 +1218,13 @@ def load_cfs6(path, log=None):
 
         except Cfs6Error:
             raise
+        except UnknownMode as exc:
+            # Forward compatibility, the same contract as an unknown record
+            # kind: drop the candidate, keep the file.
+            loaded.skipped_records += 1
+            if exc.item and exc.rank >= 0:
+                skipped_ranks.setdefault(exc.item, {})[exc.rank] = exc.line_no
+            report("SKIPPED %s" % exc)
         except Exception as exc:
             loaded.parse_errors += 1
             report("PARSE_ERROR line %d: %s" % (line_no, exc))
@@ -1051,11 +1232,14 @@ def load_cfs6(path, log=None):
     if loaded is None:
         raise Cfs6Error(_NOT_CFS6)
 
-    _attach_candidates(loaded, by_id, pending, seen_ranks, report)
+    _attach_candidates(loaded, by_id, pending, seen_ranks, skipped_ranks, report)
     return loaded
 
 
-def _attach_candidates(loaded, by_id, pending, seen_ranks, report):
+def _attach_candidates(loaded, by_id, pending, seen_ranks, skipped_ranks, report):
+    for item, ranks in skipped_ranks.items():
+        for rank, line_no in ranks.items():
+            seen_ranks[(item, rank)] = line_no
     for cand in pending:
         item = by_id.get(cand.item)
         if item is None:
@@ -1089,12 +1273,25 @@ def _attach_candidates(loaded, by_id, pending, seen_ranks, report):
             )
             continue
 
+        # A structural locator names a *function* -- an RTTI slot and a string
+        # registration both hand back code. Attaching one to a global would
+        # claim evidence the mode cannot produce.
+        if cand.is_locator and item.kind != REC_FUNCTION:
+            loaded.parse_errors += 1
+            report(
+                "PARSE_ERROR line %d: %s candidate cannot belong to a %s item"
+                % (cand.line_no, cand.mode, item.kind)
+            )
+            continue
+
         cand.is_data = item.is_global
         item.candidates.append(cand)
 
     for item in loaded.items:
         item.candidates.sort(key=lambda c: (c.rank, c.score, c.line_no))
-        ranks = [c.rank for c in item.candidates]
+        ranks = sorted(
+            rank for (iid, rank), _line in seen_ranks.items() if iid == item.id
+        )
         if ranks and ranks != list(range(len(ranks))):
             loaded.parse_errors += 1
             report(

@@ -496,6 +496,14 @@ def _evaluate_candidates(name, records, ranges, match_cache, prefix):
     saw = {"not-found": False, "ambiguous": False, "unsafe": False}
 
     for rec in records:
+        if rec.is_locator:
+            # Structural modes are export-only. Their pattern is a bounded
+            # confirm signature, not an image-wide locator, so searching it
+            # here would be both wasteful and semantically wrong.
+            saw["unsafe"] = True
+            msg("%s_SKIPPED %-33s rank=%d mode=%s export-only locator"
+                % (prefix, name, rec.rank, rec.mode))
+            continue
         status, target_ea, detail = _find_unique_target(rec, ranges, match_cache)
         if status == "ok":
             resolved.append((rec, target_ea, detail))

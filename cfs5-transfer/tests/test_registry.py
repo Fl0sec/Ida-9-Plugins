@@ -43,6 +43,25 @@ class TestEntryId(unittest.TestCase):
 
 
 class TestNormalize(unittest.TestCase):
+    def test_vtable_locator_normalizes_and_rejects_bad_shapes(self):
+        ids, _sites, locators, rejected = registry.normalize_entries(
+            registry.KIND_FUNCTION,
+            [{"name": "notify", "vtable": {"type": "C", "slot": 19}}],
+        )
+        self.assertEqual(ids, ["fn:notify"])
+        self.assertEqual(locators["fn:notify"][0], {
+            "kind": "vtable", "type": "C", "slot": 19,
+            "subobject_offset": None,
+        })
+        self.assertEqual(rejected, [])
+
+        for spec in ({"type": "", "slot": 1}, {"type": "C"},
+                     {"type": "C", "slot": -1}):
+            _ids, _sites, _locators, rejected = registry.normalize_entries(
+                registry.KIND_FUNCTION, [{"name": "notify", "vtable": spec}]
+            )
+            self.assertEqual(len(rejected), 1)
+
     def test_a_bad_name_does_not_lose_the_batch(self):
         """Fifty names with two typos must register forty-eight."""
         names = ["Good%d" % i for i in range(48)] + ["bad name", "?x@@"]
@@ -68,7 +87,7 @@ class TestEntriesWithSites(unittest.TestCase):
     """An entry may carry anchor sites the caller located itself."""
 
     def test_a_plain_name_still_works_and_carries_no_sites(self):
-        ids, sites, rejected = registry.normalize_entries(
+        ids, sites, _locators, rejected = registry.normalize_entries(
             registry.KIND_FUNCTION, ["Alpha"]
         )
         self.assertEqual(ids, ["fn:Alpha"])
@@ -76,7 +95,7 @@ class TestEntriesWithSites(unittest.TestCase):
         self.assertEqual(rejected, [])
 
     def test_sites_are_collected_against_the_entry_id(self):
-        ids, sites, _ = registry.normalize_entries(
+        ids, sites, _locators, _ = registry.normalize_entries(
             registry.KIND_FUNCTION,
             [{"name": "Alpha", "sites": [0x1000, {"ea": 0x2000}]}],
         )
@@ -85,7 +104,7 @@ class TestEntriesWithSites(unittest.TestCase):
 
     def test_repeating_a_name_merges_its_sites(self):
         # Finding a second anchor must not mean repeating the first.
-        _ids, sites, _ = registry.normalize_entries(
+        _ids, sites, _locators, _ = registry.normalize_entries(
             registry.KIND_FUNCTION,
             [{"name": "Alpha", "sites": [0x1000]},
              {"name": "Alpha", "sites": [0x2000, 0x1000]}],
@@ -104,7 +123,7 @@ class TestEntriesWithSites(unittest.TestCase):
             registry.normalize_sites(["not-an-address"])
 
     def test_a_bad_entry_does_not_lose_the_batch(self):
-        ids, sites, rejected = registry.normalize_entries(
+        ids, sites, _locators, rejected = registry.normalize_entries(
             registry.KIND_FUNCTION,
             [{"name": "Good", "sites": [0x1000]},
              {"name": "bad name"},

@@ -58,6 +58,28 @@ A refused site appears in the export's `advisory` list with the reason. Sites
 are stored per entry and removed with `unregister`. A site on a *global* is
 rejected — a global is anchored from its data references.
 
+## Vtable locators for functions
+
+A registered function may declare an MSVC RTTI vtable slot:
+
+```python
+api.register(function_names=[
+    {"name": "notify_inventory_has_new_items",
+     "vtable": {"type": "CCSPlayerInventory", "slot": 19}},
+])
+```
+
+`subobject_offset` may be supplied when multiple-inheritance RTTI exposes more
+than one vtable. Without it, an ambiguous class is refused and the available
+offsets are reported. Registration resolves RTTI immediately and requires the
+slot to hold the named function. Export verifies it again, builds a bounded
+confirm signature inside the function, and pins the resulting `VTABLE`
+candidate like an explicit site. The record stores the raw MSVC descriptor
+read from the image, never IDA's demangled rendering.
+
+These locators are export-only. The IDA importer skips them; a non-IDA consumer
+implements the revision-2 algorithm in `cfs6-format.md`.
+
 ## Members and strides
 
 ```python

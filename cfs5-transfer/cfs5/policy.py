@@ -44,6 +44,7 @@ ORIGIN_BODY = ("body_early", "body_middle", "body_late")
 ORIGIN_STROFF_XREF = cfs6.ORIGIN_STROFF_XREF
 ORIGIN_SELECTED_OPERAND = cfs6.ORIGIN_SELECTED_OPERAND
 ORIGIN_HEXRAYS_MEMPTR = cfs6.ORIGIN_HEXRAYS_MEMPTR
+ORIGIN_RTTI_VTABLE_SLOT = cfs6.ORIGIN_RTTI_VTABLE_SLOT
 
 # Resolution axes an item can be covered by.
 AXIS_ENTRY = "entry"
@@ -51,9 +52,18 @@ AXIS_EXTERNAL_REL = "external_rel"
 AXIS_SELF_REL = "self_rel"
 AXIS_BODY = "body"
 AXIS_VALUE = "value"
+# A structural locator is its own axis: it is independent of every pattern
+# axis by construction, which is the entire reason it exists. A function whose
+# prologue, callers and body all fail can still be covered here.
+AXIS_VTABLE = "vtable"
 
-_MODE_ORDER = {"ENTRY": 0, "REL": 1, "BODY": 2, "VALUE": 3}
-_MODE_PENALTY = {"ENTRY": 0, "REL": 12, "BODY": 18, "VALUE": 12}
+_MODE_ORDER = {"ENTRY": 0, "REL": 1, "BODY": 2, "VALUE": 3, cfs6.MODE_VTABLE: 4}
+# A locator is not scored against patterns -- it does not compete with them,
+# it covers a different axis -- but it still needs a defined penalty so the
+# total order stays deterministic. It sits last because when a pattern axis
+# does work, it needs no RTTI table to resolve.
+_MODE_PENALTY = {"ENTRY": 0, "REL": 12, "BODY": 18, "VALUE": 12,
+                 cfs6.MODE_VTABLE: 24}
 
 
 def candidate_min_exact(total_bytes):
@@ -85,11 +95,12 @@ def value_min_exact(total_bytes):
 # How many image-wide siblings of a confirm signature we bother counting.
 CONFIRM_MATCH_LIMIT = 8
 
-# How a confirm signature was tokenized. Closed set: it tells the consumer how
-# much build drift the pattern is expected to absorb.
-TOKENIZATION_STRICT = "strict"
-TOKENIZATION_RELAXED = "relaxed"
-TOKENIZATIONS = (TOKENIZATION_STRICT, TOKENIZATION_RELAXED)
+# Closed sets that are part of the exported contract, so they live in cfs6.py
+# beside the format rule enforcing them; re-exported here so the finders import
+# one module. Same arrangement as the derived_value origins above.
+TOKENIZATION_STRICT = cfs6.TOKENIZATION_STRICT
+TOKENIZATION_RELAXED = cfs6.TOKENIZATION_RELAXED
+TOKENIZATIONS = cfs6.TOKENIZATIONS
 
 # Why a confirm signature could not be built. A closed set, like the axis
 # reasons -- a caller branches on it rather than parsing English.
@@ -99,9 +110,9 @@ CONFIRM_NO_UNIQUE_WINDOW = "no_unique_window_in_scan_range"
 
 # Which span export-time uniqueness was measured over. Closed set; the consumer
 # needs to know whether it is working from the .pdata table or from a hint.
-SCAN_BOUND_PDATA_CHAIN = "pdata_chain"
-SCAN_BOUND_IDA_EXTENT = "ida_extent"
-SCAN_BOUNDS = (SCAN_BOUND_PDATA_CHAIN, SCAN_BOUND_IDA_EXTENT)
+SCAN_BOUND_PDATA_CHAIN = cfs6.SCAN_BOUND_PDATA_CHAIN
+SCAN_BOUND_IDA_EXTENT = cfs6.SCAN_BOUND_IDA_EXTENT
+SCAN_BOUNDS = cfs6.SCAN_BOUNDS
 
 
 def confirm_min_exact(total_bytes):
@@ -207,7 +218,7 @@ class Candidate:
         "mode", "signature", "origin", "byte_len", "wildcards", "exact",
         "score", "anchor_ea", "func_ea", "func_size", "body_offset",
         "target_ea", "target_delta", "rel_offset", "rel_size", "base_offset",
-        "insn_offset", "is_data", "ownership", "extract", "value",
+        "insn_offset", "is_data", "ownership", "extract", "value", "locator",
     )
 
     def __init__(
@@ -215,7 +226,7 @@ class Candidate:
         anchor_ea=0, func_ea=0, func_size=0, body_offset=0, target_ea=0,
         target_delta=0, rel_offset=0, rel_size=0, base_offset=0,
         insn_offset=0, is_data=False, ownership="pdata", extract=None,
-        value=None,
+        value=None, locator=None,
     ):
         self.mode = mode
         self.signature = cfs6.normalize_pattern(signature)
@@ -242,6 +253,10 @@ class Candidate:
         # candidate -- the item carries the one authoritative value.
         self.extract = dict(extract or {})
         self.value = value
+        # Locator modes only: how to find the function without a unique
+        # pattern. Built by the finder from validated RTTI/string evidence;
+        # the policy layer never invents or edits a field in it.
+        self.locator = dict(locator or {})
 
         # Lower is better. Length dominates: once a pattern is source-unique,
         # shorter is usually less flaky across versions. Wildcards get only a
@@ -260,9 +275,15 @@ class Candidate:
             return AXIS_BODY
         if self.mode == "VALUE":
             return AXIS_VALUE
+        if self.mode == cfs6.MODE_VTABLE:
+            return AXIS_VTABLE
         if self.origin == ORIGIN_SELF_CALL:
             return AXIS_SELF_REL
         return AXIS_EXTERNAL_REL
+
+    @property
+    def is_locator(self):
+        return self.mode in cfs6.LOCATOR_MODES
 
     @property
     def span(self):
@@ -301,6 +322,10 @@ class Candidate:
         source["anchor_rva"] = rva(self.anchor_ea)
         if self.mode == "BODY":
             source["body_offset"] = self.body_offset
+        if self.mode == cfs6.MODE_VTABLE and self.target_ea:
+            # Diagnostics only, like every other source RVA: a consumer finds
+            # the table through RTTI, never at the address it had here.
+            source["vtable_rva"] = rva(self.target_ea)
         return source
 
     def resolve_object(self):
@@ -318,6 +343,8 @@ class Candidate:
             # Built entirely by the finder from decoded operand metadata; the
             # policy layer never invents or edits an extraction field.
             resolve = dict(self.extract)
+        elif self.is_locator:
+            resolve = dict(self.locator)
         else:
             resolve = {}
         # Optional with a documented default of 0; omit the common case.
@@ -480,6 +507,13 @@ WHY_NO_XREFS = "no_xrefs"
 WHY_DATA_XREFS_ONLY = "data_xrefs_only"
 WHY_XREFS_NOT_UNIQUE = "xrefs_not_unique"
 WHY_OUTSIDE_PDATA = "unique_anchor_outside_pdata"
+# Structural-locator failures. A locator is only attempted when the caller
+# declared one, so these say what went wrong with *that claim* -- never
+# "nothing was found", which would blame discovery for a declaration problem.
+WHY_NOT_DECLARED = "not_declared"
+WHY_LOCATOR_UNRESOLVED = "locator_unresolved"
+WHY_LOCATOR_MISMATCH = "locator_mismatch"
+WHY_NO_CONFIRM_SIGNATURE = "no_confirm_signature"
 
 # How many identical siblings we bother counting before saying "at least N".
 CLONE_COUNT_LIMIT = 8
@@ -561,6 +595,20 @@ def _diagnose_missing_axis(axis, facts):
             "detail": "%d reference(s), %d tested, none yielded a unique "
                       "window" % (count, int(facts.get("xrefs_tested") or 0)),
             "xref_count": count,
+        }
+
+    if axis == AXIS_VTABLE:
+        # The caller either did not declare a locator, or declared one that
+        # did not survive verification. Those are very different problems and
+        # the detail names which, with the underlying refusal quoted verbatim
+        # so the RTTI reason is not paraphrased away.
+        failure = facts.get("vtable_failure")
+        if not failure:
+            return {"reason": WHY_NOT_DECLARED,
+                    "detail": "no vtable locator was declared for this function"}
+        return {
+            "reason": failure.get("reason", WHY_LOCATOR_UNRESOLVED),
+            "detail": failure.get("detail", ""),
         }
 
     if axis == AXIS_BODY:
@@ -662,7 +710,7 @@ def coverage_for(selected, attempted_axes):
     # A self-call REL still covers the external_rel axis in spirit, but the
     # distinction matters to a consumer, so report it honestly.
     coverage = {}
-    for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_BODY):
+    for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_BODY, AXIS_VTABLE):
         if axis not in attempted_axes:
             coverage[axis] = cfs6.COV_NOT_APPLICABLE
         elif axis in found:

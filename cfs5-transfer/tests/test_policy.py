@@ -3,7 +3,7 @@
 import random
 import unittest
 
-from _support import body_candidate, entry_candidate, rel_candidate
+from _support import body_candidate, entry_candidate, rel_candidate, vtable_candidate
 
 from cfs5 import policy
 
@@ -145,6 +145,19 @@ class TestDedup(unittest.TestCase):
 
 
 class TestFunctionSelection(unittest.TestCase):
+    def test_pinned_vtable_survives_four_cheaper_candidates(self):
+        locator = vtable_candidate(pattern="48 89 44 24 ? 48 8B CB FF D7")
+        cheaper = [
+            entry_candidate(" ".join(["90"] * 6), anchor=0x2000 + i * 0x100)
+            for i in range(4)
+        ]
+        self.assertTrue(all(c.score < locator.score for c in cheaper))
+        selected = policy.select_function_candidates(
+            cheaper, max_count=3, pinned=[locator]
+        )
+        self.assertIn(locator, selected)
+        self.assertEqual(selected[0], locator)
+
     def test_prefers_one_per_axis_over_same_region_variants(self):
         # Three short ENTRY variants would win on score alone; the policy must
         # still reach for the REL and BODY axes.

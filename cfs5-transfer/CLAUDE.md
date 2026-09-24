@@ -66,6 +66,18 @@ Invariants you must not break:
 - BODY also carries `resolve.ownership`: `"pdata"` or `"ida-only"`. **IDA's function extents and the PE's RUNTIME_FUNCTION table disagree for chunked/outlined functions** — their IDA start is not the `.pdata` begin the body sits in — so such candidates are labelled `ida-only` and a non-IDA consumer must skip them. The exporter classifies this via `image.BodyOwnership`; never emit a bare `"pdata"` without checking.
 - A pattern matching zero or 2+ times never resolves.
 
+## Structural function locators (schema revision 2)
+
+`VTABLE` and `STRING_REL` are function candidate modes whose pattern is a
+bounded confirm signature, not an image-wide locator. Producer and consumer
+must scan exactly the same range: the contiguous `.pdata` chain beginning at
+the resolved function, falling back to the IDA extent only when `.pdata` is
+unavailable. Confirm signatures are exempt from normal exact-byte/wildcard
+floors. `tokenization` records strict vs relaxed construction;
+`image_matches > 1` is legal quality information, while zero or multiple
+matches inside the bounded scan range is always a refusal. The IDA importer
+skips structural modes; resolution belongs to the non-IDA consumer.
+
 ## Derived values (`derived_value` + `VALUE`, schema revision 1)
 
 `member_offset` is the only semantic produced today; `element_stride`, `object_extent` and `constant` are reserved. `semantic`, extraction `op` (`CONST`/`DISP`/`IMM`/`SCALE`/`DISP_PLUS_WIDTH`) and `VALUE` `origin` are **closed sets** — a consumer rejects an unknown value rather than interpreting it. No expression strings, ever.

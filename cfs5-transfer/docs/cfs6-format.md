@@ -96,8 +96,8 @@ additive revision and not a major version bump.
 ## 3. `header`
 
 ```json
-{"record":"header","format":"CFS","version":6,"schema_revision":1,
- "generator":{"name":"cfs5-transfer","version":"6.1.0"},
+{"record":"header","format":"CFS","version":6,"schema_revision":2,
+ "generator":{"name":"cfs5-transfer","version":"6.2.0"},
  "image":{"name":"client.dll","format":"PE","architecture":"x86_64",
           "timestamp":1788412510,"size_of_image":41803776,"sha256":"…"},
  "build":{"number":14177,"source":"path-confirmed"},
@@ -229,7 +229,7 @@ represent different values.
 |---|---|
 | `item` | the owning item's `id`. |
 | `rank` | **authoritative** order. Contiguous from `0` within an item. |
-| `mode` | `ENTRY`, `REL`, `BODY` (address items) or `VALUE` (`derived_value` items). |
+| `mode` | `ENTRY`, `REL`, `BODY`, `VTABLE` (function items) or `VALUE` (`derived_value` items). |
 | `pattern` | space-separated uppercase hex bytes; `?` is a single-byte wildcard. |
 | `origin` | provenance category (below). Diagnostic. |
 | `score` | **lower is better**. Diagnostic ranking aid — **never** proof of identity. |
@@ -246,6 +246,10 @@ A `VALUE` candidate may only belong to a `derived_value` item, and an
 `ENTRY`/`REL`/`BODY` candidate may only belong to a `function` or `global`.
 Pairing them the other way is an error: it would hand a consumer the wrong
 *kind* of answer.
+
+An unknown mode is reported and skipped, not a file error. This matches the
+forward-compatibility rule for unknown record kinds: an item remains usable
+when any supported candidate survives.
 
 ### `resolve` fields
 
@@ -384,6 +388,52 @@ promise made by the producer.
 
 ---
 
+## 5b. Structural function locators (`VTABLE`, revision 2)
+
+A structural locator finds a function through image metadata, then uses
+`pattern` only to confirm that the resolved function still has the expected
+body. The confirm pattern is never searched image-wide and is exempt from the
+normal exact-byte and wildcard-ratio floors.
+
+```json
+{"record":"candidate","item":"fn:notify_inventory_has_new_items","rank":0,
+ "mode":"VTABLE","pattern":"48 89 44 24 48 48 8B CB FF D7 48 8B 7C 24 30",
+ "origin":"rtti_vtable_slot","score":0,
+ "resolve":{"type_descriptor":".?AVCCSPlayerInventory@@",
+            "subobject_offset":0,"slot":19,"confirm_offset":88,
+            "function_size":109,"scan_bound":"pdata_chain",
+            "tokenization":"strict","image_matches":1}}
+```
+
+Resolution:
+
+1. Locate the exact raw MSVC type descriptor and its validated Complete Object
+   Locator. If more than one subobject vtable exists, select only the table at
+   `subobject_offset`; ambiguity or absence refuses the candidate.
+2. Bounds-check `slot` against the validated vtable's method count and read the
+   function address from that slot.
+3. For `pdata_chain`, begin at the runtime-function entry whose begin equals
+   the resolved function and walk forward while each entry's end equals the
+   next entry's begin. For `ida_extent`, use `function_size` as a producer hint
+   when no `.pdata` chain exists.
+4. Search `pattern` only inside that range. Exactly one match confirms the
+   locator; zero or two-or-more matches refuse it.
+
+`confirm_offset` and `function_size` are hints, never correctness inputs.
+`tokenization` is `strict` or `relaxed`. `image_matches` is export-time quality:
+`1` can stand alone as a body signature; a larger value is legal and means
+confirm-only. It must not be confused with the required exactly-one match
+inside the bounded scan range. The raw descriptor is stored instead of a
+demangled IDA name because it is the reproducible byte string in the image.
+
+### Export-time scan-range invariant
+
+The producer MUST measure confirm uniqueness over exactly the range the
+consumer will scan. For `pdata_chain`, that is the maximal contiguous run of
+runtime-function entries beginning at the resolved function, with no slack.
+If `.pdata` is unavailable, the producer uses the IDA function extent and
+records `scan_bound: "ida_extent"`.
+
 ## 6. Resolution
 
 Let `match` be the RVA where `pattern` matched. **A pattern that does not match
@@ -505,11 +555,15 @@ Recoverable (count, report with the line number, skip the record):
 - malformed JSON on a line; a line that is not a JSON object
 - duplicate `id`; duplicate `(item, rank)`; non-contiguous ranks within an item
 - candidate referencing an unknown `item`
-- unsupported `mode`; empty `pattern`
+- unknown `mode`: report and skip; empty `pattern`: reject the candidate
 - REL: `displacement_size` not in {1,2,4,8}; negative offsets; `base_offset <= 0`;
   field or base running past the pattern; field not inside `[instruction_offset,
   base_offset)`
 - BODY: missing or negative `body_offset`
+- VTABLE: origin other than `rtti_vtable_slot`; missing/non-raw
+  `type_descriptor`; negative/missing `slot`, `subobject_offset`, or
+  `confirm_offset`; unknown `scan_bound` or `tokenization`; `image_matches < 1`;
+  attachment to anything other than a `function`
 - `derived_value`: unknown `semantic`; missing `owner`; non-integer
   `expected_value`; `member_offset` without an `expected_value`
 - VALUE: `origin` outside {`stroff_xref`, `selected_operand`}; unknown `op`;
@@ -585,6 +639,7 @@ python tools/cfs6_resolve.py <file.cfs> <client.dll> --name ConVarRef_GetFloat -
 |---|---|
 | 0 | `function` / `global` items; `ENTRY` / `REL` / `BODY` candidates; type payloads |
 | 1 | `derived_value` items and `VALUE` candidates (`member_offset` produced) |
+| 2 | structural function locators (`VTABLE`; `STRING_REL` follows in the same revision) and skip-with-report for unknown candidate modes |
 
 Revisions are **additive within version 6**: a reader written against an older
 revision skips the newer records as unknown kinds and stays correct on the rest

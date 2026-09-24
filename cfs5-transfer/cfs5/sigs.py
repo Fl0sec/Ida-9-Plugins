@@ -20,7 +20,10 @@ import ida_funcs
 import ida_ua
 
 from . import cfs6
+from . import confirm
 from . import memberscan
+from . import registry
+from . import rtti
 from .common import UA_MAXOP, ea_str, find_up_to_n, find_up_to_two, msg
 from .disasm import (
     collect_data_xrefs_to,
@@ -40,6 +43,7 @@ from .policy import (
     AXIS_BODY,
     AXIS_ENTRY,
     AXIS_EXTERNAL_REL,
+    AXIS_VTABLE,
     Candidate,
     FunctionSearch,
     ORIGIN_DATA_REF,
@@ -48,8 +52,12 @@ from .policy import (
     ORIGIN_EXTERNAL_CALL,
     ORIGIN_HEXRAYS_MEMPTR,
     ORIGIN_SELECTED_OPERAND,
+    ORIGIN_RTTI_VTABLE_SLOT,
     ORIGIN_SELF_CALL,
     ORIGIN_STROFF_XREF,
+    WHY_LOCATOR_MISMATCH,
+    WHY_LOCATOR_UNRESOLVED,
+    WHY_NO_CONFIRM_SIGNATURE,
     body_origin_for_position,
     candidate_min_exact,
     coverage_for,
@@ -61,95 +69,11 @@ from .policy import (
     value_coverage,
     value_min_exact,
 )
-
-# Window lengths tried, shortest first, until one is source-unique.
-_WINDOW_THRESHOLDS = [10, 14, 18, 24, 32, 40, 48]
-
-
-def _window_stats(insns, start_idx, end_idx):
-    tokens = []
-    for item in insns[start_idx:end_idx]:
-        tokens.extend(item["tokens"])
-
-    if not tokens:
-        return None
-
-    wild = sum(1 for t in tokens if t == "?")
-    return {
-        "tokens": tokens,
-        "signature": " ".join(tokens),
-        "byte_len": len(tokens),
-        "wildcards": wild,
-        "exact": len(tokens) - wild,
-        "start_ea": insns[start_idx]["ea"],
-        "end_ea": insns[end_idx - 1]["ea"] + insns[end_idx - 1]["size"],
-    }
-
-
-def _window_ladder(insns, start_idx, min_exact=None):
-    """Yield window stats at start_idx, shortest first, along the length ladder.
-
-    Split out of `_unique_window` so the growth rule has exactly one
-    implementation: `_unique_window` stops at the first unique window, while
-    `confirm.py` needs *every* unique one so it can pick by image-uniqueness
-    rather than by length. Forking this would let the two drift apart on which
-    lengths are even considered.
-    """
-    if start_idx < 0 or start_idx >= len(insns):
-        return
-    if min_exact is None:
-        min_exact = candidate_min_exact
-
-    tried_ends = set()
-    for threshold in _WINDOW_THRESHOLDS:
-        total = 0
-        end_idx = start_idx
-        while end_idx < len(insns) and total < threshold and total < MAX_PATTERN_BYTES:
-            total += insns[end_idx]["size"]
-            end_idx += 1
-
-        if end_idx <= start_idx:
-            continue
-
-        if total > MAX_PATTERN_BYTES:
-            while end_idx > start_idx and (
-                insns[end_idx - 1]["ea"] + insns[end_idx - 1]["size"]
-                - insns[start_idx]["ea"]
-            ) > MAX_PATTERN_BYTES:
-                end_idx -= 1
-
-        if end_idx <= start_idx or end_idx in tried_ends:
-            continue
-        tried_ends.add(end_idx)
-
-        stats = _window_stats(insns, start_idx, end_idx)
-        if stats is None:
-            continue
-        if stats["exact"] < min_exact(stats["byte_len"]):
-            continue
-        yield stats
-
-
-def _unique_window(insns, start_idx, ranges, min_exact=None):
-    """Shortest window starting at start_idx that matches `ranges` once, or None.
-
-    `min_exact` is the exact-byte floor to apply, defaulting to the image-wide
-    one. A confirm signature passes `policy.confirm_min_exact` because it is
-    searched over a single function rather than the whole image -- see that
-    function for why the floor would be wrong there.
-    """
-    for stats in _window_ladder(insns, start_idx, min_exact):
-        if len(find_up_to_two(stats["signature"], ranges)) == 1:
-            return stats
-    return None
-
-
-def iter_unique_windows(insns, start_idx, ranges, min_exact=None):
-    """Every window at start_idx that matches `ranges` exactly once."""
-    for stats in _window_ladder(insns, start_idx, min_exact):
-        if len(find_up_to_two(stats["signature"], ranges)) == 1:
-            yield stats
-
+from .windows import (
+    sample_body_indices,
+    unique_window,
+    window_stats,
+)
 
 def _unique_window_around(insns, xidx, ranges, min_exact=None):
     """Shortest source-unique window that contains instruction `xidx`.
@@ -163,7 +87,7 @@ def _unique_window_around(insns, xidx, ranges, min_exact=None):
         min_exact = candidate_min_exact
     possibilities = []
     for a, b in _xref_window_specs(xidx, len(insns)):
-        stats = _window_stats(insns, a, b)
+        stats = window_stats(insns, a, b)
         if stats is None or stats["byte_len"] > MAX_PATTERN_BYTES:
             continue
         if stats["exact"] < min_exact(stats["byte_len"]):
@@ -195,7 +119,7 @@ def _longest_window_matches(insns, start_idx, ranges):
         total += size
         end_idx += 1
 
-    stats = _window_stats(insns, start_idx, end_idx)
+    stats = window_stats(insns, start_idx, end_idx)
     if stats is None:
         return 0
     return len(find_up_to_n(stats["signature"], ranges, CLONE_COUNT_LIMIT))
@@ -227,7 +151,7 @@ def find_entry_candidate(func_ea, ranges):
     if not insns:
         return None, [], 0
 
-    stats = _unique_window(insns, 0, ranges)
+    stats = unique_window(insns, 0, ranges)
     if stats is None:
         return None, insns, _longest_window_matches(insns, 0, ranges)
 
@@ -248,28 +172,6 @@ def find_entry_candidate(func_ea, ranges):
 # BODY
 # ---------------------------------------------------------------------------
 
-def _sample_body_indices(insns):
-    """Early/middle/late instruction indices, never the entry instruction."""
-    n = len(insns)
-    if n <= 3:
-        return []
-
-    raw = [max(1, n // 4), max(1, n // 2), max(1, (3 * n) // 4)]
-    out = []
-    for idx in raw:
-        idx = min(idx, n - 1)
-        if idx not in out and idx != 0:
-            out.append(idx)
-    return out
-
-
-# Public names for the two primitives `cfs5/confirm.py` reuses. It builds its
-# own windows -- over the .pdata chain instead of the image, with no exact-byte
-# floor -- but the sampling and growth rules must not fork.
-sample_body_indices = _sample_body_indices
-unique_window = _unique_window
-
-
 def find_body_candidates(insns, ranges, func_ea, func_size, ownership=None):
     """(candidates, near_miss) -- unique interior patterns.
 
@@ -288,9 +190,9 @@ def find_body_candidates(insns, ranges, func_ea, func_size, ownership=None):
     """
     out = []
     limit = primary_chunk_limit(insns, func_ea, ownership)
-    indices = _sample_body_indices(insns[:limit])
+    indices = sample_body_indices(insns[:limit])
     for position, idx in enumerate(indices):
-        stats = _unique_window(insns, idx, ranges)
+        stats = unique_window(insns, idx, ranges)
         if stats is None:
             continue
         kind = (
@@ -333,9 +235,9 @@ def _sample_whole_body(insns, ranges, func_ea, func_size, ownership):
         as a near miss instead.
     """
     candidates, near_miss = [], []
-    indices = _sample_body_indices(insns)
+    indices = sample_body_indices(insns)
     for position, idx in enumerate(indices):
-        stats = _unique_window(insns, idx, ranges)
+        stats = unique_window(insns, idx, ranges)
         if stats is None:
             continue
         kind = (
@@ -439,7 +341,7 @@ def _body_candidate_at_site(func_ea, site_ea, ranges, ownership):
             % ea_str(site_ea)
         )
 
-    stats = _unique_window(insns, idx, ranges)
+    stats = unique_window(insns, idx, ranges)
     if stats is None:
         return None, (
             "no unique pattern starts at %s (every window matched elsewhere)"
@@ -867,13 +769,93 @@ def choose_member_candidates(ref, ranges, selected_sites=(), value_adjust=0,
 # Item-level policy entry points
 # ---------------------------------------------------------------------------
 
-def choose_function_candidates(func_ea, ranges, ownership=None, sites=()):
+def find_vtable_candidate(func_ea, ranges, locator, ownership=None):
+    """(Candidate or None, failure or None) for a declared vtable locator.
+
+    Three things must hold before anything is exported, and each is checked
+    against the database rather than taken on the caller's word:
+
+    1. the class resolves to exactly one vtable (an ambiguous subobject is
+       refused, not guessed),
+    2. the declared slot really holds *this* function -- a wrong slot number is
+       caught here, while the caller is still looking at it, instead of
+       becoming a locator that silently resolves elsewhere,
+    3. a confirm signature can be built over the range a consumer will scan.
+
+    The confirm signature is what keeps (2) true on a later build: the slot
+    could be renumbered, and then only the bytes can tell.
+    """
+    type_name = locator.get("type")
+    slot = int(locator.get("slot", -1))
+    subobject = locator.get("subobject_offset")
+
+    try:
+        vtable = rtti.find_vtable(type_name, subobject)
+    except rtti.RttiError as exc:
+        return None, {"reason": WHY_LOCATOR_UNRESOLVED, "detail": str(exc)}
+    except Exception as exc:
+        return None, {"reason": WHY_LOCATOR_UNRESOLVED,
+                      "detail": "RTTI lookup failed: %s" % exc}
+
+    try:
+        slot_func, _slot_ea = rtti.read_slot(vtable, slot)
+    except rtti.RttiError as exc:
+        return None, {"reason": WHY_LOCATOR_MISMATCH, "detail": str(exc)}
+    if slot_func != func_ea:
+        return None, {
+            "reason": WHY_LOCATOR_MISMATCH,
+            "detail": "%s slot %d holds %s, not %s" % (
+                vtable.type_descriptor, slot, ea_str(slot_func), ea_str(func_ea)
+            ),
+        }
+
+    sig = confirm.build_confirm_signature(func_ea, ownership, ranges)
+    if not sig:
+        return None, {
+            "reason": WHY_NO_CONFIRM_SIGNATURE,
+            "detail": "the vtable slot resolves, but no window inside the "
+                      "function is unique over its scan range (%s), so a "
+                      "consumer could not check the slot still holds it"
+                      % sig.reason,
+        }
+
+    _f, start_ea, func_size = _func_extent(func_ea)
+    return Candidate(
+        mode=cfs6.MODE_VTABLE,
+        signature=sig.signature,
+        origin=ORIGIN_RTTI_VTABLE_SLOT,
+        byte_len=sig.byte_len,
+        wildcards=sig.signature.count("?"),
+        exact=sig.byte_len - sig.signature.count("?"),
+        anchor_ea=func_ea + sig.offset,
+        func_ea=start_ea or func_ea,
+        func_size=func_size,
+        target_ea=vtable.ea,
+        locator={
+            "type_descriptor": vtable.type_descriptor,
+            "subobject_offset": vtable.subobject_offset,
+            "slot": slot,
+            "confirm_offset": sig.offset,
+            "function_size": func_size,
+            "scan_bound": sig.scan_bound,
+            "tokenization": sig.tokenization,
+            "image_matches": sig.image_matches,
+        },
+    ), None
+
+
+def choose_function_candidates(func_ea, ranges, ownership=None, sites=(),
+                               locators=()):
     """Ranked, structurally diverse candidates for a function.
 
     `sites` are addresses the caller located itself. They are verified against
     the database and, when they hold up, pinned into the result -- scoring is
     a guess about the next build and must not discard evidence that was
     supplied deliberately.
+
+    `locators` are structural declarations (a vtable slot). They are verified
+    the same way and pinned for the same reason, and they are the only axis
+    that can cover a function whose prologue, callers and body all fail.
 
     Returns a FunctionSearch.
     """
@@ -890,6 +872,25 @@ def choose_function_candidates(func_ea, ranges, ownership=None, sites=()):
     attempted = {AXIS_ENTRY}
     if entry is not None:
         candidates.append(entry)
+
+    # A declared locator is pinned like an explicit site: the caller asserted
+    # it, and the exporter's job is to verify the claim, not to let scoring
+    # rank it out of the file.
+    vtable_failure = None
+    for locator in locators or ():
+        if locator.get("kind") != registry.LOCATOR_VTABLE:
+            continue
+        attempted.add(AXIS_VTABLE)
+        cand, failure = find_vtable_candidate(
+            start_ea or func_ea, ranges, locator, ownership
+        )
+        if cand is not None:
+            pinned.append(cand)
+        else:
+            vtable_failure = failure
+            msg("LOCATOR_REJECTED %s slot %s: %s"
+                % (locator.get("type"), locator.get("slot"),
+                   failure.get("detail", "")))
 
     # Unconditional: a good prologue says nothing about whether a caller-side
     # anchor will survive the next build, and vice versa.
@@ -929,6 +930,7 @@ def choose_function_candidates(func_ea, ranges, ownership=None, sites=()):
             "data_xref_count": data_xrefs,
             "xrefs_tested": searched,
             "body_near_miss": body_near_miss,
+            "vtable_failure": vtable_failure,
         }),
         site_rejections=site_rejections,
         pinned=len(pinned),
