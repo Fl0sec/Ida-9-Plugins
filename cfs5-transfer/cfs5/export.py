@@ -658,7 +658,8 @@ def summarize(state, path, build_number, build_source, merged=None):
 def export_to_path(path, ranges, function_eas=(), global_eas=(),
                    declarations=(), build=(None, "unknown"),
                    merge=MERGE_APPEND, function_sites=None,
-                   function_locators=None):
+                   function_locators=None, require_all=False,
+                   validate_output=False):
     """Write a CFS6 file. Returns a result dict; never prompts, never pops up.
 
     `build` is (number_or_None, source) -- resolved by the caller, because the
@@ -723,11 +724,12 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
     if state.ownership.available:
         msg("PDATA: %d runtime functions (source=%s)"
             % (state.ownership.index.count, state.ownership.source))
-    try:
-        state.local_type_index = build_local_type_index()
-    except Exception as exc:
-        msg("TYPE_INDEX_WARN: %s" % exc)
-        state.local_type_index = {}
+    if function_eas or global_eas:
+        try:
+            state.local_type_index = build_local_type_index()
+        except Exception as exc:
+            msg("TYPE_INDEX_WARN: %s" % exc)
+            state.local_type_index = {}
 
     # One work list instead of a loop per item kind: the progress, cancel and
     # error handling are identical, and a third copy of them would drift.
@@ -782,6 +784,16 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
                 result["error"] = "cancelled after %d/%d items" % (done - 1, total)
                 return result
 
+            generated = state.functions + state.globals + state.member_values
+            if require_all and generated != total:
+                result.update({
+                    "error": "selected export generated %d/%d requested items; "
+                             "original file left untouched" % (generated, total),
+                    "uncovered": list(state.uncovered),
+                    "advisory": list(state.advisory),
+                })
+                return result
+
             # Emit each referenced local type exactly once (shared dedup across
             # functions and globals). Order is irrelevant: the importer performs
             # safe multi-pass registration.
@@ -796,10 +808,23 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
                 merged = cfs6.carry_over(writer, merge_from)
                 msg("MERGE: %s" % merged.describe())
 
+        if validate_output:
+            checked = cfs6.load_cfs6(
+                tmp_path, log=lambda t: msg("EXPORT_VALIDATE: %s" % t)
+            )
+            if checked.parse_errors:
+                result["error"] = (
+                    "generated file failed validation with %d parse error(s); "
+                    "original file left untouched" % checked.parse_errors
+                )
+                return result
         os.replace(tmp_path, path)
 
     except OSError as exc:
         result["error"] = "unable to write CFS6 file: %s" % exc
+        return result
+    except Exception as exc:
+        result["error"] = "unable to validate generated CFS6 file: %s" % exc
         return result
     finally:
         ida_kernwin.hide_wait_box()
@@ -815,6 +840,17 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
         "members": state.member_values,
         "types": len(state.exported_types),
         "merged": merged.describe() if merged is not None else None,
+        "merge_stats": ({
+            "preserved_items": merged.items,
+            "preserved_candidates": merged.candidates,
+            "preserved_type_payloads": merged.metas,
+            "preserved_local_types": merged.types,
+            "preserved_records": (
+                merged.items + merged.candidates + merged.metas + merged.types
+            ),
+            "removed_records": merged.replaced_lines,
+            "dropped_records": merged.dropped_lines,
+        } if merged is not None else None),
         "mode": mode,
         "uncovered": list(state.uncovered),
         "advisory": list(state.advisory),

@@ -125,6 +125,13 @@ and a cancel or any error writes nothing, leaving the existing file untouched.
 Do not "optimize" the carry-over into re-serializing parsed records — a
 round-trip through this build's model silently drops fields it does not know.
 
+`api.export_selected` is the strict incremental path. It requires an existing
+compatible file, resolves every requested qualified name or exact item id
+before generation, runs only those work items, requires all of them to produce
+valid records, validates the completed temporary file, and only then replaces
+the destination. Never weaken its failure into a full export or retain a stale
+selected record after failed regeneration.
+
 **No backward compatibility.** The CSV era (`CFS2`/`CFS2G`/`CFS3*`/`CFS4*`/`CFS5GLOB`, legacy Cra0 rows) is deleted, not deprecated. Do not reintroduce it.
 
 ## Signature model — `cfs5/sigs.py` (finders) + `cfs5/policy.py` (rules)

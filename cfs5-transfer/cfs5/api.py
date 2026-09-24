@@ -32,6 +32,8 @@ Registration stores *names*, resolved to addresses only at export time -- see
 `registry.py` for why.
 """
 
+import os
+
 import ida_funcs
 import ida_name
 
@@ -40,6 +42,7 @@ from . import export as _export
 from . import members as _members
 from . import registry
 from . import rtti
+from . import selection
 from . import strloc
 from . import store
 from .common import BADADDR, ea_str, get_search_ranges, msg
@@ -710,3 +713,88 @@ def export_list(path, function_names=(), global_names=(),
     return _run_export(path, function_eas, global_eas, unresolved,
                        merge, build, include_members, function_sites=sites,
                        function_locators=locators)
+
+
+def export_selected(path, declaration_names=(), item_ids=(), build=None):
+    """Atomically refresh only explicitly selected items in an existing file.
+
+    `declaration_names` are qualified derived-value names (`Owner::name`).
+    `item_ids` are exact CFS ids (`fn:`, `global:`, `member:`, `stride:`,
+    `const:` or `extent:`). Selection is resolved completely before candidate
+    generation; any unknown or ambiguous input refuses the whole call rather
+    than falling back to a full export.
+    """
+    if not isinstance(path, str) or not path:
+        return _result(error="path is required", requested=0, refreshed=0)
+    if not path.lower().endswith(".cfs"):
+        path += ".cfs"
+    if not os.path.isfile(path):
+        return _result(
+            error="selected export requires an existing CFS6 file; run a full "
+                  "export first",
+            path=path, requested=0, refreshed=0,
+        )
+
+    chosen = selection.resolve(
+        store.load_all(), declaration_names=declaration_names, item_ids=item_ids
+    )
+    unresolved = chosen["unresolved"]
+    requested = chosen["requested"]
+    if unresolved:
+        return _result(
+            error="selected export refused because the selection is not exact",
+            unresolved=unresolved, path=path, requested=requested, refreshed=0,
+            preserved=0, removed_records=0,
+        )
+    if not requested:
+        return _result(error="no items selected", path=path,
+                       requested=0, refreshed=0, preserved=0,
+                       removed_records=0)
+
+    sites_by_id = store.load_sites()
+    locators_by_id = store.load_locators()
+    function_eas, global_eas, sites, locators, resolve_errors = _collect(
+        chosen["function_names"], chosen["global_names"],
+        sites_by_id=sites_by_id, locators_by_id=locators_by_id,
+    )
+    if resolve_errors:
+        return _result(
+            error="selected export refused because an item does not resolve",
+            unresolved=resolve_errors, path=path, requested=requested,
+            refreshed=0, preserved=0, removed_records=0,
+        )
+
+    if build is None:
+        build_number, build_source = detect_build()
+    else:
+        build_number, build_source = int(build), "user"
+
+    _export.clear_caches()
+    raw = _export.export_to_path(
+        path, get_search_ranges(),
+        function_eas=function_eas, global_eas=global_eas,
+        declarations=chosen["declarations"],
+        build=(build_number, build_source), merge=_export.MERGE_APPEND,
+        function_sites=sites, function_locators=locators,
+        require_all=True, validate_output=True,
+    )
+    missed = list(raw.get("uncovered", ()))
+    if raw.get("error") or raw.get("written", 0) != requested or missed:
+        return _result(
+            error=raw.get("error") or "one or more selected items failed",
+            unresolved=missed, path=path, requested=requested, refreshed=0,
+            preserved=0, removed_records=0,
+            advisory=raw.get("advisory", []),
+        )
+
+    stats = raw.get("merge_stats") or {}
+    return _result(
+        ok=True, path=path, requested=requested, refreshed=raw["written"],
+        preserved=stats.get("preserved_records", 0),
+        preserved_items=stats.get("preserved_items", 0),
+        removed_records=stats.get("removed_records", 0),
+        dropped_records=stats.get("dropped_records", 0),
+        functions=raw.get("functions", 0), globals=raw.get("globals", 0),
+        declarations=raw.get("members", 0), types=raw.get("types", 0),
+        advisory=raw.get("advisory", []), summary=raw.get("summary", ""),
+    )

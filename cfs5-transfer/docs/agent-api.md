@@ -17,6 +17,7 @@ from cfs5 import api
 | `registered()` | the set + anything that no longer resolves |
 | `export(path, merge="append", build=None, include_members=True)` | write the set |
 | `export_list(path, function_names=[], global_names=[], ...)` | explicit list, ignores the set |
+| `export_selected(path, declaration_names=[], item_ids=[], build=None)` | atomically refresh only named items in an existing file |
 | `declare_members(members_=[], discovery="sites_only")` | declare `member_offset` values |
 | `declare_strides(strides=[])` | declare `element_stride` constants |
 | `declare_constants(constants=[])` | declare `constant` values (bit positions, sentinels) |
@@ -205,6 +206,40 @@ re-declaring anything.
 `merge`: `"append"` refreshes re-exported items and keeps the rest;
 `"replace"` discards the file. Append is refused across a different image or
 build — that is an error, not something to retry.
+
+## Incremental refresh
+
+Use `export_selected` after changing one or a few declarations:
+
+```python
+api.export_selected(
+    r"C:\exports\client.cfs",
+    declaration_names=[
+        "CEntityIdentityFlags::kModelChangeUseExplicitBit",
+        "CEntityIdentityFlags::kModelChangeBlockedBit",
+    ],
+    build=14182,
+)
+```
+
+Qualified names select derived-value declarations. Exact `item_ids` may select
+functions, globals, or derived values. An ambiguous qualified name must be
+replaced with its exact id, for example `const:Owner::name`.
+
+The destination must already exist. Selection is resolved completely before
+generation; an unknown name/id refuses the call and never falls back to a full
+export. Only selected items run candidate generation. Their parent records,
+candidates, coverage, item type payloads and directly required local types are
+replaced; unrelated records are carried over from the existing file. Image and
+build compatibility is enforced before generation.
+
+The update is transactional. Every selected item must generate successfully,
+and the complete temporary CFS file must parse cleanly, before the destination
+is replaced. A failed item therefore leaves its old file intact rather than
+silently retaining the stale record. Results report `requested`, `refreshed`,
+`preserved`, `removed_records`, `unresolved`, and `advisory`. Use full `export`
+when creating a file, intentionally refreshing the whole registered set, or
+rebuilding every transported type after broad type-library changes.
 
 ## Every call returns these four keys
 

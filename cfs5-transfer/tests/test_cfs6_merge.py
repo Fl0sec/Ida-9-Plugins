@@ -11,7 +11,8 @@ import tempfile
 import unittest
 
 from _support import (
-    cfs6, entry_candidate, rel_candidate, sample_image, write_cfs6,
+    cfs6, entry_candidate, rel_candidate, sample_image, value_candidate,
+    write_cfs6,
 )
 
 
@@ -128,6 +129,66 @@ class MergeTests(unittest.TestCase):
             if line and '"record":"header"' not in line
         ]
         self.assertEqual(before, after)
+
+    def test_refreshing_one_constant_preserves_every_unrelated_record(self):
+        with open(self.path, "w", encoding="utf-8", newline="") as handle:
+            writer = cfs6.Cfs6Writer(handle)
+            writer.write_header(sample_image(), 14177, "user")
+            fn = writer.write_item(cfs6.REC_FUNCTION, "f", 1, {})
+            writer.write_candidate(fn, 0, entry_candidate("40 53 48 83 EC 20"))
+            glob = writer.write_item(cfs6.REC_GLOBAL, "g", 1, {})
+            writer.write_candidate(glob, 0, rel_candidate(
+                "48 8B 05 ? ? ? ?", 0x2000, 0, 3, 4, 7, is_data=True,
+            ))
+            old = writer.write_derived_value(
+                cfs6.SEM_CONSTANT, "Flags", "kA", 1, {}, expected_value=1,
+            )
+            writer.write_candidate(old, 0, value_candidate(
+                "83 F8 ? 75 01 90", field_offset=2, field_size=1,
+                op=cfs6.OP_IMM, value=1,
+            ))
+            other = writer.write_derived_value(
+                cfs6.SEM_ELEMENT_STRIDE, "Mesh", "kStride", 1, {},
+                expected_value=48,
+            )
+            writer.write_candidate(other, 0, value_candidate(
+                "83 C0 ? 75 01 90", field_offset=2, field_size=1,
+                op=cfs6.OP_IMM, value=48,
+            ))
+            writer.write_local_type("KeepMe", "STRUCT", (b"body", b"", b""))
+
+        before = cfs6.load_cfs6(self.path)
+        old_item = next(
+            item for item in before.items if item.id == "const:Flags::kA"
+        )
+        selected_lines = {
+            old_item.line_no,
+            old_item.candidates[0].line_no,
+            before.header_line,
+        }
+        unrelated = [
+            raw for line, raw in enumerate(before.lines, 1)
+            if line not in selected_lines and raw.strip()
+        ]
+
+        def fresh(writer):
+            iid = writer.write_derived_value(
+                cfs6.SEM_CONSTANT, "Flags", "kA", 1, {}, expected_value=2,
+            )
+            writer.write_candidate(iid, 0, value_candidate(
+                "83 F8 ? 75 02 90", field_offset=2, field_size=1,
+                op=cfs6.OP_IMM, value=2,
+            ))
+
+        stats, after = merge(self.path, fresh)
+        after_text = set(after.lines)
+        self.assertTrue(all(line in after_text for line in unrelated))
+        self.assertEqual(stats.replaced_items, 1)
+        self.assertEqual(stats.replaced_lines, 2)
+        refreshed = next(
+            item for item in after.items if item.id == "const:Flags::kA"
+        )
+        self.assertEqual(refreshed.expected_value, 2)
 
 
 class MergeConflictTests(unittest.TestCase):
