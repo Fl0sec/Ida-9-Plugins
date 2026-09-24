@@ -20,8 +20,14 @@ cfs5-transfer/
     declare.py  # the user-declaration model (no ida_*)
     members.py  # structure-member lookup, creation, reference discovery
     store.py    # declaration persistence in the IDB (netnodes)
+    api.py      # stable public facade
+    api_registry.py api_declarations.py api_export.py api_import.py
+    importer.py # reusable catalogue apply + producer-state migration
     common.py   disasm.py   sigs.py   typeio.py
-  docs/cfs6-format.md   # the authoritative format specification
+  docs/agent-api.md          # public calls and workflows
+  docs/producer-invariants.md # export/declaration implementation rules
+  docs/import-migration.md   # import and state portability rules
+  docs/cfs6-format.md        # authoritative format specification
   tests/                # python -m unittest discover -s tests -t tests
 ```
 
