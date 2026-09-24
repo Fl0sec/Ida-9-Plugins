@@ -52,7 +52,7 @@ FORMAT_VERSION = 6
 # fewer candidates" instead of "this file is broken".
 SCHEMA_REVISION = 3
 GENERATOR_NAME = "cfs5-transfer"
-GENERATOR_VERSION = "6.3.0"
+GENERATOR_VERSION = "6.4.0"
 
 REC_HEADER = "header"
 REC_FUNCTION = "function"

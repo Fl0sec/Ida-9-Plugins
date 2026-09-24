@@ -579,6 +579,26 @@ def write_member(writer, state, decl, ranges):
         state.member_candidates += 1
         state.mode_counts[cand.mode] = state.mode_counts.get(cand.mode, 0) + 1
 
+    # A blank destination needs the independently-authored owner type before
+    # it can reconstruct a member declaration. The importer still compares
+    # that field with code in the destination build, so a stale transported
+    # layout is reported rather than accepted as self-confirming evidence.
+    if decl.needs_ida_member:
+        try:
+            owner_tif = members.get_struct_tinfo(decl.owner)
+            if owner_tif is not None:
+                export_type_payload(
+                    owner_tif, state.local_type_index, state.closure_cache,
+                    state.exported_types,
+                )
+        except Exception as exc:
+            state._note(
+                "member", decl.qualified,
+                "owner type could not be transported", error=str(exc),
+            )
+            msg("MEMBER_TYPE_EXPORT_FAIL %-23s error=%s"
+                % (decl.qualified, exc))
+
     primary = agreed[0]
     msg(
         "MEMBER_EXPORTED %-29s offset=0x%X n=%d bytes=%d exact=%d sites=%d "
@@ -776,7 +796,7 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
     if state.ownership.available:
         msg("PDATA: %d runtime functions (source=%s)"
             % (state.ownership.index.count, state.ownership.source))
-    if function_eas or global_eas:
+    if function_eas or global_eas or declarations:
         try:
             state.local_type_index = build_local_type_index()
         except Exception as exc:

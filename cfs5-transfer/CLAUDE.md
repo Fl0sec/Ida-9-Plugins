@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Hard constraints (read first)
 
-- **Target is IDA Pro 9.0 / IDAPython 9.0 / Python 3.12 ONLY.** Do not assume API shapes from IDA 7.x/8.x or from generic "IDAPython" memory — those APIs changed. Every `ida_*` call, constant, and signature you add or edit must be **verified against IDA 9.0** before you rely on it. If you cannot verify a symbol exists in 9.0, do not use it.
+- **Target is IDA Professional 9.4 / IDAPython 9.4 / Python 3.12 ONLY.** IDA 9.0 was the previous target and is no longer a validation target. Do not assume API shapes from older IDA releases or from generic "IDAPython" memory. Every `ida_*` call, constant, and signature you add or edit must be **verified against the installed IDA 9.4 stubs** before you rely on it. If you cannot verify a symbol exists in 9.4, do not use it.
 - Use the `ida-pro-mcp:idapython` skill to check API surface, and treat the modules already imported in `cfs5/` as the known-good ground truth for this codebase.
 - These are IDA **plugins**, not standalone scripts. There is no build/test harness inside IDA. "Running" means loading the two entry `.py` files (with the `cfs5/` package beside them) into IDA's `plugins/` directory and exercising the UI actions against a real IDB. You cannot fully validate behavior outside IDA.
-- You *can* cheaply catch syntax + cross-module wiring errors outside IDA: `python tools/check.py cfs5-transfer` (compile + IDA-9.0 symbol existence + stubbed import).
+- You *can* cheaply catch syntax + cross-module wiring errors outside IDA: `python tools/check.py cfs5-transfer` (compile + IDA-9.4 symbol existence + stubbed import).
 - **Five modules are deliberately free of any `ida_*` import and are unit tested**: `cfs5/cfs6.py` (the format), `cfs5/policy.py` (scoring + selection), `cfs5/declare.py` (the declaration model), `cfs5/peinfo.py` (PE/RVA/.pdata) and `tools/cfs6_resolve.py` (the reference resolver). Keep them that way — `cd cfs5-transfer && python -m unittest discover -s tests -t tests` is the only real test harness this repo has. Anything needing IDA goes in the adapter layer (`sigs.py`, `image.py`, `members.py`, `store.py`, the two entry files).
 
 ## What this repo is
@@ -19,7 +19,7 @@ Plugins that transfer names, prototypes and types between IDBs of the same/relat
 ```
 cfs5-transfer/
   cvutils-cfs-exporter.py   # exporter plugin entry: discovery + orchestration + UI
-  cvutils-cfs-importer.py   # importer plugin entry: resolve/apply + UI
+  cvutils-cfs-importer.py   # importer plugin entry: UI only
   cfs5/                     # shared importable core (no duplication across plugins)
     cfs6.py     # THE format: records, reader, writer, codec        [no ida_*]
     policy.py   # Candidate, score, dedup, diversity selection       [no ida_*]
@@ -35,8 +35,9 @@ cfs5-transfer/
     sigs.py     # IDA-touching ENTRY/BODY/REL finders (rules live in policy.py)
     typeio.py   # binary tinfo transport: materialize/serialize/deserialize, register, merge
     export.py   # the export engine: UI actions and api.py both call it, never prompts
+    importer.py # reusable catalogue apply + transactional producer-state migration
     registry.py # the export set: identity + validation                  [no ida_*]
-    api.py      # programmatic export for an agent (no UI) -- docs/agent-api.md
+    api.py      # programmatic import/export facade (no UI) -- docs/agent-api.md
   docs/cfs6-format.md     # AUTHORITATIVE format spec -- update it with any change
   docs/agent-api.md       # READ BEFORE adding/changing anything in api.py
   tests/                  # stdlib unittest over the ida-free modules

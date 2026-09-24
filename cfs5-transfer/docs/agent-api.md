@@ -1,6 +1,6 @@
 # Agent API (`cfs5/api.py`) — rules
 
-Programmatic export for an agent driving IDA. Drive it with `py_eval`:
+Programmatic import and export for a caller driving IDA. Drive it with `py_eval`:
 
 ```python
 import sys; sys.path.insert(0, r"%APPDATA%\Hex-Rays\IDA Pro\plugins")
@@ -11,6 +11,9 @@ from cfs5 import api
 
 | Call | Does |
 |---|---|
+| `import_catalogue(path)` | apply resolvable names and transported types |
+| `migrate_state(path, require_all=False)` | transactionally reconstruct portable producer state |
+| `import_and_migrate(path, require_all_state=False)` | apply the catalogue, then migrate producer state |
 | `register(function_names=[], global_names=[])` | add names to this IDB's export set |
 | `unregister(function_names=[], global_names=[])` | remove names |
 | `clear()` | empty the set |

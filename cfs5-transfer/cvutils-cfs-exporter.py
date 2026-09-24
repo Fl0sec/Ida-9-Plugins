@@ -1,4 +1,4 @@
-# CFS6 Exporter for IDA Pro 9.0 / IDAPython 9.0
+# CFS6 Exporter for IDA Professional 9.4 / IDAPython 9.4
 #
 # Fast name/type-transfer signatures for large binaries. Exports user-named
 # functions AND user-named global variables to a portable .cfs file:
@@ -11,7 +11,7 @@
 # All shared machinery lives in the importable `cfs5` package; this file is
 # only discovery, orchestration and the IDA plugin/UI glue.
 #
-# Target: IDA Professional 9.0 / Python 3.12.
+# Target: IDA Professional 9.4 / Python 3.12.
 
 import os
 import sys

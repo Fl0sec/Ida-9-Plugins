@@ -1,6 +1,6 @@
 # cfs5-transfer
 
-CFS6 signature/type transfer plugins for IDA Pro 9.0 (IDAPython 9.0 / Python 3.12).
+CFS6 signature/type transfer plugins for IDA Professional 9.4 (IDAPython 9.4 / Python 3.12).
 
 Transfer function names, **global-variable names**, prototypes, global types and
 local types between two IDBs of the same or related binaries, using short unique
@@ -228,7 +228,8 @@ That is honest, and it is reported per item rather than hidden.
 ### `cvutils-cfs-importer.py` — CFS6 Importer
 
 Imports a `.cfs` file into the current IDB: renames matched functions and
-globals, registers missing local types, merges prototypes, applies global types.
+globals, registers missing local types, merges prototypes, applies global
+types, then reconstructs portable producer state from destination-build proof.
 
 **Usage**
 - File → Load file → **CFS6 / CFS File...** (`Ctrl+Shift+I`).
@@ -256,6 +257,13 @@ globals, registers missing local types, merges prototypes, applies global types.
   destination already carries a user/more-specific type.
 - Registers missing local types (multi-pass, dependency-order aware) without
   touching pre-existing definitions.
+- Reconstructs the export registry, derived-value declarations, patch sites,
+  and structural locators only from records that resolve in the destination
+  image. Source RVAs are never copied. The accepted subset is committed as one
+  verified transaction; non-portable records remain explicit failures.
+- Member-owner types travel with the catalogue. A reconstructed member is
+  persisted only when that destination type agrees with the value independently
+  decoded from destination code; stale layouts are reported, never self-validated.
 - Shows a detailed import summary (functions/globals renamed / created / skipped
   / ambiguous / types registered / prototypes applied, …) in the Output window
   and a popup.
@@ -311,7 +319,7 @@ implement from the spec alone.
 ## Testing
 
 ```bash
-python tools/check.py cfs5-transfer                  # compile + IDA 9.0 API + import
+python tools/check.py cfs5-transfer                  # compile + IDA 9.4 API + import
 cd cfs5-transfer && python -m unittest discover -s tests -t tests
 python tools/cfs6_resolve.py <file.cfs> <image.dll>  # resolve without IDA
 ```
