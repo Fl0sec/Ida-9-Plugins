@@ -38,8 +38,9 @@ class ConstantDeclarationTests(unittest.TestCase):
     def test_a_constant_has_no_backing_ida_member(self):
         """Which is the whole reason it exists as a separate semantic."""
         decl = declare.make_constant("SosConstants", "kDisableStartTime",
-                                     0xFF, SITES)
+                                     -1, SITES)
         self.assertFalse(decl.needs_ida_member)
+        self.assertEqual(decl.asserted_value, -1)
 
     def test_a_constant_is_never_discovered(self):
         """Nothing in the database associates an instruction with a constant.
@@ -118,6 +119,31 @@ class ConstantFormatTests(unittest.TestCase):
         )
         self.assertEqual(len(item.candidates), 1)
         self.assertEqual(item.candidates[0].op, cfs6.OP_IMM)
+
+    def test_negative_expected_value_round_trips_as_signed_json(self):
+        path = os.path.join(self.dir, "negative.cfs")
+        cand = value_candidate(
+            "41 83 F8 ?", anchor=0x3AE51F, field_size=1,
+            op=cfs6.OP_IMM, value=-1,
+        )
+        cand.extract["signed"] = True
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            writer = cfs6.Cfs6Writer(handle)
+            writer.write_header(sample_image(), 14182, "user")
+            iid = writer.write_derived_value(
+                cfs6.SEM_CONSTANT, "SosConstants", "kDisableStartTime",
+                1, {}, expected_value=-1,
+            )
+            writer.write_candidate(iid, 0, cand)
+
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+        self.assertIn('"expected_value":-1', raw)
+
+        loaded = cfs6.load_cfs6(path)
+        item = loaded.derived_values(cfs6.SEM_CONSTANT)[0]
+        self.assertEqual(item.expected_value, -1)
+        self.assertTrue(item.candidates[0].field_signed)
 
 
 if __name__ == "__main__":

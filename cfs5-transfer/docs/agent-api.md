@@ -114,6 +114,8 @@ api.declare_strides([
 api.declare_constants([
     {"owner": "CEntityIdentityFlags", "name": "kModelChangeBlockedBit",
      "value": 0x6, "sites": [{"ea": 0x9ABC, "op": 1}]},
+    {"owner": "SosConstants", "name": "kDisableStartTime",
+     "value": -1, "sites": [{"ea": 0x3AE51F, "op": 1}]},
 ])
 ```
 
@@ -139,6 +141,10 @@ fatal. `owner` is a namespace there, not a claim that the type has such a
 field. The two differ only in what a consumer does with the number — use
 `constant` for a value that is not a size or a stride, such as a bit position
 tested by `bt reg, 6` or a sentinel compared against a field.
+
+Use the semantic signed value for a sign-extended sentinel. An imm8 `FF` that
+the consumer reads with `signed: true` is `-1`, not `0xFF` or `0xFFFFFFFF`;
+the same signed value is written to `source.expected_value`.
 
 ### `value_adjust`
 
