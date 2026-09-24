@@ -197,6 +197,33 @@ class Declaration:
         """Whether `expected_value` comes from a live IDA field."""
         return self.semantic == cfs6.SEM_MEMBER_OFFSET
 
+    # -- the value_adjust convention ---------------------------------------
+    #
+    # One direction of arithmetic, stated once, here. Three different numbers
+    # are involved and conflating any two of them produces a declaration that
+    # can never be exported:
+    #
+    #   site value      what the instruction literally encodes
+    #   value_adjust    what a consumer adds to the site value
+    #   reported value  the answer -- which must equal the IDA member, or the
+    #                   asserted value for a semantic with no field
+    #
+    # so `reported = site + adjust`, and therefore `site = reported - adjust`.
+    # An exporter learns the reported value *first* (IDA supplies it) and has
+    # to work backwards to know what to look for at the site. Searching the
+    # site for the reported value is the defect this pair exists to prevent:
+    # for any non-zero adjust the site does not encode that number, so the
+    # site yields no candidate at all and the declaration is refused for
+    # "no candidate" when the real cause was the search target.
+
+    def site_value(self, reported_value):
+        """What an instruction must encode in order to report `reported_value`."""
+        return int(reported_value) - self.value_adjust
+
+    def reported_value(self, site_value):
+        """What a consumer reports for an instruction encoding `site_value`."""
+        return int(site_value) + self.value_adjust
+
     def to_dict(self):
         return {
             "version": self.version,
@@ -288,6 +315,31 @@ def make_stride(owner, name, value, sites, value_adjust=0):
     """
     return Declaration(
         cfs6.SEM_ELEMENT_STRIDE, owner, name, member=name,
+        sites=sites, discovery=DISCOVER_SITES_ONLY,
+        asserted_value=value, value_adjust=value_adjust,
+    )
+
+
+def make_constant(owner, name, value, sites, value_adjust=0):
+    """A `constant` declaration: a number that exists only in the code.
+
+    Structurally identical to `element_stride` -- assert the value, name the
+    instructions that encode it, no discovery -- and deliberately so: both are
+    the same claim about the same kind of evidence, and only the meaning a
+    consumer attaches to the number differs. A bit position tested by
+    `bt reg, 0xB` or a sentinel compared against a field has no owning IDA
+    field to source a value from, which is exactly the case this covers.
+
+    `owner` is a namespace, not a claim that the type has such a field.
+
+    A constant is usually encoded as a small immediate, so its pattern is more
+    likely than a member offset's to fail the VALUE uniqueness test. That
+    refusal is correct and is not softened here: a non-unique pattern resolves
+    to nothing on the consumer's side, so exporting it would publish a
+    signature that cannot be used.
+    """
+    return Declaration(
+        cfs6.SEM_CONSTANT, owner, name, member=name,
         sites=sites, discovery=DISCOVER_SITES_ONLY,
         asserted_value=value, value_adjust=value_adjust,
     )

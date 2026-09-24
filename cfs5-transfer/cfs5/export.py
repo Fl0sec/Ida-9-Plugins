@@ -91,6 +91,10 @@ class ExportState:
         self.member_unresolved = 0
         # Candidates dropped for not reproducing the IDA-known offset.
         self.member_disagreements = 0
+        # Declarations that produced nothing on the first generation pass and
+        # candidates on an identical second one. Non-zero means this export's
+        # content was one retry away from being silently incomplete.
+        self.member_retries_recovered = 0
         self.no_candidate = 0
         self.failures = 0
         self.user_prototypes = 0
@@ -123,6 +127,12 @@ class ExportState:
         if diagnosis:
             entry["diagnosis"] = diagnosis
         self.uncovered.append(entry)
+
+    def _note(self, kind, name, note, **extra):
+        """Record one advisory that is not tied to a FunctionSearch."""
+        entry = {"kind": kind, "name": name, "note": note}
+        entry.update(extra)
+        self.advisory.append(entry)
 
     def _advise(self, kind, name, search, ea=None):
         """Record what a search noticed but could not act on."""
@@ -380,9 +390,9 @@ def write_member(writer, state, decl, ranges):
       no backing field asserts its value instead, which is a weaker claim --
       so it is gated on every one of its sites decoding that same number.
     * every candidate must reproduce the expected value. Candidates are built
-      by searching for exactly that value, so a disagreement means something
-      is wrong with the extraction rather than with the build -- it is
-      dropped, never ranked.
+      by searching the sites for exactly the number that *yields* that value,
+      so a disagreement means something is wrong with the extraction rather
+      than with the build -- it is dropped, never ranked.
     """
     ref = None
     if decl.needs_ida_member:
@@ -396,32 +406,82 @@ def write_member(writer, state, decl, ranges):
             )
             state._miss("member", decl.qualified, "no live IDA field")
             return None
-        encoded = ref.byte_offset
+        expected = ref.byte_offset
     else:
         # No field to read, so the declaration's own number is the claim; the
         # sites below are what has to substantiate it.
-        encoded = decl.asserted_value
+        expected = decl.asserted_value
 
-    expected = encoded + decl.value_adjust
+    # Three numbers, one direction of arithmetic, and the declaration owns it
+    # (`Declaration.site_value`). `expected` is what the file publishes and
+    # what IDA -- or the assertion -- says is true. `site_value` is what an
+    # instruction has to encode for a consumer to arrive at `expected` after
+    # adding `value_adjust`. Searching a site for `expected` is wrong for any
+    # non-zero adjust: the site does not encode that number, so every site
+    # fails and the declaration is refused for "no candidate" when the real
+    # cause was the search target.
+    site_value = decl.site_value(expected)
 
-    try:
-        candidates, coverage, sites, searched = choose_value_candidates(
-            encoded, ranges, selected_sites=decl.sites, ref=ref,
+    reasons = {}
+
+    def _generate(into):
+        return choose_value_candidates(
+            site_value, ranges, selected_sites=decl.sites, ref=ref,
             allow_scan=decl.scan_allowed, value_adjust=decl.value_adjust,
             sibling_offsets=sibling_offsets(ref.owner) if ref is not None else None,
+            reasons=into,
         )
+
+    try:
+        candidates, coverage, sites, searched = _generate(reasons)
     except Exception as exc:
         state.failures += 1
         msg("MEMBER_FAIL %-33s error=%s" % (decl.qualified, exc))
         state._miss("member", decl.qualified, "exception: %s" % exc)
         return None
 
+    # A first pass has been observed to produce no candidate for a declaration
+    # that an identical second pass resolves cleanly, with a different victim
+    # each run -- including for `sites_only` declarations, which run no
+    # discovery at all, so the cause is below this code in IDA's own state.
+    # The only honest defence is to repeat the generation once and to say
+    # loudly when the repeat disagrees: a silent retry would trade
+    # non-deterministic content for a non-deterministic cost, with no record
+    # of either. The cost is bounded to declarations that already failed.
+    if not candidates and sites:
+        retry_reasons = {}
+        try:
+            candidates, coverage, sites, searched = _generate(retry_reasons)
+        except Exception as exc:
+            msg("MEMBER_RETRY_FAIL %-27s error=%s" % (decl.qualified, exc))
+        else:
+            if candidates:
+                state.member_retries_recovered += 1
+                msg("MEMBER_FLAKY_FIRST_PASS %-21s no candidate on the first "
+                    "pass, %d on an identical second one -- the first answer "
+                    "was wrong, not the declaration"
+                    % (decl.qualified, len(candidates)))
+                state._note(
+                    "member", decl.qualified,
+                    "resolved only on a second identical generation pass",
+                )
+            else:
+                reasons = retry_reasons
+
     agreed = [c for c in candidates if c.value == expected]
-    if len(agreed) != len(candidates):
-        state.member_disagreements += len(candidates) - len(agreed)
+    discarded = [c for c in candidates if c.value != expected]
+    if discarded:
+        state.member_disagreements += len(discarded)
+    # A partial drop is advisory -- the item still exports on what agreed. When
+    # *everything* was dropped the item is refused, and MEMBER_DISCARDED below
+    # says so with the same detail; printing both would read as two problems.
+    if discarded and agreed:
         msg("MEMBER_DISAGREE %-29s dropped %d candidate(s) that did not "
-            "reproduce 0x%X"
-            % (decl.qualified, len(candidates) - len(agreed), expected))
+            "reproduce 0x%X: %s"
+            % (decl.qualified, len(discarded), expected,
+               ", ".join("%s produced 0x%X (%s)"
+                         % (ea_str(c.anchor_ea), c.value, c.origin)
+                         for c in discarded)))
 
     # An asserted value has no database behind it, so the sites are the only
     # thing substantiating it. A site that decodes a *different* number means
@@ -429,25 +489,57 @@ def write_member(writer, state, decl, ranges):
     # a number two of its own witnesses disagree with -- reject the whole
     # declaration rather than quietly keep the agreeing half.
     if not decl.needs_ida_member:
-        contradicted = _contradicting_sites(decl, encoded)
+        contradicted = _contradicting_sites(decl, site_value)
         if contradicted:
             state.member_disagreements += len(contradicted)
             detail = ", ".join(
                 "%s encodes %s" % (ea_str(ea), found) for ea, found in contradicted
             )
-            msg("STRIDE_CONTRADICTED %-25s asserted %d but %s"
-                % (decl.qualified, encoded, detail))
+            msg("STRIDE_CONTRADICTED %-25s asserted 0x%X, so its sites must "
+                "encode 0x%X, but %s"
+                % (decl.qualified, expected, site_value, detail))
             state._miss("member", decl.qualified,
-                        "asserted value %d contradicted by %s"
-                        % (encoded, detail))
+                        "asserted value 0x%X (sites must encode 0x%X) "
+                        "contradicted by %s" % (expected, site_value, detail))
             return None
 
     if not agreed:
+        # Three unrelated causes used to print one sentence, which made an
+        # internal drop indistinguishable from a genuine refusal and cost
+        # several export runs to tell apart. Each now names itself and carries
+        # the evidence that separates it from the other two.
         state.no_candidate += 1
-        msg("MEMBER_NO_CANDIDATE %-25s value=0x%X sites=%d"
-            % (decl.qualified, expected, sites))
-        state._miss("member", decl.qualified,
-                    "no candidate reproduced value 0x%X" % expected)
+        if not sites:
+            msg("MEMBER_NO_SITE %-30s nothing produced a site to test "
+                "(value=0x%X, discovery=%s)"
+                % (decl.qualified, expected, decl.discovery))
+            state._miss("member", decl.qualified,
+                        "no site: nothing in the database associates an "
+                        "instruction with it and none was declared")
+        elif discarded:
+            msg("MEMBER_DISCARDED %-28s %d site(s) produced candidates and "
+                "every one was refused for not reproducing 0x%X: %s"
+                % (decl.qualified, sites, expected,
+                   ", ".join("%s produced 0x%X (%s)"
+                             % (ea_str(c.anchor_ea), c.value, c.origin)
+                             for c in discarded)))
+            state._miss(
+                "member", decl.qualified,
+                "every candidate was discarded for not reproducing 0x%X: %s"
+                % (expected, ", ".join("%s produced 0x%X"
+                                       % (ea_str(c.anchor_ea), c.value)
+                                       for c in discarded)),
+            )
+        else:
+            detail = ", ".join(
+                "%s %s" % (ea_str(ea), why) for ea, why in sorted(reasons.items())
+            ) or "no reason recorded"
+            msg("MEMBER_NO_PATTERN %-27s %d site(s) tested, none yielded a "
+                "candidate for 0x%X (site value 0x%X): %s"
+                % (decl.qualified, searched, expected, site_value, detail))
+            state._miss("member", decl.qualified,
+                        "no site yielded a candidate for 0x%X: %s"
+                        % (expected, detail))
         return None
 
     item_id = writer.write_derived_value(
@@ -531,6 +623,7 @@ def summarize(state, path, build_number, build_source, merged=None):
         "  Member candidates: %d\n"
         "  Declarations with no live IDA field: %d\n"
         "  Candidates dropped for disagreeing with IDA: %d\n"
+        "  Resolved only on a second identical pass: %d\n"
         "Local type definitions: %d\n"
         "ENTRY / BODY / REL / VALUE candidates: %d / %d / %d / %d\n"
         "  BODY not resolvable from .pdata (IDA-only): %d\n"
@@ -547,6 +640,7 @@ def summarize(state, path, build_number, build_source, merged=None):
             state.globals, state.global_candidates, state.global_types,
             state.member_values, state.member_candidates,
             state.member_unresolved, state.member_disagreements,
+            state.member_retries_recovered,
             len(state.exported_types),
             state.mode_counts.get("ENTRY", 0), state.mode_counts.get("BODY", 0),
             state.mode_counts.get("REL", 0), state.mode_counts.get("VALUE", 0),

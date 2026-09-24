@@ -23,6 +23,15 @@ XREF_EARLY_STOP_AFTER = 6
 MAX_EXPORTED_CANDIDATES = 4
 MAX_GLOBAL_CANDIDATES = 3
 MAX_VALUE_CANDIDATES = 3
+# Uniqueness probes one anchored site may spend. Each probe is an image-wide
+# byte search, and the byte-bounded window enumeration offers many more windows
+# than the fixed instruction ladder it replaced, so this is what keeps a hard
+# site from costing a scan of the image per candidate window. Shortest-first
+# ordering means a site that can be pinned at all is pinned in the first few.
+MAX_UNIQUE_PROBES = 48
+# Candidate windows above which the envelope shortcut pays for itself. Below
+# it, probing the windows directly is cheaper than the extra probe.
+ENVELOPE_WORTH_PROBES = 8
 MIN_EXACT_BYTES = 6
 MIN_SHORT_EXACT_BYTES = 4
 # VALUE wildcards one byte, not a rel32, so it must not inherit the short tier.
@@ -72,6 +81,50 @@ _MODE_PENALTY = {"ENTRY": 0, "REL": 12, "BODY": 18, "VALUE": 12,
 def candidate_min_exact(total_bytes):
     """Minimum non-wildcard bytes a pattern of this length must carry."""
     return MIN_SHORT_EXACT_BYTES if total_bytes < 10 else MIN_EXACT_BYTES
+
+
+def anchored_window_specs(insns, xidx, max_bytes=MAX_PATTERN_BYTES):
+    """[(start_idx, end_idx)] for every window containing `xidx`, shortest first.
+
+    The growth rule for an *anchored* pattern -- one that must contain a
+    specific instruction, rather than start at one. Bounded in **bytes**, not
+    in instruction count, because a count is the wrong bound when the anchor is
+    short: `bt eax, 0Bh` is 4 bytes and `shr eax, 6` is 3, so a ladder reaching
+    three instructions back gives up around 11 bytes and never sees the 15- and
+    20-byte unique windows sitting a few instructions earlier in the same
+    function. A member offset rarely hit that, because a displacement-bearing
+    `mov`/`lea` is longer and reaches uniqueness in fewer steps.
+
+    Both directions are enumerated per instruction rather than per threshold: a
+    window that pins a site may lie entirely *behind* it, which a scheme that
+    only grew forward -- or only in balanced steps -- would miss.
+
+    `insns` is the enclosing function chunk, so growth is clamped to the
+    function by construction and a window can never reach into padding or a
+    neighbouring function however far it grows. `insns` items need only `ea`
+    and `size`, which keeps this rule testable without IDA.
+    """
+    n = len(insns)
+    if not 0 <= xidx < n:
+        return []
+
+    def span(a, b):
+        return insns[b - 1]["ea"] + insns[b - 1]["size"] - insns[a]["ea"]
+
+    specs = []
+    a = xidx
+    while a >= 0 and span(a, xidx + 1) <= max_bytes:
+        b = xidx + 1
+        while b <= n and span(a, b) <= max_bytes:
+            specs.append((a, b))
+            b += 1
+        a -= 1
+
+    # Shortest first, so the first unique window found is the smallest one --
+    # the same preference `windows.window_ladder` encodes for the modes whose
+    # pattern starts at the anchor.
+    specs.sort(key=lambda ab: (span(ab[0], ab[1]), ab[0]))
+    return specs
 
 
 def value_min_exact(total_bytes):

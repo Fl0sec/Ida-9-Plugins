@@ -19,6 +19,7 @@ from cfs5 import api
 | `export_list(path, function_names=[], global_names=[], ...)` | explicit list, ignores the set |
 | `declare_members(members_=[], discovery="sites_only")` | declare `member_offset` values |
 | `declare_strides(strides=[])` | declare `element_stride` constants |
+| `declare_constants(constants=[])` | declare `constant` values (bit positions, sentinels) |
 | `undeclare(names=[])` | remove declarations by `"Owner::name"` |
 | `declarations()` | every declaration + how it resolves now |
 
@@ -98,7 +99,7 @@ candidate carrying the function's confirm signature. Prefix strings, unrelated
 unreferenced copies, inverted argument registers, and tail-call table entries
 are handled by the same rule.
 
-## Members and strides
+## Members, strides and constants
 
 ```python
 api.declare_members([
@@ -110,6 +111,10 @@ api.declare_strides([
     {"owner": "CMeshDrawPrimitive", "name": "kStride", "value": 0x30,
      "sites": [{"ea": 0x5678, "op": 1}]},
 ])
+api.declare_constants([
+    {"owner": "CEntityIdentityFlags", "name": "kModelChangeBlockedBit",
+     "value": 0x6, "sites": [{"ea": 0x9ABC, "op": 1}]},
+])
 ```
 
 **Sites are evidence locations, never values.** You say where to look; the
@@ -120,17 +125,76 @@ Sites exist because **correct pointer typing does not guarantee IDA member
 xrefs** — a heap-backed object can yield none however well typed it is, so
 automatic discovery can legitimately find nothing.
 
-| | `member_offset` | `element_stride` |
+| | `member_offset` | `element_stride` / `constant` |
 |---|---|---|
 | value from | the IDA field | you assert it |
 | sites | optional | **required** |
 | discovery | `sites_only` (default) / `sites_plus_auto` / `auto` | never |
 | a site decoding another value | that candidate is dropped | **whole declaration rejected** |
 
-`element_stride` is weaker on purpose: nothing in the database associates an
-instruction with "the stride of this array", so the sites are the only
-evidence and a contradiction among them is fatal. `owner` is a namespace
-there, not a claim that the type has such a field.
+`element_stride` and `constant` are weaker on purpose: nothing in the database
+associates an instruction with "the stride of this array" or "this bit
+position", so the sites are the only evidence and a contradiction among them is
+fatal. `owner` is a namespace there, not a claim that the type has such a
+field. The two differ only in what a consumer does with the number — use
+`constant` for a value that is not a size or a stride, such as a bit position
+tested by `bt reg, 6` or a sentinel compared against a field.
+
+### `value_adjust`
+
+`value_adjust` is what a consumer **adds** to the number the instruction
+encodes, for a site that reaches the field through a subobject base:
+
+```
+reported = encoded_at_site + value_adjust
+```
+
+So the exporter looks for `reported - value_adjust` at the site, where
+`reported` is the IDA member offset (or the asserted value). Declare the
+adjustment that makes that true and nothing else — for `lea rdi, [rcx+8]`
+reaching a member IDA places at `0x10`, `value_adjust` is `+8`.
+
+### What value to assert
+
+**The asserted value is what the extraction recipe produces**, which is the
+field read at its encoded width with the candidate's `signed` flag — not
+necessarily what IDA prints for the operand. The two differ for a
+sign-extended immediate:
+
+| site | encodes | IDA shows | assert |
+|---|---|---|---|
+| `cmp r8d, 0FFFFFFFFh` (`41 83 F8 FF`) | one byte, `FF` | `0xFFFFFFFF` | `-1` |
+| `add rax, 30h` (`48 83 C0 30`) | one byte, `30` | `0x30` | `0x30` |
+| `bt eax, 0Bh` (`0F BA E0 0B`) | one byte, `0B` | `0xB` | `0xB` |
+
+Only the first is ambiguous, and both spellings describe the same 32 bits —
+but only the signed reading is what a consumer computes, so asserting
+`0xFFFFFFFF` is refused with `extraction_recipe_reproduces_a_different_value`
+rather than exported. Exporting it would publish an `expected_value` the
+consumer can never reproduce, and it would read as image drift forever, on the
+image it was built from.
+
+### When a derived value is not exported
+
+Four distinct refusals, never one shared sentence — the one you get tells you
+which thing to fix:
+
+| Message | Meaning |
+|---|---|
+| `MEMBER_NO_FIELD` | the declaration names a field this database no longer has |
+| `MEMBER_NO_SITE` | nothing produced a site: none declared, none discovered |
+| `MEMBER_NO_PATTERN` | sites were tested and none yielded a candidate; each site's reason is listed |
+| ↳ `site_is_ambiguous_at_every_window_length` | proven, not assumed: even the widest window matches twice. Pick another site |
+| ↳ `unique_only_in_a_window_longer_than_48_bytes` | the evidence is there but not exportable — raise `MAX_PATTERN_BYTES` or pick a site in a less repetitive function |
+| ↳ `no_window_cleared_the_exact_byte_floor` | too few concrete bytes around the site (`VALUE_MIN_EXACT_BYTES`) |
+| ↳ `gave_up_after_48_uniqueness_probes` | the only one of the four that is a limitation of the exporter |
+| ↳ `extraction_recipe_reproduces_a_different_value` | see *What value to assert* above |
+| `MEMBER_DISCARDED` | candidates existed and every one decoded a different value, each listed |
+
+`MEMBER_FLAKY_FIRST_PASS` is not a refusal: the first generation pass produced
+no candidate and an identical second one did. The item **is** exported. It means
+the first answer was wrong, not the declaration — report it rather than
+re-declaring anything.
 
 `merge`: `"append"` refreshes re-exported items and keeps the rest;
 `"replace"` discards the file. Append is refused across a different image or

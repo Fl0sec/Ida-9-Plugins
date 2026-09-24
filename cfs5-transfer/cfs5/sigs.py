@@ -34,11 +34,13 @@ from .disasm import (
     infer_immediate_field,
     infer_pc_relative_field,
     pattern_tokens_for_insn,
+    recipe_value,
 )
 from .members import decode_at, member_reference_sites, operand_displacement
 from .policy import (
     CLONE_COUNT_LIMIT,
     MAX_PATTERN_BYTES,
+    MAX_UNIQUE_PROBES,
     MAX_XREFS_TO_SEARCH,
     XREF_EARLY_STOP_AFTER,
     AXIS_BODY,
@@ -47,6 +49,8 @@ from .policy import (
     AXIS_VTABLE,
     AXIS_STRING_REL,
     Candidate,
+    ENVELOPE_WORTH_PROBES,
+    anchored_window_specs,
     FunctionSearch,
     ORIGIN_DATA_REF,
     ORIGIN_ENTRY,
@@ -78,18 +82,41 @@ from .windows import (
     window_stats,
 )
 
-def _unique_window_around(insns, xidx, ranges, min_exact=None):
-    """Shortest source-unique window that contains instruction `xidx`.
+# Why no window around an anchor produced a pattern. Four unrelated situations
+# that used to print one sentence. "Nothing was even eligible", "the site is
+# genuinely ambiguous", "a unique window exists but is too long to export" and
+# "we stopped looking" each need a different response from whoever reads the
+# log, and only the last one is a limitation of this code.
+WINDOW_BELOW_EXACT_FLOOR = "no_window_cleared_the_exact_byte_floor"
+WINDOW_NOT_UNIQUE = "site_is_ambiguous_at_every_window_length"
+WINDOW_ABOVE_BYTE_LIMIT = (
+    "unique_only_in_a_window_longer_than_%d_bytes" % MAX_PATTERN_BYTES
+)
+WINDOW_PROBE_LIMIT = "gave_up_after_%d_uniqueness_probes" % MAX_UNIQUE_PROBES
+
+
+def _unique_window_around(insns, xidx, ranges, min_exact=None, specs=None):
+    """(shortest source-unique window containing `xidx`, or None), reason.
 
     Shared by every anchored mode (REL and VALUE): both need the smallest
     pattern that still pins one site, around an instruction whose interesting
     field has already been wildcarded. `min_exact` is the floor to apply --
     REL and VALUE wildcard very different amounts, so they do not share one.
+
+    `specs` is the set of windows to consider. VALUE passes the byte-bounded
+    enumeration; REL keeps its original instruction ladder, because widening it
+    would re-pick patterns for every already-exported function -- a large
+    unvalidated change to fix a defect that only shows up on short anchors.
     """
     if min_exact is None:
         min_exact = candidate_min_exact
+    if specs is None:
+        specs = _xref_window_specs(xidx, len(insns))
+    if not specs:
+        return None, WINDOW_BELOW_EXACT_FLOOR
+
     possibilities = []
-    for a, b in _xref_window_specs(xidx, len(insns)):
+    for a, b in specs:
         stats = window_stats(insns, a, b)
         if stats is None or stats["byte_len"] > MAX_PATTERN_BYTES:
             continue
@@ -97,11 +124,51 @@ def _unique_window_around(insns, xidx, ranges, min_exact=None):
             continue
         possibilities.append(stats)
 
+    if not possibilities:
+        return None, WINDOW_BELOW_EXACT_FLOOR
+
+    # Uniqueness is monotone under containment: if a window matches in two
+    # places then so does every window inside it, because a shorter pattern
+    # matches wherever the longer one does. So one probe of the envelope --
+    # the window spanning every candidate, which may itself be too long to
+    # export -- either proves the whole site ambiguous or proves a unique
+    # window is in there somewhere. That turns the expensive case (a site that
+    # cannot be pinned) from one image-wide search per candidate window into
+    # exactly one, and upgrades the answer from "we tried and stopped" to a
+    # fact.
+    # Spending it is only worth it when there are more candidate windows than
+    # the envelope probe costs, which is why the modes on the short fixed
+    # ladder skip it and keep both their behaviour and their cost unchanged.
+    envelope_unique = False
+    if len(possibilities) > ENVELOPE_WORTH_PROBES:
+        envelope = window_stats(
+            insns, min(a for a, _b in specs), max(b for _a, b in specs)
+        )
+        if envelope is not None:
+            if len(find_up_to_two(envelope["signature"], ranges)) != 1:
+                return None, WINDOW_NOT_UNIQUE
+            envelope_unique = True
+
     possibilities.sort(key=lambda s: (s["byte_len"], s["wildcards"]))
+
+    probes = 0
+    seen_signatures = set()
     for stats in possibilities:
+        if stats["signature"] in seen_signatures:
+            continue
+        seen_signatures.add(stats["signature"])
+        if probes >= MAX_UNIQUE_PROBES:
+            return None, WINDOW_PROBE_LIMIT
+        probes += 1
         if len(find_up_to_two(stats["signature"], ranges)) == 1:
-            return stats
-    return None
+            return stats, None
+
+    # A unique envelope with nothing exportable unique means the evidence
+    # exists but only in a pattern longer than a candidate may carry -- a
+    # tuning answer (raise MAX_PATTERN_BYTES, or pick a site in a less
+    # repetitive function), not an ambiguous site. Without the envelope probe
+    # the two are indistinguishable, so say the weaker thing.
+    return None, WINDOW_ABOVE_BYTE_LIMIT if envelope_unique else WINDOW_NOT_UNIQUE
 
 
 def _longest_window_matches(insns, start_idx, ranges):
@@ -476,7 +543,7 @@ def find_rel_candidate_for_xref(
     )
     insns[xidx]["insn"] = xinsn
 
-    stats = _unique_window_around(insns, xidx, ranges)
+    stats, _why = _unique_window_around(insns, xidx, ranges)
     if stats is None:
         return None
 
@@ -557,13 +624,34 @@ def collect_rel_candidates(
 # VALUE -- integers extracted from an instruction field
 # ---------------------------------------------------------------------------
 
+# Why one site produced no candidate. A caller collects these per site so a
+# refusal can say which stage rejected the evidence: "nothing encodes the
+# number" and "the pattern was not unique" are completely different problems
+# with completely different fixes, and one shared message hides both.
+REJECT_NO_DECODE = "site_did_not_decode"
+REJECT_NO_FIELD = "no_operand_encodes_the_value"
+REJECT_WRONG_OPERAND = "value_is_not_in_the_declared_operand"
+REJECT_NO_FUNCTION = "site_is_not_inside_a_function"
+# The extraction recipe would not reproduce the declared value. Almost always a
+# sign-extended immediate asserted at the operand's width (`0xFFFFFFFF`) where
+# the recipe yields the signed reading (`-1`) -- assert the latter.
+REJECT_RECIPE_DISAGREES = "extraction_recipe_reproduces_a_different_value"
+REJECT_SITE_NOT_IN_CHUNK = "site_is_not_an_instruction_start"
+# Fallback only. The window search reports which of its three outcomes fired
+# (`WINDOW_*` below) and that reason is used in preference to this one.
+REJECT_NO_UNIQUE_WINDOW = "no_unique_pattern_around_the_site"
+
+
 def find_value_candidate_for_site(
-    site_ea, encoded_value, ranges, origin, op_hint=None, value_adjust=0
+    site_ea, encoded_value, ranges, origin, op_hint=None, value_adjust=0,
+    reasons=None,
 ):
     """A VALUE Candidate anchored at `site_ea` whose field holds `encoded_value`.
 
     `encoded_value` is what the instruction must literally encode -- for a
-    member, the offset IDA has for the field. The value a consumer reports is
+    member, the offset IDA has for the field *minus* any `value_adjust`; see
+    `declare.Declaration.site_value`, which is the one place that arithmetic
+    lives. The value a consumer reports is
     `encoded_value + value_adjust`, which is how a declaration asks for an
     answer relative to something other than the field's own container.
 
@@ -579,9 +667,14 @@ def find_value_candidate_for_site(
     inferred field must belong to it, otherwise the candidate describes a
     different access than the one that was declared.
     """
+    def _reject(reason):
+        if reasons is not None:
+            reasons[int(site_ea)] = reason
+        return None
+
     insn = decode_at(site_ea)
     if insn is None:
-        return None
+        return _reject(REJECT_NO_DECODE)
 
     encoded = int(encoded_value)
     const_extract = None
@@ -600,13 +693,13 @@ def find_value_candidate_for_site(
         # zero, which encodes nothing at all.
         const_extract = _zero_offset_extract(insn, encoded, op_hint)
         if const_extract is None:
-            return None
+            return _reject(REJECT_NO_FIELD)
     elif op_hint is not None and field["operand_index"] != int(op_hint):
-        return None
+        return _reject(REJECT_WRONG_OPERAND)
 
     chunk = ida_funcs.get_fchunk(site_ea)
     if chunk is None:
-        return None
+        return _reject(REJECT_NO_FUNCTION)
     insns = decode_chunk(chunk.start_ea, chunk.end_ea)
     xidx = None
     for i, item in enumerate(insns):
@@ -614,7 +707,16 @@ def find_value_candidate_for_site(
             xidx = i
             break
     if xidx is None:
-        return None
+        return _reject(REJECT_SITE_NOT_IN_CHUNK)
+
+    # The recipe this candidate will publish has to produce the number the
+    # candidate claims. Checked here, before any of the expensive window work:
+    # `source.expected_value` comes from the decoder's operand and the consumer
+    # computes from the raw bytes, so the two can disagree -- and a
+    # disagreement would surface only as permanent phantom drift on the
+    # consumer's side, blamed on the image rather than on the export.
+    if field is not None and recipe_value(insn, field) != encoded:
+        return _reject(REJECT_RECIPE_DISAGREES)
 
     if field is not None:
         # Wildcard exactly the extracted field and nothing else.
@@ -623,9 +725,12 @@ def find_value_candidate_for_site(
         )
         insns[xidx]["insn"] = insn
 
-    stats = _unique_window_around(insns, xidx, ranges, min_exact=value_min_exact)
+    stats, why = _unique_window_around(
+        insns, xidx, ranges, min_exact=value_min_exact,
+        specs=anchored_window_specs(insns, xidx),
+    )
     if stats is None:
-        return None
+        return _reject(why or REJECT_NO_UNIQUE_WINDOW)
 
     insn_offset = site_ea - stats["start_ea"]
     if const_extract is not None:
@@ -687,8 +792,13 @@ def _zero_offset_extract(insn, encoded, op_hint):
 
 def choose_value_candidates(encoded_value, ranges, selected_sites=(),
                             ref=None, allow_scan=True, value_adjust=0,
-                            sibling_offsets=None):
+                            sibling_offsets=None, reasons=None):
     """Ranked VALUE candidates for one derived value.
+
+    `encoded_value` is the number the *instruction* must encode, which for a
+    non-zero `value_adjust` is not the value that gets exported. Callers must
+    go through `declare.Declaration.site_value` rather than passing the IDA
+    member offset directly.
 
     Sites come from exactly three producers of a *type-directed* association,
     and a consumer can tell which by the candidate's `origin`:
@@ -712,6 +822,10 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
     not widen what is accepted -- only which functions are worth decompiling.
     Without it a common offset like `+0x10` selects tens of thousands of
     functions and the sample never reaches the right ones.
+
+    `reasons` is an optional dict filled with `{site_ea: REJECT_*}` for every
+    site that produced nothing, so a caller can report *why* rather than only
+    that it found nothing.
 
     Returns (candidates, coverage, total_sites, searched_sites).
     """
@@ -746,10 +860,13 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
         try:
             cand = find_value_candidate_for_site(
                 site_ea, encoded_value, ranges, origin,
-                op_hint=op_hint, value_adjust=value_adjust,
+                op_hint=op_hint, value_adjust=value_adjust, reasons=reasons,
             )
-        except Exception:
-            # One odd instruction must not cost the whole member.
+        except Exception as exc:
+            # One odd instruction must not cost the whole member -- but say so,
+            # or an exception here is indistinguishable from a clean refusal.
+            if reasons is not None:
+                reasons[int(site_ea)] = "exception: %s" % exc
             continue
         if cand is not None:
             found.append(cand)
@@ -759,12 +876,18 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
 
 
 def choose_member_candidates(ref, ranges, selected_sites=(), value_adjust=0,
-                             sibling_offsets=None, allow_scan=True):
-    """VALUE candidates for a structure member, whose value IDA supplies."""
+                             sibling_offsets=None, allow_scan=True,
+                             reasons=None):
+    """VALUE candidates for a structure member, whose value IDA supplies.
+
+    IDA supplies the value a consumer must *report*; what the instruction
+    encodes is that minus `value_adjust`, which is what the site search needs.
+    """
     return choose_value_candidates(
-        ref.byte_offset, ranges, selected_sites=selected_sites, ref=ref,
+        ref.byte_offset - int(value_adjust), ranges,
+        selected_sites=selected_sites, ref=ref,
         allow_scan=allow_scan, value_adjust=value_adjust,
-        sibling_offsets=sibling_offsets,
+        sibling_offsets=sibling_offsets, reasons=reasons,
     )
 
 

@@ -170,9 +170,9 @@ Duplicate `id`, or a candidate naming an unknown `item`, is an error.
 | `constant` | an integer with no further structural meaning |
 
 A consumer **MUST reject** a `semantic` it does not know rather than guess at
-it. `member_offset` and `element_stride` are produced today; `object_extent`
-and `constant` are reserved so a consumer written now stays correct when they
-arrive.
+it. `member_offset`, `element_stride` and `constant` are produced today;
+`object_extent` is reserved so a consumer written now stays correct when it
+arrives.
 
 Resolution arithmetic is **identical for every semantic** — extract a field,
 get a number. The semantic says what the number *means*, not how to obtain it,
@@ -343,6 +343,17 @@ if op == DISP_PLUS_WIDTH:  value += access_width
 value += value_adjust
 if alignment > 1:          value = round_up(value, alignment)
 ```
+
+`value_adjust` is applied **exactly once, here, by the consumer.** A producer
+therefore has to invert it: it learns `source.expected_value` first (IDA
+supplies it) and must search the evidence site for
+`expected_value - value_adjust`, which is what the instruction actually
+encodes, then check the candidate's already-adjusted value against
+`expected_value` directly. Searching the site for `expected_value` itself finds
+nothing for a non-zero adjustment, and adding the adjustment a second time at
+the check refuses every candidate. Both were real defects; both are invisible
+to any test that only uses `value_adjust = 0`, where all three numbers
+coincide.
 
 Required checks, in addition to the single-unique-match rule of §6:
 

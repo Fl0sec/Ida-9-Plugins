@@ -251,6 +251,39 @@ def infer_displacement_field(insn, expected_value):
     return matches[0]
 
 
+def recipe_value(insn, field):
+    """The number a consumer gets by following `field`, or None.
+
+    The exported `resolve` block is a recipe -- read `field_size` bytes at
+    `field_offset`, signed or not -- and `source.expected_value` is the answer
+    it is supposed to produce. Those are computed from different things (the
+    decoder's operand value versus the raw encoded bytes), so they can
+    disagree, and a disagreement is invisible on this side: the consumer
+    resolves a number the file says is wrong and reports drift forever on an
+    image that never changed.
+
+    `cmp r8d, 0FFFFFFFFh` (`41 83 F8 FF`) is the case that makes this real. The
+    decoder reports the operand as `0xFFFFFFFF`, sign-extended from the single
+    encoded byte; the recipe reads one signed byte and gets `-1`. Both describe
+    the same 32 bits and neither is wrong, but they are not the same integer,
+    and only one of them is what the consumer will compute.
+
+    So the exporter checks the recipe against the operand rather than trusting
+    that they agree. This function is that check's left-hand side.
+    """
+    raw = ida_bytes.get_bytes(insn.ea, insn.size)
+    if raw is None or len(raw) != insn.size:
+        return None
+
+    offset = int(field["field_offset"])
+    size = int(field["field_size"])
+    if offset < 0 or size <= 0 or offset + size > insn.size:
+        return None
+
+    value = int.from_bytes(raw[offset:offset + size], byteorder="little")
+    return signed_le(value, size) if field.get("signed", True) else value
+
+
 def immediate_operands(insn):
     """Operand indices of `insn` that carry an immediate."""
     out = []
@@ -291,7 +324,19 @@ def infer_immediate_field(insn, expected_value):
     for i in immediate_operands(insn):
         op = insn.ops[i]
         value = int(op.value)
-        if value != expected and signed_le(value, 8) != expected:
+        # Also accept the operand read signed at *its own* width. `cmp r8d,
+        # 0FFFFFFFFh` decodes to 0xFFFFFFFF, and a declaration asserting -1 for
+        # it is asserting the same 32 bits -- which is the value the extraction
+        # recipe will produce, so refusing it here would refuse the only
+        # spelling that stays consistent end to end.
+        try:
+            width = int(ida_ua.get_dtype_size(op.dtype))
+        except Exception:
+            width = 0
+        readings = {value, signed_le(value, 8)}
+        if width in (1, 2, 4, 8):
+            readings.add(signed_le(value, width))
+        if expected not in readings:
             continue
 
         offb = int(op.offb)

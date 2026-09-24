@@ -774,6 +774,26 @@ class ResolveValueTests(unittest.TestCase):
         )
         self.assertEqual(value, -128)
 
+    def test_a_sign_extended_immediate_resolves_to_the_signed_reading(self):
+        """`cmp r8d, 0FFFFFFFFh` -- `41 83 F8 FF`, one encoded byte.
+
+        IDA decodes the operand as `0xFFFFFFFF`; the recipe reads one signed
+        byte and gets `-1`. Both describe the same 32 bits, but only one of them
+        is what a consumer computes, so that is the one a declaration must
+        assert. An `expected_value` of `0xFFFFFFFF` against this candidate would
+        be a permanent phantom drift report on an image that never changed,
+        which is why `sigs` refuses to build such a candidate at all.
+        """
+        data = bytes([0x41, 0x83, 0xF8, 0xFF])
+        value, error = _resolve(
+            {"op": "IMM", "instruction_offset": 0, "field_offset": 3,
+             "field_size": 1, "operand_index": 1, "signed": True},
+            data, pattern="41 83 F8 ?",
+        )
+        self.assertIsNone(error)
+        self.assertEqual(value, -1)
+        self.assertNotEqual(value, 0xFFFFFFFF)
+
     def test_an_unknown_op_is_refused_rather_than_guessed(self):
         value, error = _resolve(
             dict(self.BASE, op="SCALE"),

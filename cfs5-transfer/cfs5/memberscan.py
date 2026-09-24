@@ -420,14 +420,34 @@ def _rank_functions(owner, offsets):
 # Only *complete* scans land here. Caching a cancelled or failed one would
 # turn a transient problem into a permanent empty answer for the whole session,
 # and -- because a cache hit produced no output -- an invisible one.
+#
+# {(owner, index_key): {"asked": set(offsets), "found": {offset: [ea, ...]}}}
+#
+# `asked` exists because the key does not carry the offsets. Without it a scan
+# for one member answers a later call about a *different* member of the same
+# structure with "not confirmed" -- a cached answer to a question that was
+# never asked. `found` accumulates: a site confirmed by any pass stays
+# confirmed, so a later pass can only ever add evidence, never retract it.
 _struct_cache = {}
+
+
+def _merge_into_cache(key, asked, found):
+    entry = _struct_cache.setdefault(key, {"asked": set(), "found": {}})
+    entry["asked"].update(asked)
+    for offset, eas in found.items():
+        merged = set(entry["found"].get(offset, ()))
+        merged.update(eas)
+        entry["found"][offset] = sorted(merged)
+    return entry
 
 
 def scan_struct(owner, offsets, force=False):
     """{byte_offset: [ea, ...]} confirmed by the decompiler for `owner`.
 
     One ranked pass over the structure, cached. Every member benefits from
-    every decompile, so asking for a second member after the first is free.
+    every decompile, so asking for a second member after the first is free --
+    but only for an offset the cached pass actually looked for, which is why
+    the cache records what it was asked.
     """
     if not ida_hexrays.init_hexrays_plugin():
         msg("MEMBERSCAN: Hex-Rays unavailable; only legacy xrefs will be used")
@@ -444,18 +464,29 @@ def scan_struct(owner, offsets, force=False):
         return {}
 
     key = (owner, _index_key)
-    if not force and key in _struct_cache:
-        cached = _struct_cache[key]
-        msg("MEMBERSCAN: %s -- reusing cached scan (%d member(s) confirmed)"
-            % (owner, len(cached)))
-        return cached
+    cached = _struct_cache.get(key)
+    if not force and cached is not None and wanted <= cached["asked"]:
+        msg("MEMBERSCAN: %s -- reusing cached scan (%d member(s) confirmed of "
+            "%d asked)"
+            % (owner, len(cached["found"]), len(cached["asked"])))
+        return dict(cached["found"])
+
+    if cached is not None and not force:
+        # Some offset in this request was never looked for. Rescan for the
+        # union so one pass answers both, rather than reporting "not
+        # confirmed" for a member nothing ever searched.
+        missing = sorted(wanted - cached["asked"])
+        msg("MEMBERSCAN: %s -- cached scan did not cover %d offset(s) "
+            "(%s); rescanning for the union"
+            % (owner, len(missing),
+               ", ".join("+0x%X" % o for o in missing[:8])))
+        wanted = wanted | cached["asked"]
 
     ranked, total_sites = _rank_functions(owner, wanted)
     if not ranked:
         msg("MEMBERSCAN: %s -- nothing is typed against it and no instruction "
             "encodes any of its %d member offset(s)" % (owner, len(wanted)))
-        _struct_cache[key] = {}
-        return {}
+        return dict(_merge_into_cache(key, wanted, {})["found"])
 
     found = {}
     examined = 0
@@ -500,9 +531,15 @@ def scan_struct(owner, offsets, force=False):
         % (owner, total_sites, len(ranked), examined, seeds_done, len(result),
            len(wanted),
            " (CANCELLED -- partial, not cached)" if cancelled else ""))
-    if not cancelled:
-        _struct_cache[key] = result
-    return result
+    if cancelled:
+        return result
+
+    # Merge rather than replace. A pass that confirmed fewer sites than an
+    # earlier one has not disproved anything -- Hex-Rays results depend on what
+    # else has been decompiled -- so the union is the honest answer and it makes
+    # a second export at least as complete as the first.
+    entry = _merge_into_cache(key, wanted, result)
+    return dict(entry["found"])
 
 
 def discover_member_sites(ref, exclude=(), offsets=None):

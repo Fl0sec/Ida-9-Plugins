@@ -476,29 +476,66 @@ def declare_strides(strides=()):
 
     `owner` is a namespace here, not a claim that the type has such a field.
     """
+    return _declare_asserted(strides, "stride", declare.make_stride)
+
+
+def declare_constants(constants=()):
+    """Declare `constant` values: a number that exists only in the code.
+
+    Each entry is a dict, same shape as a stride:
+
+        {"owner": "CEntityIdentityFlags", "name": "kModelChangeBlockedBit",
+         "value": 0x6, "sites": [{"ea": 0x1234, "op": 1}, ...]}
+
+    For a number that is not an offset and has no owning IDA field: a bit
+    position tested by `bt reg, 6`, a sentinel compared against a field. The
+    gate is the same as a stride's -- you assert the value, every site must
+    decode exactly it, and there is no discovery, because nothing in the
+    database associates an instruction with "this constant" and another
+    instruction holding the same number would be coincidence, not evidence.
+
+    A small immediate is more likely than a member offset to sit in an
+    instruction whose surrounding bytes are not unique, and that refusal is
+    kept: a non-unique pattern resolves to nothing on the consumer's side, so
+    exporting it would publish a signature that cannot be used.
+
+    `owner` is a namespace here, not a claim that the type has such a field.
+    """
+    return _declare_asserted(constants, "constant", declare.make_constant)
+
+
+def _declare_asserted(entries, kind, make):
+    """Shared body for the semantics whose value the caller asserts.
+
+    A stride and a constant differ only in what a consumer does with the
+    number: same entry shape, same validation, same export gate. One
+    implementation keeps them from drifting apart for no reason.
+    """
     stored, unresolved = [], []
 
-    for entry in strides or ():
+    for entry in entries or ():
         try:
             owner, name = _split_qualified(entry, "name")
             if not isinstance(entry, dict):
                 raise declare.DeclarationError(
-                    "a stride needs a value and at least one site, so it "
-                    "cannot be declared by name alone"
+                    "a %s needs a value and at least one site, so it cannot "
+                    "be declared by name alone" % kind
                 )
             if entry.get("value") is None:
-                raise declare.DeclarationError("a stride must assert a 'value'")
-            decl = declare.make_stride(
+                raise declare.DeclarationError(
+                    "a %s must assert a 'value'" % kind
+                )
+            decl = make(
                 owner, name, entry["value"], entry.get("sites", ()),
                 value_adjust=entry.get("value_adjust", 0),
             )
         except declare.DeclarationError as exc:
-            unresolved.append({"kind": "stride", "name": str(entry),
+            unresolved.append({"kind": kind, "name": str(entry),
                                "reason": str(exc)})
             continue
 
         if not store.save(decl):
-            unresolved.append({"kind": "stride", "name": decl.qualified,
+            unresolved.append({"kind": kind, "name": decl.qualified,
                                "reason": "could not be stored in the IDB"})
             continue
         stored.append(decl.qualified)
@@ -506,8 +543,8 @@ def declare_strides(strides=()):
     ok, partial = registry.outcome(
         len(stored) + len(unresolved), len(stored), unresolved
     )
-    msg("API: declared %d stride(s), %d unresolved"
-        % (len(stored), len(unresolved)))
+    msg("API: declared %d %s(s), %d unresolved"
+        % (len(stored), kind, len(unresolved)))
     return _result(ok=ok, partial=partial, unresolved=unresolved,
                    declared=len(stored), declared_names=sorted(stored))
 
@@ -548,6 +585,7 @@ def declarations():
             "sites": [{"ea": ea_str(ea), "op": op} for ea, op in decl.sites],
             "discovery": decl.discovery,
             "asserted_value": decl.asserted_value,
+            "value_adjust": decl.value_adjust,
         }
         if decl.needs_ida_member:
             ref = _members.lookup_member(decl.owner, decl.member)
