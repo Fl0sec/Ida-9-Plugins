@@ -40,6 +40,7 @@ from . import export as _export
 from . import members as _members
 from . import registry
 from . import rtti
+from . import strloc
 from . import store
 from .common import BADADDR, ea_str, get_search_ranges, msg
 from .image import detect_build
@@ -133,6 +134,19 @@ def _verify_locators(locators, func_ea):
     """
     out = []
     for locator in locators or ():
+        if locator.get("kind") == registry.LOCATOR_ANCHOR_STRING:
+            try:
+                evidence = strloc.resolve_anchor_string(locator["string"])
+            except Exception as exc:
+                out.append((locator, "anchor string lookup failed: %s" % exc))
+                continue
+            if evidence["function_ea"] != func_ea:
+                out.append((locator, "anchor string resolves to %s, not %s" % (
+                    ea_str(evidence["function_ea"]), ea_str(func_ea)
+                )))
+            else:
+                out.append((locator, None))
+            continue
         if locator.get("kind") != registry.LOCATOR_VTABLE:
             out.append((locator, "unknown locator kind %r" % locator.get("kind")))
             continue

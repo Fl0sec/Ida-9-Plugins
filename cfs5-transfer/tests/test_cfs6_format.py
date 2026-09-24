@@ -8,7 +8,7 @@ import unittest
 import _support
 from _support import (
     body_candidate, entry_candidate, header_line, rel_candidate, write_cfs6,
-    vtable_candidate, write_lines,
+    string_rel_candidate, vtable_candidate, write_lines,
 )
 
 from cfs5 import cfs6
@@ -28,6 +28,18 @@ class Cfs6TempFileCase(unittest.TestCase):
 
 
 class TestRoundTrip(Cfs6TempFileCase):
+    def test_string_rel_candidate_round_trip(self):
+        cand = string_rel_candidate()
+        write_cfs6(self.path, [(cfs6.REC_FUNCTION, "popup", [cand])])
+        loaded = self.load()
+        self.assertEqual(loaded.parse_errors, 0)
+        got = loaded.functions()[0].candidates[0]
+        self.assertEqual(got.mode, cfs6.MODE_STRING_REL)
+        self.assertEqual(got.anchor_string, "ShowGenericPopupOk")
+        self.assertEqual(got.resolve["string_match"], "nul_terminated_exact")
+        self.assertEqual(got.resolve["window_bound"], "pdata_chunk")
+        self.assertEqual(got.image_matches, 8)
+
     def test_vtable_candidate_round_trip(self):
         cand = vtable_candidate()
         write_cfs6(self.path, [(cfs6.REC_FUNCTION, "notify", [cand])])
@@ -332,6 +344,29 @@ class TestValidation(Cfs6TempFileCase):
         loaded = self.load()
         self.assertEqual(loaded.parse_errors, 1)
         self.assertIn("cannot belong", " ".join(self.logged))
+
+    def test_string_rel_validation(self):
+        resolve = {
+            "string": "ShowGenericPopupOk",
+            "string_match": "nul_terminated_exact",
+            "window_bytes": 128,
+            "window_bound": "pdata_chunk",
+            "confirm_offset": 0,
+            "function_size": 10,
+            "scan_bound": "pdata_chain",
+            "tokenization": "relaxed",
+            "image_matches": 8,
+        }
+        line = ('{"record":"candidate","item":"fn:a","rank":0,'
+                '"mode":"STRING_REL","pattern":"90","origin":"anchor_string",'
+                '"resolve":%s}')
+        for field, value in (("string", ""), ("window_bytes", 64),
+                             ("window_bound", "function")):
+            bad = dict(resolve)
+            bad[field] = value
+            loaded = self._item_and(line % json.dumps(bad))
+            self.assertEqual(loaded.parse_errors, 1)
+            self.logged.clear()
 
     def test_pattern_is_normalized(self):
         loaded = self._item_and(

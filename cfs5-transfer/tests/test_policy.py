@@ -43,6 +43,42 @@ class TestAxes(unittest.TestCase):
         )
         self.assertEqual(data.axis, "external_rel")
 
+    def test_string_handler_selection_is_structural(self):
+        handler = {"ea": 2, "mnemonic": "lea", "target": 0x2000,
+                   "target_executable": True, "register": "r8"}
+        data = {"ea": 1, "mnemonic": "lea", "target": 0x9000,
+                "target_executable": False, "register": "rdx"}
+        tail = {"ea": 3, "mnemonic": "jmp", "target_executable": True}
+        got, reason = policy.select_handler_lea([data, handler, tail])
+        self.assertIs(got, handler)
+        self.assertEqual(reason, "")
+
+        got, _ = policy.select_handler_lea([data, tail])
+        self.assertIsNone(got)
+        got, _ = policy.select_handler_lea([
+            handler,
+            {"ea": 4, "mnemonic": "lea", "target_executable": True},
+        ])
+        self.assertIsNone(got)
+
+        # Register inversion and a jmp-terminated entry do not change the rule.
+        inverted = dict(handler, register="rdx")
+        got, _ = policy.select_handler_lea([inverted, data, tail])
+        self.assertEqual(got["target"], 0x2000)
+
+    def test_string_handler_is_bounded_by_registration_terminators(self):
+        facts = [
+            {"ea": 10, "mnemonic": "lea", "target_executable": True},
+            {"ea": 20, "mnemonic": "call", "terminator": True},
+            {"ea": 30, "mnemonic": "lea", "target": 0x3000,
+             "target_executable": True},
+            {"ea": 40, "mnemonic": "lea", "target_executable": False},
+            {"ea": 50, "mnemonic": "jmp", "terminator": True},
+            {"ea": 60, "mnemonic": "lea", "target_executable": True},
+        ]
+        got, _ = policy.select_handler_lea(facts, xref_ea=40)
+        self.assertEqual(got["target"], 0x3000)
+
     def test_body_origin_for_position(self):
         self.assertEqual(policy.body_origin_for_position(0, 3), "body_early")
         self.assertEqual(policy.body_origin_for_position(1, 3), "body_middle")

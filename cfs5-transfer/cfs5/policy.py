@@ -45,6 +45,7 @@ ORIGIN_STROFF_XREF = cfs6.ORIGIN_STROFF_XREF
 ORIGIN_SELECTED_OPERAND = cfs6.ORIGIN_SELECTED_OPERAND
 ORIGIN_HEXRAYS_MEMPTR = cfs6.ORIGIN_HEXRAYS_MEMPTR
 ORIGIN_RTTI_VTABLE_SLOT = cfs6.ORIGIN_RTTI_VTABLE_SLOT
+ORIGIN_ANCHOR_STRING = cfs6.ORIGIN_ANCHOR_STRING
 
 # Resolution axes an item can be covered by.
 AXIS_ENTRY = "entry"
@@ -56,14 +57,16 @@ AXIS_VALUE = "value"
 # axis by construction, which is the entire reason it exists. A function whose
 # prologue, callers and body all fail can still be covered here.
 AXIS_VTABLE = "vtable"
+AXIS_STRING_REL = "string_rel"
 
-_MODE_ORDER = {"ENTRY": 0, "REL": 1, "BODY": 2, "VALUE": 3, cfs6.MODE_VTABLE: 4}
+_MODE_ORDER = {"ENTRY": 0, "REL": 1, "BODY": 2, "VALUE": 3,
+               cfs6.MODE_VTABLE: 4, cfs6.MODE_STRING_REL: 5}
 # A locator is not scored against patterns -- it does not compete with them,
 # it covers a different axis -- but it still needs a defined penalty so the
 # total order stays deterministic. It sits last because when a pattern axis
 # does work, it needs no RTTI table to resolve.
 _MODE_PENALTY = {"ENTRY": 0, "REL": 12, "BODY": 18, "VALUE": 12,
-                 cfs6.MODE_VTABLE: 24}
+                 cfs6.MODE_VTABLE: 24, cfs6.MODE_STRING_REL: 24}
 
 
 def candidate_min_exact(total_bytes):
@@ -127,6 +130,36 @@ def confirm_min_exact(total_bytes):
     answers for a risk that is not being run.
     """
     return 0
+
+
+def select_handler_lea(instructions, xref_ea=None):
+    """(instruction, reason) under STRING_REL's executable-LEA rule.
+
+    Pure by design: register order, spacing, and whether the table entry ends
+    in call or jmp are irrelevant. Only the decoded target classification is
+    allowed to choose the handler.
+    """
+    bounded = list(instructions)
+    if xref_ea is not None:
+        before = [i for i, item in enumerate(bounded)
+                  if item.get("terminator") and item.get("ea", 0) < xref_ea]
+        after = [i for i, item in enumerate(bounded)
+                 if item.get("terminator") and item.get("ea", 0) >= xref_ea]
+        lo = (before[-1] + 1) if before else 0
+        hi = (after[0] + 1) if after else len(bounded)
+        bounded = bounded[lo:hi]
+
+    matches = [
+        item for item in bounded
+        if item.get("mnemonic", "").lower() == "lea"
+        and item.get("target_executable")
+        and (xref_ea is None or item.get("ea", xref_ea) < xref_ea)
+    ]
+    if not matches:
+        return None, "no LEA in the bounded registration entry targets executable memory"
+    if len(matches) != 1:
+        return None, "%d LEAs in the bounded registration entry target executable memory" % len(matches)
+    return matches[0], ""
 
 
 def rank_confirm_windows(windows):
@@ -219,6 +252,7 @@ class Candidate:
         "score", "anchor_ea", "func_ea", "func_size", "body_offset",
         "target_ea", "target_delta", "rel_offset", "rel_size", "base_offset",
         "insn_offset", "is_data", "ownership", "extract", "value", "locator",
+        "locator_source",
     )
 
     def __init__(
@@ -226,7 +260,7 @@ class Candidate:
         anchor_ea=0, func_ea=0, func_size=0, body_offset=0, target_ea=0,
         target_delta=0, rel_offset=0, rel_size=0, base_offset=0,
         insn_offset=0, is_data=False, ownership="pdata", extract=None,
-        value=None, locator=None,
+        value=None, locator=None, locator_source=None,
     ):
         self.mode = mode
         self.signature = cfs6.normalize_pattern(signature)
@@ -257,6 +291,7 @@ class Candidate:
         # pattern. Built by the finder from validated RTTI/string evidence;
         # the policy layer never invents or edits a field in it.
         self.locator = dict(locator or {})
+        self.locator_source = dict(locator_source or {})
 
         # Lower is better. Length dominates: once a pattern is source-unique,
         # shorter is usually less flaky across versions. Wildcards get only a
@@ -277,6 +312,8 @@ class Candidate:
             return AXIS_VALUE
         if self.mode == cfs6.MODE_VTABLE:
             return AXIS_VTABLE
+        if self.mode == cfs6.MODE_STRING_REL:
+            return AXIS_STRING_REL
         if self.origin == ORIGIN_SELF_CALL:
             return AXIS_SELF_REL
         return AXIS_EXTERNAL_REL
@@ -326,6 +363,12 @@ class Candidate:
             # Diagnostics only, like every other source RVA: a consumer finds
             # the table through RTTI, never at the address it had here.
             source["vtable_rva"] = rva(self.target_ea)
+        if self.mode == cfs6.MODE_STRING_REL:
+            for key in ("string_ea", "xref_ea", "handler_lea_ea"):
+                if key in self.locator_source:
+                    source[key.replace("_ea", "_rva")] = rva(
+                        self.locator_source[key]
+                    )
         return source
 
     def resolve_object(self):
@@ -611,6 +654,14 @@ def _diagnose_missing_axis(axis, facts):
             "detail": failure.get("detail", ""),
         }
 
+    if axis == AXIS_STRING_REL:
+        failure = facts.get("string_rel_failure")
+        if not failure:
+            return {"reason": WHY_NOT_DECLARED,
+                    "detail": "no anchor_string locator was declared"}
+        return {"reason": failure.get("reason", WHY_LOCATOR_UNRESOLVED),
+                "detail": failure.get("detail", "")}
+
     if axis == AXIS_BODY:
         near = facts.get("body_near_miss") or []
         if near:
@@ -674,7 +725,8 @@ class FunctionSearch:
     def failure_reason(self):
         """One line naming *which* axis failed and why, for a miss report."""
         parts = []
-        for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_SELF_REL, AXIS_BODY):
+        for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_SELF_REL, AXIS_BODY,
+                     AXIS_VTABLE, AXIS_STRING_REL):
             entry = self.diagnosis.get(axis)
             if entry is None or entry["reason"] in (
                 WHY_SELECTED, WHY_NOT_ATTEMPTED
@@ -688,7 +740,8 @@ class FunctionSearch:
     def explain(self):
         """The long form: every failed axis with its full detail."""
         lines = []
-        for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_SELF_REL, AXIS_BODY):
+        for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_SELF_REL, AXIS_BODY,
+                     AXIS_VTABLE, AXIS_STRING_REL):
             entry = self.diagnosis.get(axis)
             if entry is None or entry["reason"] in (
                 WHY_SELECTED, WHY_NOT_ATTEMPTED
@@ -710,7 +763,8 @@ def coverage_for(selected, attempted_axes):
     # A self-call REL still covers the external_rel axis in spirit, but the
     # distinction matters to a consumer, so report it honestly.
     coverage = {}
-    for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_BODY, AXIS_VTABLE):
+    for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_BODY, AXIS_VTABLE,
+                 AXIS_STRING_REL):
         if axis not in attempted_axes:
             coverage[axis] = cfs6.COV_NOT_APPLICABLE
         elif axis in found:

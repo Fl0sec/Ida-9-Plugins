@@ -80,6 +80,24 @@ read from the image, never IDA's demangled rendering.
 These locators are export-only. The IDA importer skips them; a non-IDA consumer
 implements the revision-2 algorithm in `cfs6-format.md`.
 
+## String-relative locators for functions
+
+```python
+api.register(function_names=[
+    {"name": "ui_toolkit_show_generic_popup_ok",
+     "anchor_string": "ShowGenericPopupOk"},
+])
+```
+
+The string is matched as exact UTF-8 bytes including its trailing NUL. The
+exporter examines only code references in bounded `.pdata` registration
+entries and accepts one structurally unique executable-targeting handler LEA;
+it never relies on a register or fixed name-to-handler distance. Registration
+verifies that handler is the named function, and export pins a `STRING_REL`
+candidate carrying the function's confirm signature. Prefix strings, unrelated
+unreferenced copies, inverted argument registers, and tail-call table entries
+are handled by the same rule.
+
 ## Members and strides
 
 ```python

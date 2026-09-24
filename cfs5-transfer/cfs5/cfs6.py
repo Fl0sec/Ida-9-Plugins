@@ -66,11 +66,12 @@ REC_LOCAL_TYPE = "local_type"
 ITEM_KINDS = (REC_FUNCTION, REC_GLOBAL, REC_DERIVED_VALUE)
 ADDRESS_ITEM_KINDS = (REC_FUNCTION, REC_GLOBAL)
 MODE_VTABLE = "VTABLE"
-MODES = ("ENTRY", "BODY", "REL", "VALUE", MODE_VTABLE)
+MODE_STRING_REL = "STRING_REL"
+MODES = ("ENTRY", "BODY", "REL", "VALUE", MODE_VTABLE, MODE_STRING_REL)
 # Modes that locate a function structurally instead of by a unique pattern.
 # Their `pattern` is a *confirm* signature: it is matched only inside the
 # already-located function, so it is not required to be image-unique.
-LOCATOR_MODES = (MODE_VTABLE,)
+LOCATOR_MODES = (MODE_VTABLE, MODE_STRING_REL)
 VALID_REL_WIDTHS = (1, 2, 4, 8)
 
 # ---------------------------------------------------------------------------
@@ -100,6 +101,10 @@ TOKENIZATIONS = (TOKENIZATION_STRICT, TOKENIZATION_RELAXED)
 # Where a VTABLE candidate came from.
 ORIGIN_RTTI_VTABLE_SLOT = "rtti_vtable_slot"
 VALID_VTABLE_ORIGINS = (ORIGIN_RTTI_VTABLE_SLOT,)
+ORIGIN_ANCHOR_STRING = "anchor_string"
+VALID_STRING_REL_ORIGINS = (ORIGIN_ANCHOR_STRING,)
+STRING_MATCH_NUL_EXACT = "nul_terminated_exact"
+WINDOW_BOUND_PDATA_CHUNK = "pdata_chunk"
 
 # A raw MSVC type descriptor, never a demangled name: `.?AVCCSPlayerInventory@@`
 # is in the image, `CCSPlayerInventory` is IDA's rendering of it.
@@ -376,6 +381,10 @@ class CandidateRecord:
         matches *within the scan range*, which is a different number entirely.
         """
         return int(self.resolve.get("image_matches", 0))
+
+    @property
+    def anchor_string(self):
+        return str(self.resolve.get("string", ""))
 
     @property
     def alignment(self):
@@ -923,6 +932,9 @@ def _parse_candidate(obj, line_no):
     elif mode == MODE_VTABLE:
         _validate_vtable_candidate(rec, line_no)
 
+    elif mode == MODE_STRING_REL:
+        _validate_string_rel_candidate(rec, line_no)
+
     return rec
 
 
@@ -981,6 +993,46 @@ def _validate_vtable_candidate(rec, line_no):
             "line %d: image_matches must be >= 1 (the signature matched at "
             "least where it was built), got %d" % (line_no, rec.image_matches)
         )
+
+
+def _validate_confirm_fields(rec, line_no):
+    if rec.confirm_offset < 0:
+        raise ValueError(
+            "line %d: confirm_offset must be >= 0, got %d"
+            % (line_no, rec.confirm_offset)
+        )
+    if rec.scan_bound not in SCAN_BOUNDS:
+        raise ValueError(
+            "line %d: scan_bound %r is not one of %r"
+            % (line_no, rec.scan_bound, list(SCAN_BOUNDS))
+        )
+    if rec.tokenization not in TOKENIZATIONS:
+        raise ValueError(
+            "line %d: tokenization %r is not one of %r"
+            % (line_no, rec.tokenization, list(TOKENIZATIONS))
+        )
+    if rec.image_matches < 1:
+        raise ValueError(
+            "line %d: image_matches must be >= 1 (the signature matched at "
+            "least where it was built), got %d" % (line_no, rec.image_matches)
+        )
+
+
+def _validate_string_rel_candidate(rec, line_no):
+    if rec.origin not in VALID_STRING_REL_ORIGINS:
+        raise ValueError("line %d: STRING_REL candidate has invalid origin %r"
+                         % (line_no, rec.origin))
+    if not rec.anchor_string:
+        raise ValueError("line %d: STRING_REL needs resolve.string" % line_no)
+    if rec.resolve.get("string_match") != STRING_MATCH_NUL_EXACT:
+        raise ValueError("line %d: STRING_REL needs nul_terminated_exact matching"
+                         % line_no)
+    if int(rec.resolve.get("window_bytes", 0)) != 128:
+        raise ValueError("line %d: STRING_REL window_bytes must be 128" % line_no)
+    if rec.resolve.get("window_bound") != WINDOW_BOUND_PDATA_CHUNK:
+        raise ValueError("line %d: STRING_REL window_bound must be pdata_chunk"
+                         % line_no)
+    _validate_confirm_fields(rec, line_no)
 
 
 def _validate_value_candidate(rec, pattern_len, line_no):

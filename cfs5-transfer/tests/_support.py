@@ -127,6 +127,33 @@ def vtable_candidate(pattern="48 89 44 24 ? 48 8B CB FF D7", anchor=0x1058,
     )
 
 
+def string_rel_candidate(pattern="48 83 EC ? E8 ? ? ? ?", anchor=0x101C,
+                         func=0x1000, size=0x21):
+    tokens = pattern.split()
+    return Candidate(
+        mode=cfs6.MODE_STRING_REL, signature=pattern,
+        origin=cfs6.ORIGIN_ANCHOR_STRING,
+        byte_len=len(tokens), wildcards=tokens.count("?"),
+        exact=len(tokens) - tokens.count("?"),
+        anchor_ea=anchor, func_ea=func, func_size=size,
+        locator={
+            "string": "ShowGenericPopupOk",
+            "string_match": cfs6.STRING_MATCH_NUL_EXACT,
+            "window_bytes": 128,
+            "window_bound": cfs6.WINDOW_BOUND_PDATA_CHUNK,
+            "confirm_offset": anchor - func,
+            "function_size": size,
+            "scan_bound": cfs6.SCAN_BOUND_PDATA_CHAIN,
+            "tokenization": cfs6.TOKENIZATION_RELAXED,
+            "image_matches": 8,
+        },
+        locator_source={
+            "string_ea": 0x9000, "xref_ea": 0x500C,
+            "handler_lea_ea": 0x5005,
+        },
+    )
+
+
 def write_member_cfs6(path, members, image=None, build_number=14177):
     """members: [(owner, name, expected, [Candidate, ...]), ...] -> a file."""
     with open(path, "w", encoding="utf-8", newline="") as handle:

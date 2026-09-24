@@ -27,7 +27,8 @@ from .image import (
 )
 from .members import decode_at
 from .policy import (
-    AXIS_VTABLE, WHY_NOT_ATTEMPTED, WHY_NOT_DECLARED, WHY_SELECTED,
+    AXIS_STRING_REL, AXIS_VTABLE, WHY_NOT_ATTEMPTED, WHY_NOT_DECLARED,
+    WHY_SELECTED,
 )
 from .sigs import (
     choose_function_candidates, choose_global_candidates,
@@ -95,7 +96,7 @@ class ExportState:
         self.user_prototypes = 0
         self.guessed_prototypes = 0
         self.mode_counts = {"ENTRY": 0, "BODY": 0, "REL": 0,
-                            cfs6.MODE_VTABLE: 0}
+                            cfs6.MODE_VTABLE: 0, cfs6.MODE_STRING_REL: 0}
         # How many items got 1, 2, 3, 4 candidates -- the diversity metric.
         self.candidate_counts = {}
         # BODY candidates a .pdata-based consumer cannot resolve.
@@ -153,6 +154,16 @@ class ExportState:
                 "axis": AXIS_VTABLE,
                 "reason": vtable["reason"],
                 "detail": vtable.get("detail", ""),
+            })
+        string_rel = search.diagnosis.get(AXIS_STRING_REL)
+        if string_rel and string_rel["reason"] not in (
+            WHY_SELECTED, WHY_NOT_DECLARED, WHY_NOT_ATTEMPTED
+        ):
+            notes.append({
+                "note": "declared anchor_string locator rejected",
+                "axis": AXIS_STRING_REL,
+                "reason": string_rel["reason"],
+                "detail": string_rel.get("detail", ""),
             })
         for note in notes:
             entry = {"kind": kind, "name": name}
@@ -523,7 +534,7 @@ def summarize(state, path, build_number, build_source, merged=None):
         "Local type definitions: %d\n"
         "ENTRY / BODY / REL / VALUE candidates: %d / %d / %d / %d\n"
         "  BODY not resolvable from .pdata (IDA-only): %d\n"
-        "Structural locators (VTABLE): %d\n"
+        "Structural locators (VTABLE / STRING_REL): %d / %d\n"
         "No unique candidate / no anchor: %d\n"
         "Failures: %d\n"
         "Build: %s (%s)\n"
@@ -541,6 +552,7 @@ def summarize(state, path, build_number, build_source, merged=None):
             state.mode_counts.get("REL", 0), state.mode_counts.get("VALUE", 0),
             state.ida_only_bodies,
             state.mode_counts.get(cfs6.MODE_VTABLE, 0),
+            state.mode_counts.get(cfs6.MODE_STRING_REL, 0),
             state.no_candidate, state.failures,
             "unknown" if build_number is None else build_number, build_source,
             merge_note,

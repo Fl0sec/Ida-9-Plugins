@@ -78,6 +78,13 @@ floors. `tokenization` records strict vs relaxed construction;
 matches inside the bounded scan range is always a refusal. The IDA importer
 skips structural modes; resolution belongs to the non-IDA consumer.
 
+`STRING_REL` matches exact `string + NUL`, examines code references only in a
+±128-byte `.pdata`-clamped window, and isolates an entry with surrounding
+call/jmp terminators. It accepts the sole preceding LEA whose decoded
+RIP-relative target is executable. Never encode a register or fixed byte
+delta. Multiple raw string copies or xrefs are harmless only when this rule
+produces exactly one distinct handler; ambiguity refuses.
+
 ## Derived values (`derived_value` + `VALUE`, schema revision 1)
 
 `member_offset` is the only semantic produced today; `element_stride`, `object_extent` and `constant` are reserved. `semantic`, extraction `op` (`CONST`/`DISP`/`IMM`/`SCALE`/`DISP_PLUS_WIDTH`) and `VALUE` `origin` are **closed sets** — a consumer rejects an unknown value rather than interpreting it. No expression strings, ever.

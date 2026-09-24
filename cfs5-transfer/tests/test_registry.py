@@ -62,6 +62,24 @@ class TestNormalize(unittest.TestCase):
             )
             self.assertEqual(len(rejected), 1)
 
+    def test_anchor_string_locator_normalizes(self):
+        ids, _sites, locators, rejected = registry.normalize_entries(
+            registry.KIND_FUNCTION,
+            [{"name": "popup", "anchor_string": "ShowGenericPopupOk"}],
+        )
+        self.assertEqual(ids, ["fn:popup"])
+        self.assertEqual(locators["fn:popup"], [
+            {"kind": "anchor_string", "string": "ShowGenericPopupOk"}
+        ])
+        self.assertEqual(rejected, [])
+
+        for value in ("", "bad\0string", 123):
+            _ids, _sites, _locators, rejected = registry.normalize_entries(
+                registry.KIND_FUNCTION,
+                [{"name": "popup", "anchor_string": value}],
+            )
+            self.assertEqual(len(rejected), 1)
+
     def test_a_bad_name_does_not_lose_the_batch(self):
         """Fifty names with two typos must register forty-eight."""
         names = ["Good%d" % i for i in range(48)] + ["bad name", "?x@@"]

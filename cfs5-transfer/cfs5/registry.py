@@ -39,7 +39,8 @@ _PREFIX = {KIND_FUNCTION: "fn:", KIND_GLOBAL: "global:"}
 # candidate modes: this names what the *caller asked for*, which the exporter
 # must verify before it becomes a VTABLE candidate.
 LOCATOR_VTABLE = "vtable"
-VALID_LOCATOR_KINDS = (LOCATOR_VTABLE,)
+LOCATOR_ANCHOR_STRING = "anchor_string"
+VALID_LOCATOR_KINDS = (LOCATOR_VTABLE, LOCATOR_ANCHOR_STRING)
 
 
 class RegistryError(ValueError):
@@ -115,7 +116,19 @@ def normalize_locators(entry):
     vtable = entry.get("vtable")
     if vtable is not None:
         out.append(normalize_vtable_locator(vtable))
+    anchor_string = entry.get("anchor_string")
+    if anchor_string is not None:
+        out.append(normalize_anchor_string_locator(anchor_string))
     return out
+
+
+def normalize_anchor_string_locator(value):
+    """A non-empty exact string declaration."""
+    if not isinstance(value, str) or not value:
+        raise RegistryError("anchor_string must be a non-empty string")
+    if "\0" in value:
+        raise RegistryError("anchor_string must not contain a NUL byte")
+    return {"kind": LOCATOR_ANCHOR_STRING, "string": value}
 
 
 def normalize_vtable_locator(spec):

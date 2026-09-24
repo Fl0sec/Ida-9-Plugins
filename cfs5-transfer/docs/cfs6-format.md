@@ -388,7 +388,7 @@ promise made by the producer.
 
 ---
 
-## 5b. Structural function locators (`VTABLE`, revision 2)
+## 5b. Structural function locators (`VTABLE` / `STRING_REL`, revision 2)
 
 A structural locator finds a function through image metadata, then uses
 `pattern` only to confirm that the resolved function still has the expected
@@ -425,6 +425,33 @@ Resolution:
 confirm-only. It must not be confused with the required exactly-one match
 inside the bounded scan range. The raw descriptor is stored instead of a
 demangled IDA name because it is the reproducible byte string in the image.
+
+### `STRING_REL`
+
+```json
+{"record":"candidate","item":"fn:ui_toolkit_show_generic_popup_ok","rank":0,
+ "mode":"STRING_REL","pattern":"48 83 C4 ? C3","origin":"anchor_string",
+ "resolve":{"string":"ShowGenericPopupOk",
+            "string_match":"nul_terminated_exact","window_bytes":128,
+            "window_bound":"pdata_chunk","confirm_offset":28,
+            "function_size":33,"scan_bound":"pdata_chain",
+            "tokenization":"relaxed","image_matches":8}}
+```
+
+Resolution searches exact `string + NUL` bytes, never a substring. For each
+code reference to an exact occurrence, take the enclosing `.pdata` chunk and
+clamp inspection to 128 bytes on either side. Within that bounded region,
+isolate the registration entry between the nearest preceding and following
+call/jmp terminators. The handler is the sole preceding `lea` in that entry
+whose decoded RIP-relative target is executable. Registers and fixed byte
+deltas are not inputs. Zero or multiple handler LEAs refuse that reference;
+zero or multiple distinct handlers across all references refuse the candidate.
+This handles inverted rdx/r8 entries and a final entry terminated by `jmp`.
+
+The consumer then applies the same bounded confirm-signature procedure as
+`VTABLE`. Unreferenced duplicate string bytes do not create a handler, and
+multiple references are acceptable only when the structural rule yields one
+distinct handler.
 
 ### Export-time scan-range invariant
 
@@ -564,6 +591,10 @@ Recoverable (count, report with the line number, skip the record):
   `type_descriptor`; negative/missing `slot`, `subobject_offset`, or
   `confirm_offset`; unknown `scan_bound` or `tokenization`; `image_matches < 1`;
   attachment to anything other than a `function`
+- STRING_REL: origin other than `anchor_string`; empty `string`; a
+  `string_match` other than `nul_terminated_exact`; `window_bytes != 128`; a
+  `window_bound` other than `pdata_chunk`; invalid shared confirm fields;
+  attachment to anything other than a `function`
 - `derived_value`: unknown `semantic`; missing `owner`; non-integer
   `expected_value`; `member_offset` without an `expected_value`
 - VALUE: `origin` outside {`stroff_xref`, `selected_operand`}; unknown `op`;
@@ -639,7 +670,7 @@ python tools/cfs6_resolve.py <file.cfs> <client.dll> --name ConVarRef_GetFloat -
 |---|---|
 | 0 | `function` / `global` items; `ENTRY` / `REL` / `BODY` candidates; type payloads |
 | 1 | `derived_value` items and `VALUE` candidates (`member_offset` produced) |
-| 2 | structural function locators (`VTABLE`; `STRING_REL` follows in the same revision) and skip-with-report for unknown candidate modes |
+| 2 | structural function locators (`VTABLE`, `STRING_REL`) and skip-with-report for unknown candidate modes |
 
 Revisions are **additive within version 6**: a reader written against an older
 revision skips the newer records as unknown kinds and stays correct on the rest

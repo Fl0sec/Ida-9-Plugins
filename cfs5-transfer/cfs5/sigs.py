@@ -24,6 +24,7 @@ from . import confirm
 from . import memberscan
 from . import registry
 from . import rtti
+from . import strloc
 from .common import UA_MAXOP, ea_str, find_up_to_n, find_up_to_two, msg
 from .disasm import (
     collect_data_xrefs_to,
@@ -44,6 +45,7 @@ from .policy import (
     AXIS_ENTRY,
     AXIS_EXTERNAL_REL,
     AXIS_VTABLE,
+    AXIS_STRING_REL,
     Candidate,
     FunctionSearch,
     ORIGIN_DATA_REF,
@@ -53,6 +55,7 @@ from .policy import (
     ORIGIN_HEXRAYS_MEMPTR,
     ORIGIN_SELECTED_OPERAND,
     ORIGIN_RTTI_VTABLE_SLOT,
+    ORIGIN_ANCHOR_STRING,
     ORIGIN_SELF_CALL,
     ORIGIN_STROFF_XREF,
     WHY_LOCATOR_MISMATCH,
@@ -844,6 +847,59 @@ def find_vtable_candidate(func_ea, ranges, locator, ownership=None):
     ), None
 
 
+def find_string_rel_candidate(func_ea, ranges, locator, ownership=None):
+    """(Candidate or None, failure) for a declared unique anchor string."""
+    text = locator.get("string", "")
+    try:
+        evidence = strloc.resolve_anchor_string(text, ownership)
+    except strloc.StringLocatorError as exc:
+        return None, {"reason": WHY_LOCATOR_UNRESOLVED, "detail": str(exc)}
+    except Exception as exc:
+        return None, {"reason": WHY_LOCATOR_UNRESOLVED,
+                      "detail": "string locator failed: %s" % exc}
+
+    if evidence["function_ea"] != func_ea:
+        return None, {
+            "reason": WHY_LOCATOR_MISMATCH,
+            "detail": "anchor string %r resolves to %s, not %s" % (
+                text, ea_str(evidence["function_ea"]), ea_str(func_ea)
+            ),
+        }
+
+    sig = confirm.build_confirm_signature(func_ea, ownership, ranges)
+    if not sig:
+        return None, {
+            "reason": WHY_NO_CONFIRM_SIGNATURE,
+            "detail": "the string locator resolves, but no window inside the "
+                      "function is unique over its scan range (%s)" % sig.reason,
+        }
+
+    _f, start_ea, func_size = _func_extent(func_ea)
+    return Candidate(
+        mode=cfs6.MODE_STRING_REL,
+        signature=sig.signature,
+        origin=ORIGIN_ANCHOR_STRING,
+        byte_len=sig.byte_len,
+        wildcards=sig.signature.count("?"),
+        exact=sig.byte_len - sig.signature.count("?"),
+        anchor_ea=func_ea + sig.offset,
+        func_ea=start_ea or func_ea,
+        func_size=func_size,
+        locator={
+            "string": text,
+            "string_match": cfs6.STRING_MATCH_NUL_EXACT,
+            "window_bytes": strloc.WINDOW_BYTES,
+            "window_bound": cfs6.WINDOW_BOUND_PDATA_CHUNK,
+            "confirm_offset": sig.offset,
+            "function_size": func_size,
+            "scan_bound": sig.scan_bound,
+            "tokenization": sig.tokenization,
+            "image_matches": sig.image_matches,
+        },
+        locator_source=evidence,
+    ), None
+
+
 def choose_function_candidates(func_ea, ranges, ownership=None, sites=(),
                                locators=()):
     """Ranked, structurally diverse candidates for a function.
@@ -877,19 +933,31 @@ def choose_function_candidates(func_ea, ranges, ownership=None, sites=(),
     # it, and the exporter's job is to verify the claim, not to let scoring
     # rank it out of the file.
     vtable_failure = None
+    string_rel_failure = None
     for locator in locators or ():
-        if locator.get("kind") != registry.LOCATOR_VTABLE:
+        kind = locator.get("kind")
+        if kind == registry.LOCATOR_VTABLE:
+            attempted.add(AXIS_VTABLE)
+            cand, failure = find_vtable_candidate(
+                start_ea or func_ea, ranges, locator, ownership
+            )
+        elif kind == registry.LOCATOR_ANCHOR_STRING:
+            attempted.add(AXIS_STRING_REL)
+            cand, failure = find_string_rel_candidate(
+                start_ea or func_ea, ranges, locator, ownership
+            )
+        else:
             continue
-        attempted.add(AXIS_VTABLE)
-        cand, failure = find_vtable_candidate(
-            start_ea or func_ea, ranges, locator, ownership
-        )
         if cand is not None:
             pinned.append(cand)
         else:
-            vtable_failure = failure
+            if kind == registry.LOCATOR_VTABLE:
+                vtable_failure = failure
+            else:
+                string_rel_failure = failure
             msg("LOCATOR_REJECTED %s slot %s: %s"
-                % (locator.get("type"), locator.get("slot"),
+                % (locator.get("type", locator.get("string")),
+                   locator.get("slot", "-"),
                    failure.get("detail", "")))
 
     # Unconditional: a good prologue says nothing about whether a caller-side
@@ -931,6 +999,7 @@ def choose_function_candidates(func_ea, ranges, ownership=None, sites=(),
             "xrefs_tested": searched,
             "body_near_miss": body_near_miss,
             "vtable_failure": vtable_failure,
+            "string_rel_failure": string_rel_failure,
         }),
         site_rejections=site_rejections,
         pinned=len(pinned),
