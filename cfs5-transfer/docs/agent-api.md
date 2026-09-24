@@ -22,6 +22,42 @@ from cfs5 import api
 | `undeclare(names=[])` | remove declarations by `"Owner::name"` |
 | `declarations()` | every declaration + how it resolves now |
 
+## Explicit anchor sites for functions
+
+A function entry is a name, or an object carrying sites:
+
+```python
+api.register(function_names=[
+    "CCSPlayer_Think",
+    {"name": "ui_toolkit_show_generic_popup_ok", "sites": [0x108C545]},
+])
+```
+
+A site is an address you determined identifies the function — an instruction
+that **references** it (`call`, `jmp`, or the `lea` that hands it to a
+registrar), or an instruction **inside** it to anchor a body pattern on. Which
+one it is is worked out from the database, not declared.
+
+This exists because discovery legitimately runs out of options: a function
+reached only through a vtable has no call site, and one in a family of
+byte-identical clones has no unique prologue. When that happens the address you
+found by hand is the only evidence left, and there has to be a way to hand it
+over.
+
+**A site is not a signature.** The exporter re-decodes it, re-derives what it
+references, and refuses it when that is not this function; only then does it
+build a pattern and hold it to the same uniqueness rule as a discovered anchor.
+You supply *where to look*; the database still supplies the answer. This is the
+same contract as a member declaration's `sites`.
+
+A site that holds up is **pinned**: it occupies a candidate slot unconditionally
+and is never scored out of the file. Scoring is a guess about which pattern
+survives the next build, and it must not discard evidence supplied on purpose.
+
+A refused site appears in the export's `advisory` list with the reason. Sites
+are stored per entry and removed with `unregister`. A site on a *global* is
+rejected — a global is anchored from its data references.
+
 ## Members and strides
 
 ```python
@@ -71,6 +107,33 @@ build — that is an error, not something to retry.
 
 `ok` is **not** "something worked". 51 of 52 exported is `ok=False,
 partial=True`. Check `ok`; when it is False read `unresolved`.
+
+### What a failure says
+
+An `unresolved` entry from an export carries a `reason` that names **which axis
+failed and why**, plus a `diagnosis` object keyed by axis:
+
+```
+no unique signature (entry: clone_family; external_rel: data_xrefs_only;
+                     body: unique_anchor_outside_pdata)
+```
+
+| Reason | Means |
+|---|---|
+| `clone_family` | N byte-identical prologues exist — **no** entry pattern can ever be unique; look for a structural anchor |
+| `no_unique_window` | every window tried still matched elsewhere |
+| `no_xrefs` | nothing references the address from code |
+| `data_xrefs_only` | no call/jump, but N instructions take its address (a `lea`-passed callback) |
+| `xrefs_not_unique` | references exist; no window around one was unique |
+| `unique_anchor_outside_pdata` | a unique body anchor **does** exist, but outside the function's own `.pdata` range, so a hit could not be mapped back to it |
+
+`export` also returns `advisory`: findings that are not failures — near-miss
+anchors (with their offset and pattern, so you can judge them yourself) and
+rejected sites. An item can be fully exported and still have something here.
+
+These distinctions are the difference between "this function has no
+distinguishing bytes" (unsolvable) and "its distinguishing bytes are somewhere
+the resolver cannot follow" (solvable, differently).
 
 ## Rules for anything added here
 

@@ -80,6 +80,32 @@ class PdataIndex:
         idx = bisect.bisect_left(self._starts, rva)
         return idx < len(self._starts) and self._starts[idx] == rva
 
+    def chain_end(self, start_rva):
+        """End RVA of the maximal run of adjacent entries beginning at start_rva.
+
+        The compiler splits one function's unwind information across several
+        RUNTIME_FUNCTION entries whose ranges abut exactly (`entry[i].end ==
+        entry[i+1].begin`). A non-IDA consumer that resolves a function to
+        `start_rva` and then scans it must scan that whole run, not just the
+        first entry -- so export-time uniqueness has to be measured over the
+        same span or a signature can be declared unique here and come back
+        ambiguous there.
+
+        Returns None when start_rva is not itself an entry begin: there is no
+        chain to walk, and guessing one from the containing entry would attribute
+        a neighbour's bytes to this function.
+        """
+        idx = bisect.bisect_left(self._starts, start_rva)
+        if idx >= len(self._starts) or self._starts[idx] != start_rva:
+            return None
+
+        end = self._ranges[idx][1]
+        i = idx + 1
+        while i < len(self._ranges) and self._ranges[i][0] == end:
+            end = self._ranges[i][1]
+            i += 1
+        return end
+
 
 class PeImage:
     """A parsed PE, addressed by RVA.

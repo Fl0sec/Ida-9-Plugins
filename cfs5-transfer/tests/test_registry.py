@@ -64,6 +64,65 @@ class TestNormalize(unittest.TestCase):
         self.assertEqual(registry.normalize(registry.KIND_GLOBAL, None), ([], []))
 
 
+class TestEntriesWithSites(unittest.TestCase):
+    """An entry may carry anchor sites the caller located itself."""
+
+    def test_a_plain_name_still_works_and_carries_no_sites(self):
+        ids, sites, rejected = registry.normalize_entries(
+            registry.KIND_FUNCTION, ["Alpha"]
+        )
+        self.assertEqual(ids, ["fn:Alpha"])
+        self.assertEqual(sites, {})
+        self.assertEqual(rejected, [])
+
+    def test_sites_are_collected_against_the_entry_id(self):
+        ids, sites, _ = registry.normalize_entries(
+            registry.KIND_FUNCTION,
+            [{"name": "Alpha", "sites": [0x1000, {"ea": 0x2000}]}],
+        )
+        self.assertEqual(ids, ["fn:Alpha"])
+        self.assertEqual(sites, {"fn:Alpha": [0x1000, 0x2000]})
+
+    def test_repeating_a_name_merges_its_sites(self):
+        # Finding a second anchor must not mean repeating the first.
+        _ids, sites, _ = registry.normalize_entries(
+            registry.KIND_FUNCTION,
+            [{"name": "Alpha", "sites": [0x1000]},
+             {"name": "Alpha", "sites": [0x2000, 0x1000]}],
+        )
+        self.assertEqual(sites, {"fn:Alpha": [0x1000, 0x2000]})
+
+    def test_sentinels_are_dropped_not_stored(self):
+        # BADADDR and 0 are how "no address" arrives from IDA; storing one
+        # would produce a confusing decode failure much later.
+        self.assertEqual(
+            registry.normalize_sites([0, 0xFFFFFFFFFFFFFFFF, 0x1234]), [0x1234]
+        )
+
+    def test_a_site_that_is_not_an_address_is_refused(self):
+        with self.assertRaises(registry.RegistryError):
+            registry.normalize_sites(["not-an-address"])
+
+    def test_a_bad_entry_does_not_lose_the_batch(self):
+        ids, sites, rejected = registry.normalize_entries(
+            registry.KIND_FUNCTION,
+            [{"name": "Good", "sites": [0x1000]},
+             {"name": "bad name"},
+             {"name": "AlsoGood"}],
+        )
+        self.assertEqual(ids, ["fn:Good", "fn:AlsoGood"])
+        self.assertEqual(sites, {"fn:Good": [0x1000]})
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["name"], "bad name")
+
+    def test_normalize_still_returns_two_values(self):
+        # The old shape has three call sites in api.py; it must not change.
+        self.assertEqual(
+            registry.normalize(registry.KIND_FUNCTION, ["Alpha"]),
+            (["fn:Alpha"], []),
+        )
+
+
 class TestSplitByKind(unittest.TestCase):
     def test_groups_and_sorts(self):
         out = registry.split_by_kind(

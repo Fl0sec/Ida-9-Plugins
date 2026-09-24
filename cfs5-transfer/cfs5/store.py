@@ -32,6 +32,10 @@ _INDEX_NODE = "$ cfs6 declarations"
 # The export set (registry.py entry ids). One node holding one JSON list --
 # it is pure identity, so unlike a declaration there is nothing to shard.
 _REGISTRY_NODE = "$ cfs6 export set"
+# Explicit anchor sites for registered functions: {entry_id: [ea, ...]}. Kept
+# in a separate node from the export set so a plugin that does not know about
+# sites still reads and writes the set correctly.
+_SITES_NODE = "$ cfs6 export sites"
 
 _BLOB_TAG = "D"
 _BLOB_INDEX = 0
@@ -135,6 +139,35 @@ def save_registry(entry_ids):
         return False
     if load_registry() != wanted:
         msg("STORE: export set write-back verification failed")
+        return False
+    return True
+
+
+def load_sites():
+    """{entry_id: [ea, ...]} for registered entries. Absent reads as empty."""
+    value = _read_json(_SITES_NODE)
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for key, eas in value.items():
+        if not isinstance(key, str) or not isinstance(eas, list):
+            continue
+        clean = [int(x) for x in eas if isinstance(x, int)]
+        if clean:
+            out[key] = clean
+    return out
+
+
+def save_sites(mapping):
+    """Replace the stored sites. Verified by read-back, like the export set."""
+    wanted = {
+        str(k): sorted({int(x) for x in v})
+        for k, v in (mapping or {}).items() if v
+    }
+    if not _write_json(_SITES_NODE, wanted):
+        return False
+    if load_sites() != wanted:
+        msg("STORE: export-site write-back verification failed")
         return False
     return True
 

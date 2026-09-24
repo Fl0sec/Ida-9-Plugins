@@ -96,7 +96,7 @@ def field_span_for_offb(insn, offb):
     return max(0, end - offb)
 
 
-def pattern_tokens_for_insn(insn, force_wildcard=None):
+def pattern_tokens_for_insn(insn, force_wildcard=None, relax=False):
     """Exact instruction bytes with address-dependent operand bytes wildcarded.
 
     force_wildcard=(offb, width) additionally wildcards one validated field --
@@ -105,6 +105,16 @@ def pattern_tokens_for_insn(insn, force_wildcard=None):
     instruction. Both callers rely on it for the same reason: the field is
     expected to differ in another build, so pinning it would defeat the
     pattern.
+
+    `relax=True` wildcards every encoded immediate/displacement/memory/branch
+    field regardless of whether IDA recorded a reference from the instruction,
+    stack-relative displacements included. That is only ever correct for a
+    *confirm* signature, which is matched inside an already-resolved function
+    and therefore does not have to be image-unique: the bytes it gives up are
+    exactly the ones that drift between builds. It is wrong for a locating
+    signature, where those same bytes are what separate a function from its
+    clone siblings -- see `confirm.build_confirm_signature`, which pays for the
+    relaxation by re-checking the result image-wide.
     """
     raw = ida_bytes.get_bytes(insn.ea, insn.size)
     if raw is None or len(raw) != insn.size:
@@ -113,7 +123,7 @@ def pattern_tokens_for_insn(insn, force_wildcard=None):
     tokens = ["%02X" % b for b in raw]
     wildcard = set()
 
-    if has_far_reference(insn.ea):
+    if relax or has_far_reference(insn.ea):
         address_like = {
             ida_ua.o_near, ida_ua.o_far, ida_ua.o_mem,
             ida_ua.o_displ, ida_ua.o_imm
@@ -134,11 +144,12 @@ def pattern_tokens_for_insn(insn, force_wildcard=None):
     return tokens
 
 
-def decode_chunk(start_ea, end_ea):
+def decode_chunk(start_ea, end_ea, relax=False):
     """Decode one contiguous chunk without crossing its boundary.
 
     Returns a list of {ea, size, tokens, insn} dicts; undecodable bytes become
-    1-byte pseudo-instructions so window math stays contiguous.
+    1-byte pseudo-instructions so window math stays contiguous. `relax` is
+    forwarded to the tokenizer.
     """
     insns = []
     ea = start_ea
@@ -156,7 +167,7 @@ def decode_chunk(start_ea, end_ea):
         insns.append({
             "ea": ea,
             "size": int(insn.size),
-            "tokens": pattern_tokens_for_insn(insn),
+            "tokens": pattern_tokens_for_insn(insn, relax=relax),
             "insn": insn,
         })
         ea += insn.size

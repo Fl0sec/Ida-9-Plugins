@@ -58,14 +58,15 @@ def get_search_ranges():
     return ranges
 
 
-def find_up_to_two(signature, ranges):
-    """Return at most two match addresses for an IDA byte-pattern signature.
+def find_up_to_n(signature, ranges, limit):
+    """Return at most `limit` match addresses for an IDA byte-pattern signature.
 
-    Stops early once a second hit proves the pattern is non-unique. Accepts
-    ranges as (start, end) or (start, end, name).
+    Stops as soon as `limit` hits are in hand. Accepts ranges as (start, end)
+    or (start, end, name).
     """
     flags = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW
     matches = []
+    limit = max(1, int(limit))
 
     for rng in ranges:
         start, end = rng[0], rng[1]
@@ -77,8 +78,18 @@ def find_up_to_two(signature, ranges):
             if ea == BADADDR:
                 break
             matches.append(ea)
-            if len(matches) >= 2:
+            if len(matches) >= limit:
                 return matches
             cur = ea + 1
 
     return matches
+
+
+def find_up_to_two(signature, ranges):
+    """At most two matches -- the uniqueness test every finder runs.
+
+    Two is all a uniqueness decision needs, and stopping there is what keeps
+    the search cheap on a 40MB image. `find_up_to_n` is for diagnostics, where
+    *how many* siblings exist is the answer being looked for.
+    """
+    return find_up_to_n(signature, ranges, 2)

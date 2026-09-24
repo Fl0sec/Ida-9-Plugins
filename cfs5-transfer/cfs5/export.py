@@ -101,12 +101,46 @@ class ExportState:
         # inferring it from a count. This is the whole difference between an
         # export an agent can trust and one it has to assume worked.
         self.uncovered = []
+        # Findings that are not failures: an anchor that exists but could not
+        # be exported, a site the caller named that did not hold up. Separate
+        # from `uncovered` because an item can be fully exported and still
+        # have something worth saying about it.
+        self.advisory = []
+        # {func_ea: [site_ea, ...]} supplied by the caller.
+        self.function_sites = {}
 
-    def _miss(self, kind, name, reason, ea=None):
+    def _miss(self, kind, name, reason, ea=None, diagnosis=None):
         entry = {"kind": kind, "name": name, "reason": reason}
         if ea is not None:
             entry["ea"] = ea_str(ea)
+        if diagnosis:
+            entry["diagnosis"] = diagnosis
         self.uncovered.append(entry)
+
+    def _advise(self, kind, name, search, ea=None):
+        """Record what a search noticed but could not act on."""
+        notes = []
+        for near in search.near_misses:
+            notes.append({
+                "note": "unique anchor exists but is not exportable",
+                "axis": near.get("axis"),
+                "offset": near.get("offset"),
+                "ea": near.get("ea"),
+                "ownership": near.get("ownership"),
+                "signature": near.get("signature"),
+            })
+        for bad in search.site_rejections:
+            notes.append({
+                "note": "explicit site rejected",
+                "ea": bad.get("ea"),
+                "reason": bad.get("reason"),
+            })
+        for note in notes:
+            entry = {"kind": kind, "name": name}
+            if ea is not None:
+                entry["ea"] = ea_str(ea)
+            entry.update(note)
+            self.advisory.append(entry)
 
 
 def write_function(writer, state, func_ea, ranges):
@@ -117,8 +151,9 @@ def write_function(writer, state, func_ea, ranges):
         return None
 
     try:
-        candidates, coverage, xref_count, xrefs_tested = choose_function_candidates(
-            func_ea, ranges, ownership=state.ownership
+        search = choose_function_candidates(
+            func_ea, ranges, ownership=state.ownership,
+            sites=state.function_sites.get(func_ea, ()),
         )
     except Exception as exc:
         state.failures += 1
@@ -126,10 +161,19 @@ def write_function(writer, state, func_ea, ranges):
         state._miss("function", name, "exception: %s" % exc, func_ea)
         return None
 
+    candidates = search.candidates
+    coverage = search.coverage
+    xref_count, xrefs_tested = search.total_xrefs, search.searched_xrefs
+    state._advise("function", name, search, func_ea)
+
     if not candidates:
         state.no_candidate += 1
         msg("NO_UNIQUE_CANDIDATE %-31s @ %s" % (name, ea_str(func_ea)))
-        state._miss("function", name, "no unique signature", func_ea)
+        explanation = search.explain()
+        if explanation:
+            msg(explanation)
+        state._miss("function", name, search.failure_reason(), func_ea,
+                    diagnosis=search.diagnosis)
         return None
 
     item_id = writer.write_item(
@@ -196,19 +240,22 @@ def write_global(writer, state, global_ea, ranges):
         return None
 
     try:
-        candidates, coverage, xref_count, xrefs_tested = choose_global_candidates(
-            global_ea, ranges
-        )
+        search = choose_global_candidates(global_ea, ranges)
     except Exception as exc:
         state.failures += 1
         msg("GLOB_FAIL %-40s @ %s error=%s" % (name, ea_str(global_ea), exc))
         state._miss("global", name, "exception: %s" % exc, global_ea)
         return None
 
+    candidates = search.candidates
+    coverage = search.coverage
+    xref_count, xrefs_tested = search.total_xrefs, search.searched_xrefs
+
     if not candidates:
         state.no_candidate += 1
         msg("GLOB_NO_XREF_ANCHOR %-31s @ %s" % (name, ea_str(global_ea)))
-        state._miss("global", name, "no xref anchor", global_ea)
+        state._miss("global", name, search.failure_reason(), global_ea,
+                    diagnosis=search.diagnosis)
         return None
 
     item_id = writer.write_item(cfs6.REC_GLOBAL, name, len(candidates), coverage)
@@ -482,11 +529,14 @@ def summarize(state, path, build_number, build_source, merged=None):
 
 def export_to_path(path, ranges, function_eas=(), global_eas=(),
                    declarations=(), build=(None, "unknown"),
-                   merge=MERGE_APPEND):
+                   merge=MERGE_APPEND, function_sites=None):
     """Write a CFS6 file. Returns a result dict; never prompts, never pops up.
 
     `build` is (number_or_None, source) -- resolved by the caller, because the
     UI confirms it with the user and an agent passes it outright.
+
+    `function_sites` is {func_ea: [site_ea, ...]}: anchors the caller located
+    itself, verified against the database before use.
     """
     function_eas = sorted(set(function_eas or []))
     global_eas = sorted(set(global_eas or []))
@@ -494,7 +544,7 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
 
     result = {
         "ok": False, "path": path, "written": 0, "cancelled": False,
-        "uncovered": [], "error": None, "summary": "",
+        "uncovered": [], "advisory": [], "error": None, "summary": "",
     }
 
     if not function_eas and not global_eas and not declarations:
@@ -533,6 +583,9 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
             % (path, merge_from.describe_contents()))
 
     state = ExportState()
+    state.function_sites = {
+        int(ea): list(sites) for ea, sites in (function_sites or {}).items()
+    }
     state.ownership = BodyOwnership.for_current_idb(view, imagebase)
     if state.ownership.available:
         msg("PDATA: %d runtime functions (source=%s)"
@@ -631,6 +684,7 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
         "merged": merged.describe() if merged is not None else None,
         "mode": mode,
         "uncovered": list(state.uncovered),
+        "advisory": list(state.advisory),
         "summary": summarize(state, path, build_number, build_source, merged),
     })
     msg(result["summary"].replace("\n", " | "))

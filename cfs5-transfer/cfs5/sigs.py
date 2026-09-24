@@ -21,7 +21,7 @@ import ida_ua
 
 from . import cfs6
 from . import memberscan
-from .common import UA_MAXOP, find_up_to_two
+from .common import UA_MAXOP, ea_str, find_up_to_n, find_up_to_two, msg
 from .disasm import (
     collect_data_xrefs_to,
     collect_far_xrefs_to,
@@ -33,6 +33,7 @@ from .disasm import (
 )
 from .members import decode_at, member_reference_sites, operand_displacement
 from .policy import (
+    CLONE_COUNT_LIMIT,
     MAX_PATTERN_BYTES,
     MAX_XREFS_TO_SEARCH,
     XREF_EARLY_STOP_AFTER,
@@ -40,8 +41,10 @@ from .policy import (
     AXIS_ENTRY,
     AXIS_EXTERNAL_REL,
     Candidate,
+    FunctionSearch,
     ORIGIN_DATA_REF,
     ORIGIN_ENTRY,
+    ORIGIN_EXPLICIT_SITE,
     ORIGIN_EXTERNAL_CALL,
     ORIGIN_HEXRAYS_MEMPTR,
     ORIGIN_SELECTED_OPERAND,
@@ -50,6 +53,7 @@ from .policy import (
     body_origin_for_position,
     candidate_min_exact,
     coverage_for,
+    diagnose_function,
     primary_chunk_limit,
     select_function_candidates,
     select_global_candidates,
@@ -82,10 +86,19 @@ def _window_stats(insns, start_idx, end_idx):
     }
 
 
-def _unique_window(insns, start_idx, ranges):
-    """Shortest source-unique window starting at start_idx, or None."""
+def _window_ladder(insns, start_idx, min_exact=None):
+    """Yield window stats at start_idx, shortest first, along the length ladder.
+
+    Split out of `_unique_window` so the growth rule has exactly one
+    implementation: `_unique_window` stops at the first unique window, while
+    `confirm.py` needs *every* unique one so it can pick by image-uniqueness
+    rather than by length. Forking this would let the two drift apart on which
+    lengths are even considered.
+    """
     if start_idx < 0 or start_idx >= len(insns):
-        return None
+        return
+    if min_exact is None:
+        min_exact = candidate_min_exact
 
     tried_ends = set()
     for threshold in _WINDOW_THRESHOLDS:
@@ -112,13 +125,30 @@ def _unique_window(insns, start_idx, ranges):
         stats = _window_stats(insns, start_idx, end_idx)
         if stats is None:
             continue
-        if stats["exact"] < candidate_min_exact(stats["byte_len"]):
+        if stats["exact"] < min_exact(stats["byte_len"]):
             continue
+        yield stats
 
+
+def _unique_window(insns, start_idx, ranges, min_exact=None):
+    """Shortest window starting at start_idx that matches `ranges` once, or None.
+
+    `min_exact` is the exact-byte floor to apply, defaulting to the image-wide
+    one. A confirm signature passes `policy.confirm_min_exact` because it is
+    searched over a single function rather than the whole image -- see that
+    function for why the floor would be wrong there.
+    """
+    for stats in _window_ladder(insns, start_idx, min_exact):
         if len(find_up_to_two(stats["signature"], ranges)) == 1:
             return stats
-
     return None
+
+
+def iter_unique_windows(insns, start_idx, ranges, min_exact=None):
+    """Every window at start_idx that matches `ranges` exactly once."""
+    for stats in _window_ladder(insns, start_idx, min_exact):
+        if len(find_up_to_two(stats["signature"], ranges)) == 1:
+            yield stats
 
 
 def _unique_window_around(insns, xidx, ranges, min_exact=None):
@@ -147,6 +177,30 @@ def _unique_window_around(insns, xidx, ranges, min_exact=None):
     return None
 
 
+def _longest_window_matches(insns, start_idx, ranges):
+    """How many places the longest allowed window at start_idx still matches.
+
+    Only ever called once an axis has already failed, so its cost is paid on
+    the diagnostic path and never on the happy one. The answer is what tells
+    an analyst whether to keep growing the pattern or to stop: a prologue that
+    still matches N places at maximum length belongs to a clone family, and no
+    longer prefix will ever separate it from its siblings.
+    """
+    end_idx = start_idx
+    total = 0
+    while end_idx < len(insns):
+        size = insns[end_idx]["size"]
+        if total + size > MAX_PATTERN_BYTES:
+            break
+        total += size
+        end_idx += 1
+
+    stats = _window_stats(insns, start_idx, end_idx)
+    if stats is None:
+        return 0
+    return len(find_up_to_n(stats["signature"], ranges, CLONE_COUNT_LIMIT))
+
+
 def _func_extent(func_ea):
     f = ida_funcs.get_func(func_ea)
     if f is None:
@@ -159,18 +213,23 @@ def _func_extent(func_ea):
 # ---------------------------------------------------------------------------
 
 def find_entry_candidate(func_ea, ranges):
-    """(Candidate or None, decoded instruction list) for a function's start."""
+    """(Candidate or None, instructions, match_count) for a function's start.
+
+    `match_count` is 0 unless the search failed, in which case it is how many
+    places the longest prologue window still matched -- the clone-family
+    signal.
+    """
     f, start_ea, func_size = _func_extent(func_ea)
     if f is None:
-        return None, []
+        return None, [], 0
 
     insns = decode_chunk(f.start_ea, f.end_ea)
     if not insns:
-        return None, []
+        return None, [], 0
 
     stats = _unique_window(insns, 0, ranges)
     if stats is None:
-        return None, insns
+        return None, insns, _longest_window_matches(insns, 0, ranges)
 
     return Candidate(
         mode="ENTRY",
@@ -182,7 +241,7 @@ def find_entry_candidate(func_ea, ranges):
         anchor_ea=stats["start_ea"],
         func_ea=start_ea,
         func_size=func_size,
-    ), insns
+    ), insns, 0
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +263,28 @@ def _sample_body_indices(insns):
     return out
 
 
+# Public names for the two primitives `cfs5/confirm.py` reuses. It builds its
+# own windows -- over the .pdata chain instead of the image, with no exact-byte
+# floor -- but the sampling and growth rules must not fork.
+sample_body_indices = _sample_body_indices
+unique_window = _unique_window
+
+
 def find_body_candidates(insns, ranges, func_ea, func_size, ownership=None):
-    """Unique interior patterns from structurally distinct regions.
+    """(candidates, near_miss) -- unique interior patterns.
 
     `ownership` is an image.BodyOwnership (or None): it both biases sampling
     toward the function's own .pdata chunk and labels whether a non-IDA
     consumer could recover func_ea from the resulting hit.
+
+    `near_miss` is advisory only. When sampling is confined to the function's
+    .pdata range and finds nothing, the rest of the body is sampled *for
+    reporting*: a unique anchor that exists past the range is the difference
+    between "this function has no distinguishing bytes" and "its
+    distinguishing bytes are somewhere a .pdata consumer cannot follow". The
+    first is unsolvable, the second points at a structural anchor. Nothing
+    found this way is exported -- an anchor whose owner cannot be recovered
+    resolves to nothing.
     """
     out = []
     limit = primary_chunk_limit(insns, func_ea, ownership)
@@ -235,7 +310,185 @@ def find_body_candidates(insns, ranges, func_ea, func_size, ownership=None):
             func_size=func_size,
             body_offset=stats["start_ea"] - func_ea,
         ))
-    return out
+
+    near_miss = []
+    if not out and limit < len(insns):
+        out, near_miss = _sample_whole_body(
+            insns, ranges, func_ea, func_size, ownership
+        )
+    return out, near_miss
+
+
+def _sample_whole_body(insns, ranges, func_ea, func_size, ownership):
+    """(candidates, near_miss) from sampling the entire body.
+
+    Only reached when the .pdata-confined sampling produced nothing. Two
+    different things come out of it, and conflating them is what made the
+    original failure unreadable:
+
+      * an anchor that still classifies `pdata` is a real candidate the
+        confined sampling merely did not land on -- it is exported,
+      * an anchor outside the function's own .pdata range is not exportable
+        (a consumer could not map a hit back to the function) and is reported
+        as a near miss instead.
+    """
+    candidates, near_miss = [], []
+    indices = _sample_body_indices(insns)
+    for position, idx in enumerate(indices):
+        stats = _unique_window(insns, idx, ranges)
+        if stats is None:
+            continue
+        kind = (
+            ownership.classify(func_ea, stats["start_ea"])
+            if ownership is not None else "pdata"
+        )
+        if kind != "pdata":
+            near_miss.append({
+                "offset": stats["start_ea"] - func_ea,
+                "ea": ea_str(stats["start_ea"]),
+                "byte_len": stats["byte_len"],
+                "exact": stats["exact"],
+                "ownership": kind,
+                "signature": stats["signature"],
+            })
+            continue
+        candidates.append(Candidate(
+            ownership=kind,
+            mode="BODY",
+            signature=stats["signature"],
+            origin=body_origin_for_position(position, len(indices)),
+            byte_len=stats["byte_len"],
+            wildcards=stats["wildcards"],
+            exact=stats["exact"],
+            anchor_ea=stats["start_ea"],
+            func_ea=func_ea,
+            func_size=func_size,
+            body_offset=stats["start_ea"] - func_ea,
+        ))
+    return candidates, near_miss
+
+
+# ---------------------------------------------------------------------------
+# Explicit sites -- evidence the caller located and the exporter verifies
+# ---------------------------------------------------------------------------
+
+def find_site_candidate(func_ea, site_ea, ranges, ownership=None):
+    """(Candidate or None, reason) for one caller-named site.
+
+    A site is an *address*, and what it means is worked out from the database
+    rather than declared, because there are only two things it can honestly
+    be:
+
+      * an instruction that references the function -- a `call`, a `jmp` or,
+        as with a callback passed to a registrar, a bare `lea`. That becomes a
+        REL anchor, with the referenced target re-derived from the decoded
+        operand and required to land exactly on `func_ea`.
+      * an instruction inside the function -- a BODY anchor at that exact
+        position, instead of one of the sampled ones.
+
+    The verification is the point of the whole feature. The caller supplies
+    *where to look*; the database still supplies what is there. A site that
+    references some other function, or that sits in some other function, is
+    refused with a reason rather than exported under this name -- an anchor
+    pointing at the wrong target is worse than no anchor at all, because a
+    consumer would apply it with full confidence.
+    """
+    if ida_funcs.get_func(func_ea) is None:
+        return None, "%s is not a function" % ea_str(func_ea)
+
+    insn = ida_ua.insn_t()
+    if ida_ua.decode_insn(insn, site_ea) <= 0 or insn.size <= 0:
+        return None, "%s does not decode as an instruction" % ea_str(site_ea)
+
+    # A reference to the function, whatever instruction form carries it.
+    if infer_pc_relative_field(insn, func_ea) is not None:
+        _f, start_ea, func_size = _func_extent(func_ea)
+        cand = find_rel_candidate_for_xref(
+            site_ea, func_ea, ranges, ORIGIN_EXPLICIT_SITE,
+            func_ea=start_ea, func_size=func_size, is_data=False,
+        )
+        if cand is None:
+            return None, (
+                "%s references the function but no unique pattern could be "
+                "built around it" % ea_str(site_ea)
+            )
+        return cand, None
+
+    owner = ida_funcs.get_func(site_ea)
+    if owner is None or owner.start_ea != ida_funcs.get_func(func_ea).start_ea:
+        where = (
+            "inside %s" % ea_str(owner.start_ea) if owner is not None
+            else "outside any function"
+        )
+        return None, (
+            "%s neither references the function nor lies inside it (it is %s)"
+            % (ea_str(site_ea), where)
+        )
+
+    return _body_candidate_at_site(func_ea, site_ea, ranges, ownership)
+
+
+def _body_candidate_at_site(func_ea, site_ea, ranges, ownership):
+    """A BODY Candidate anchored exactly at `site_ea`, or (None, reason)."""
+    f, start_ea, func_size = _func_extent(func_ea)
+    insns = decode_chunk(f.start_ea, f.end_ea)
+    idx = next((i for i, it in enumerate(insns) if it["ea"] == site_ea), None)
+    if idx is None:
+        return None, (
+            "%s is inside the function but is not an instruction start"
+            % ea_str(site_ea)
+        )
+
+    stats = _unique_window(insns, idx, ranges)
+    if stats is None:
+        return None, (
+            "no unique pattern starts at %s (every window matched elsewhere)"
+            % ea_str(site_ea)
+        )
+
+    kind = (
+        ownership.classify(start_ea, stats["start_ea"])
+        if ownership is not None else "pdata"
+    )
+    if kind != "pdata":
+        # Emitting it would be a lie of omission: the file would gain a
+        # candidate the consumer that asked for it must skip.
+        return None, (
+            "the unique pattern at %s sits outside the function's own .pdata "
+            "range, so a hit could not be mapped back to the function"
+            % ea_str(site_ea)
+        )
+
+    return Candidate(
+        ownership=kind,
+        mode="BODY",
+        signature=stats["signature"],
+        origin=ORIGIN_EXPLICIT_SITE,
+        byte_len=stats["byte_len"],
+        wildcards=stats["wildcards"],
+        exact=stats["exact"],
+        anchor_ea=stats["start_ea"],
+        func_ea=start_ea,
+        func_size=func_size,
+        body_offset=stats["start_ea"] - start_ea,
+    ), None
+
+
+def find_site_candidates(func_ea, site_eas, ranges, ownership=None):
+    """(candidates, rejections) for every caller-named site of one function."""
+    found, rejected = [], []
+    for site_ea in site_eas or ():
+        try:
+            cand, reason = find_site_candidate(
+                func_ea, int(site_ea), ranges, ownership
+            )
+        except Exception as exc:
+            cand, reason = None, "site %s raised: %s" % (ea_str(site_ea), exc)
+        if cand is not None:
+            found.append(cand)
+        else:
+            rejected.append({"ea": ea_str(site_ea), "reason": reason})
+    return found, rejected
 
 
 # ---------------------------------------------------------------------------
@@ -614,13 +867,24 @@ def choose_member_candidates(ref, ranges, selected_sites=(), value_adjust=0,
 # Item-level policy entry points
 # ---------------------------------------------------------------------------
 
-def choose_function_candidates(func_ea, ranges, ownership=None):
+def choose_function_candidates(func_ea, ranges, ownership=None, sites=()):
     """Ranked, structurally diverse candidates for a function.
 
-    Returns (candidates, coverage, total_xrefs, searched_xrefs).
+    `sites` are addresses the caller located itself. They are verified against
+    the database and, when they hold up, pinned into the result -- scoring is
+    a guess about the next build and must not discard evidence that was
+    supplied deliberately.
+
+    Returns a FunctionSearch.
     """
-    entry, insns = find_entry_candidate(func_ea, ranges)
+    entry, insns, entry_matches = find_entry_candidate(func_ea, ranges)
     _f, start_ea, func_size = _func_extent(func_ea)
+
+    pinned, site_rejections = find_site_candidates(
+        start_ea or func_ea, sites, ranges, ownership
+    )
+    for bad in site_rejections:
+        msg("SITE_REJECTED %s: %s" % (bad["ea"], bad["reason"]))
 
     candidates = []
     attempted = {AXIS_ENTRY}
@@ -636,23 +900,46 @@ def choose_function_candidates(func_ea, ranges, ownership=None):
     attempted.add(AXIS_EXTERNAL_REL)
     candidates.extend(rels)
 
+    body_near_miss = []
     if insns:
         attempted.add(AXIS_BODY)
-        candidates.extend(
-            find_body_candidates(
-                insns, ranges, start_ea, func_size, ownership=ownership
-            )
+        bodies, body_near_miss = find_body_candidates(
+            insns, ranges, start_ea, func_size, ownership=ownership
         )
+        candidates.extend(bodies)
 
-    selected = select_function_candidates(candidates)
-    return selected, coverage_for(selected, attempted), total_xrefs, searched
+    selected = select_function_candidates(candidates, pinned=pinned)
+    coverage = coverage_for(selected, attempted)
+
+    # Only when nothing called it: the answer distinguishes "unreferenced" from
+    # "referenced by an instruction that takes its address", which are very
+    # different problems to go and solve.
+    data_xrefs = (
+        len(collect_data_xrefs_to(start_ea or func_ea)) if not total_xrefs else 0
+    )
+
+    return FunctionSearch(
+        candidates=selected,
+        coverage=coverage,
+        total_xrefs=total_xrefs,
+        searched_xrefs=searched,
+        diagnosis=diagnose_function(coverage, {
+            "entry_matches": entry_matches,
+            "xref_count": total_xrefs,
+            "data_xref_count": data_xrefs,
+            "xrefs_tested": searched,
+            "body_near_miss": body_near_miss,
+        }),
+        site_rejections=site_rejections,
+        pinned=len(pinned),
+    )
 
 
 def choose_global_candidates(global_ea, ranges):
     """Ranked REL candidates for a global via distinct data-xref anchor sites.
 
     Globals have no instruction body, so REL is the only applicable axis.
-    Returns (candidates, coverage, total_xrefs, searched_xrefs).
+    Returns a FunctionSearch (only its REL axis is meaningful).
     """
     rels, total_xrefs, searched = collect_rel_candidates(
         global_ea, ranges, collect_data_xrefs_to, is_data=True,
@@ -660,4 +947,12 @@ def choose_global_candidates(global_ea, ranges):
     )
     selected = select_global_candidates(rels)
     coverage = coverage_for(selected, {AXIS_EXTERNAL_REL})
-    return selected, coverage, total_xrefs, searched
+    return FunctionSearch(
+        candidates=selected,
+        coverage=coverage,
+        total_xrefs=total_xrefs,
+        searched_xrefs=searched,
+        diagnosis=diagnose_function(coverage, {
+            "xref_count": total_xrefs, "xrefs_tested": searched,
+        }),
+    )

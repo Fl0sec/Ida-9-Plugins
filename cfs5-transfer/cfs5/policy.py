@@ -31,6 +31,11 @@ VALUE_MIN_EXACT_BYTES = 8
 # Origin categories. These are part of the exported contract.
 ORIGIN_ENTRY = "function_entry"
 ORIGIN_EXTERNAL_CALL = "external_call"
+# An anchor the caller named outright, rather than one discovery found. It is
+# a distinct origin because it carries a different warranty: a human or an
+# agent asserted this site is the right evidence, and the exporter's job is to
+# verify that claim, not to second-guess where it came from.
+ORIGIN_EXPLICIT_SITE = "explicit_site"
 ORIGIN_SELF_CALL = "self_call"
 ORIGIN_DATA_REF = "data_reference"
 ORIGIN_BODY = ("body_early", "body_middle", "body_late")
@@ -75,6 +80,81 @@ def value_min_exact(total_bytes):
     instructions rather than stop at the first technically-unique window.
     """
     return max(VALUE_MIN_EXACT_BYTES, candidate_min_exact(total_bytes))
+
+
+# How many image-wide siblings of a confirm signature we bother counting.
+CONFIRM_MATCH_LIMIT = 8
+
+# How a confirm signature was tokenized. Closed set: it tells the consumer how
+# much build drift the pattern is expected to absorb.
+TOKENIZATION_STRICT = "strict"
+TOKENIZATION_RELAXED = "relaxed"
+TOKENIZATIONS = (TOKENIZATION_STRICT, TOKENIZATION_RELAXED)
+
+# Why a confirm signature could not be built. A closed set, like the axis
+# reasons -- a caller branches on it rather than parsing English.
+CONFIRM_NO_SCAN_RANGE = "no_scan_range"
+CONFIRM_NO_INSTRUCTIONS = "no_instructions"
+CONFIRM_NO_UNIQUE_WINDOW = "no_unique_window_in_scan_range"
+
+# Which span export-time uniqueness was measured over. Closed set; the consumer
+# needs to know whether it is working from the .pdata table or from a hint.
+SCAN_BOUND_PDATA_CHAIN = "pdata_chain"
+SCAN_BOUND_IDA_EXTENT = "ida_extent"
+SCAN_BOUNDS = (SCAN_BOUND_PDATA_CHAIN, SCAN_BOUND_IDA_EXTENT)
+
+
+def confirm_min_exact(total_bytes):
+    """No exact-byte floor applies to a confirm signature.
+
+    `MIN_EXACT_BYTES` and `value_min_exact` exist to keep a pattern that must
+    be unique across a 40MB image from collapsing to a coincidence on the next
+    build. A confirm signature is not that pattern: the locator (an RTTI slot,
+    a string reference) has already produced the function address, and the
+    signature is only asked to still match *inside that one function*. Applying
+    an image-wide floor to a deliberately bounded pattern would refuse good
+    answers for a risk that is not being run.
+    """
+    return 0
+
+
+def rank_confirm_windows(windows):
+    """Confirm windows best-first.
+
+    Each window is a plain dict carrying at least `image_matches`, `byte_len`,
+    `wildcards`, `offset` and `tokenization`, so the ordering rule stays
+    testable without IDA.
+
+    **Image-uniqueness is the first key**, and it is the clone-family defence
+    rather than a nicety. The relaxed tokenizer wildcards exactly the stack
+    offsets and immediates that distinguish a function from its byte-identical
+    siblings. If the locator ever drifts onto a sibling -- a vtable slot that
+    shifted, a renumbered table -- a signature that also matches inside that
+    sibling would *confirm* the wrong function, which is the precise failure
+    this design exists to prevent. A window matching nowhere else in the image
+    cannot do that, so it wins over any shorter or more tolerant one.
+
+    Measured on `notify_inventory_has_new_items` (cs2 client.dll 14182), a
+    member of exactly such a clone family: **no** relaxed window at any anchor
+    or any length is image-unique -- every one matches 8+ places -- while the
+    strict 15-byte window at +0x58 is unique precisely because it pins the
+    `24 48` / `24 30` stack offsets that separate it from its siblings. So both
+    tokenizations must be offered here; ranking only relaxed windows would ship
+    an 8-way-ambiguous confirm signature for the function the whole mechanism
+    exists to protect.
+
+    Tolerance is the *second* key: among windows that are equally
+    discriminating, the relaxed one absorbs more build drift, so it is
+    preferred even when longer. Length and wildcard count only break the
+    remaining ties.
+    """
+    return sorted(windows, key=lambda w: (
+        0 if int(w.get("image_matches", 0)) == 1 else 1,
+        0 if w.get("tokenization") == TOKENIZATION_RELAXED else 1,
+        int(w.get("byte_len", 0)),
+        int(w.get("wildcards", 0)),
+        int(w.get("offset", 0)),
+    ))
 
 
 def primary_chunk_limit(insns, func_ea, ownership):
@@ -282,18 +362,27 @@ def _best_for_axis(pool, axis, selected=()):
     return None
 
 
-def select_function_candidates(candidates, max_count=MAX_EXPORTED_CANDIDATES):
+def select_function_candidates(candidates, max_count=MAX_EXPORTED_CANDIDATES,
+                               pinned=()):
     """Pick structurally diverse candidates, best-first.
 
     One candidate per axis first (ENTRY, external REL, BODY), then fill any
     remaining slot with the best leftover of an origin not already used. Never
     manufactures weak candidates to reach a count.
+
+    `pinned` candidates are kept unconditionally and occupy the first slots.
+    That is the whole point of an explicitly named site: scoring is a
+    heuristic about what will survive the next build, and it must not be
+    allowed to discard evidence the caller supplied on purpose. Everything
+    else is then selected around them, and may not overlap them.
     """
     pool = dedup_and_order(candidates)
 
     # Axis order is priority order: ENTRY resolves with no .pdata and no xref,
     # an external REL survives a rewritten prologue, BODY is the fallback.
-    selected = []
+    selected = list(dedup_and_order(pinned))[:max_count]
+    pinned_patterns = {c.signature for c in selected}
+    pool = [c for c in pool if c.signature not in pinned_patterns]
     for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_BODY):
         cand = _best_for_axis(pool, axis, selected)
         if cand is not None:
@@ -322,8 +411,14 @@ def select_function_candidates(candidates, max_count=MAX_EXPORTED_CANDIDATES):
         selected.append(cand)
         used_origins.add(cand.origin)
 
-    selected.sort(key=lambda c: c.sort_key())
-    return selected[:max_count]
+    # Pinned candidates keep their slots through the truncation: sorting the
+    # whole list by score could otherwise rank an explicitly named site out of
+    # the file, which is the one outcome the caller asked us to prevent.
+    keep = [c for c in selected if c.signature in pinned_patterns]
+    rest = [c for c in selected if c.signature not in pinned_patterns]
+    rest.sort(key=lambda c: c.sort_key())
+    keep.sort(key=lambda c: c.sort_key())
+    return (keep + rest)[:max_count]
 
 
 def select_global_candidates(candidates, max_count=MAX_GLOBAL_CANDIDATES):
@@ -373,6 +468,187 @@ def value_coverage(selected):
     return {
         AXIS_VALUE: cfs6.COV_SELECTED if selected else cfs6.COV_NONE_UNIQUE
     }
+
+
+# Why an axis produced nothing. A closed set, because the whole point is that
+# a caller can branch on it instead of parsing English.
+WHY_SELECTED = "selected"
+WHY_NOT_ATTEMPTED = "not_attempted"
+WHY_NO_UNIQUE_WINDOW = "no_unique_window"
+WHY_CLONE_FAMILY = "clone_family"
+WHY_NO_XREFS = "no_xrefs"
+WHY_DATA_XREFS_ONLY = "data_xrefs_only"
+WHY_XREFS_NOT_UNIQUE = "xrefs_not_unique"
+WHY_OUTSIDE_PDATA = "unique_anchor_outside_pdata"
+
+# How many identical siblings we bother counting before saying "at least N".
+CLONE_COUNT_LIMIT = 8
+
+
+def diagnose_function(coverage, facts):
+    """Per-axis {reason, detail} for one function, from plain facts.
+
+    `facts` is whatever the finders observed, all optional:
+
+        entry_matches   how many times the longest ENTRY window still matched
+        xref_count      code/data references to the function that were found
+        xrefs_tested    how many of them a REL window was attempted at
+        body_near_miss  [{offset, byte_len, ownership}] unique body anchors
+                        that exist but were not exported
+
+    Kept here, free of `ida_*`, because "no unique signature" was the whole
+    problem: a caller could not tell a function with 40 byte-identical clones
+    from one with no callers, and had to re-derive the difference by hand. The
+    mapping from facts to reason is a rule, so it is testable like one.
+    """
+    facts = facts or {}
+    out = {}
+
+    for axis, state in (coverage or {}).items():
+        if state == cfs6.COV_SELECTED:
+            out[axis] = {"reason": WHY_SELECTED, "detail": ""}
+            continue
+        if state == cfs6.COV_NOT_APPLICABLE:
+            out[axis] = {"reason": WHY_NOT_ATTEMPTED, "detail": "axis does not apply"}
+            continue
+        out[axis] = _diagnose_missing_axis(axis, facts)
+
+    return out
+
+
+def _diagnose_missing_axis(axis, facts):
+    if axis == AXIS_ENTRY:
+        matches = facts.get("entry_matches")
+        if matches and matches >= 2:
+            # The decisive fact: N byte-identical prologues means *no* prefix
+            # pattern can ever work, so the answer is a structural anchor, not
+            # a longer ENTRY window.
+            at_least = "at least " if matches >= CLONE_COUNT_LIMIT else ""
+            return {
+                "reason": WHY_CLONE_FAMILY,
+                "detail": "the longest prologue window still matches %s%d "
+                          "places; no entry pattern can be unique"
+                          % (at_least, matches),
+                "matches": matches,
+            }
+        return {"reason": WHY_NO_UNIQUE_WINDOW,
+                "detail": "no prologue window reached a unique match"}
+
+    if axis in (AXIS_EXTERNAL_REL, AXIS_SELF_REL):
+        count = int(facts.get("xref_count") or 0)
+        data_count = int(facts.get("data_xref_count") or 0)
+        if not count and data_count:
+            # The distinction is worth spelling out: the address *is*
+            # referenced, just by an instruction that takes it rather than
+            # calls it (`lea rdx, [rip+x]` handing a callback to a registrar),
+            # and the REL axis searches call/jump sites only.
+            return {
+                "reason": WHY_DATA_XREFS_ONLY,
+                "detail": "no call or jump references it; %d instruction(s) "
+                          "take its address instead (a `lea`-passed callback)"
+                          % data_count,
+                "xref_count": 0,
+                "data_xref_count": data_count,
+            }
+        if not count:
+            return {"reason": WHY_NO_XREFS,
+                    "detail": "nothing in the image references this address "
+                              "from code (a vtable-only callee has no call "
+                              "site to anchor on)",
+                    "xref_count": 0}
+        return {
+            "reason": WHY_XREFS_NOT_UNIQUE,
+            "detail": "%d reference(s), %d tested, none yielded a unique "
+                      "window" % (count, int(facts.get("xrefs_tested") or 0)),
+            "xref_count": count,
+        }
+
+    if axis == AXIS_BODY:
+        near = facts.get("body_near_miss") or []
+        if near:
+            return {
+                "reason": WHY_OUTSIDE_PDATA,
+                "detail": "%d unique body anchor(s) exist but sit outside the "
+                          "function's own .pdata range, so a non-IDA consumer "
+                          "could not map a hit back to the function"
+                          % len(near),
+                "near_miss": list(near),
+            }
+        return {"reason": WHY_NO_UNIQUE_WINDOW,
+                "detail": "no unique window inside the function's .pdata range"}
+
+    return {"reason": WHY_NO_UNIQUE_WINDOW, "detail": ""}
+
+
+class FunctionSearch:
+    """Everything one item's search produced, findings and failures alike.
+
+    Returned instead of a tuple because the failure half is now as
+    load-bearing as the success half: "no unique signature" was true and
+    useless, and the caller had to re-derive the actual cause by hand. An
+    object also means a later axis or counter can be added without breaking
+    every unpacking site.
+    """
+
+    __slots__ = (
+        "candidates", "coverage", "total_xrefs", "searched_xrefs",
+        "diagnosis", "site_rejections", "pinned",
+    )
+
+    def __init__(self, candidates=(), coverage=None, total_xrefs=0,
+                 searched_xrefs=0, diagnosis=None, site_rejections=(),
+                 pinned=0):
+        self.candidates = list(candidates)
+        self.coverage = dict(coverage or {})
+        self.total_xrefs = int(total_xrefs)
+        self.searched_xrefs = int(searched_xrefs)
+        self.diagnosis = dict(diagnosis or {})
+        self.site_rejections = list(site_rejections)
+        self.pinned = int(pinned)
+
+    def __bool__(self):
+        return bool(self.candidates)
+
+    def __len__(self):
+        return len(self.candidates)
+
+    @property
+    def near_misses(self):
+        """Advisory anchors that exist but are not exportable."""
+        out = []
+        for axis, entry in sorted(self.diagnosis.items()):
+            for item in entry.get("near_miss", ()):
+                record = dict(item)
+                record["axis"] = axis
+                out.append(record)
+        return out
+
+    def failure_reason(self):
+        """One line naming *which* axis failed and why, for a miss report."""
+        parts = []
+        for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_SELF_REL, AXIS_BODY):
+            entry = self.diagnosis.get(axis)
+            if entry is None or entry["reason"] in (
+                WHY_SELECTED, WHY_NOT_ATTEMPTED
+            ):
+                continue
+            parts.append("%s: %s" % (axis, entry["reason"]))
+        if not parts:
+            return "no unique signature"
+        return "no unique signature (%s)" % "; ".join(parts)
+
+    def explain(self):
+        """The long form: every failed axis with its full detail."""
+        lines = []
+        for axis in (AXIS_ENTRY, AXIS_EXTERNAL_REL, AXIS_SELF_REL, AXIS_BODY):
+            entry = self.diagnosis.get(axis)
+            if entry is None or entry["reason"] in (
+                WHY_SELECTED, WHY_NOT_ATTEMPTED
+            ):
+                continue
+            lines.append("  %-13s %s -- %s"
+                         % (axis, entry["reason"], entry["detail"]))
+        return "\n".join(lines)
 
 
 def coverage_for(selected, attempted_axes):

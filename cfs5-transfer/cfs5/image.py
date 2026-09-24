@@ -241,6 +241,28 @@ class BodyOwnership:
         except Exception:
             return None
 
+    def chain_span(self, func_ea):
+        """(start_ea, end_ea) of the whole .pdata chain beginning at func_ea.
+
+        `primary_span` answers what a BODY *anchor* may sit in -- only the one
+        entry a consumer can map a hit back to. This answers the different
+        question a confirm signature asks: what will a consumer actually
+        **scan** once it has already resolved the function? That is the maximal
+        run of abutting entries, so uniqueness must be measured over it.
+
+        None when .pdata is unavailable or func_ea is not an entry begin.
+        """
+        if not self.available:
+            return None
+        try:
+            start_rva = int(func_ea) - self.imagebase
+            end_rva = self.index.chain_end(start_rva)
+            if end_rva is None:
+                return None
+            return (func_ea, end_rva + self.imagebase)
+        except Exception:
+            return None
+
     def classify(self, func_ea, anchor_ea):
         """'pdata' when an external consumer can recover func_ea from a hit."""
         if not self.available:

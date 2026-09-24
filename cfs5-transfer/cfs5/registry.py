@@ -64,8 +64,58 @@ def parse_entry_id(value):
     raise RegistryError("%r is not a registry entry id" % (value,))
 
 
-def normalize(kind, names):
-    """(ids, rejected) for a batch, order-stable and deduplicated.
+# A site is an address in the current image, so unlike a name it cannot be
+# re-derived later -- it is stored as given and re-verified at export time.
+_NO_EA = 0xFFFFFFFFFFFFFFFF
+
+
+def normalize_entry(kind, entry):
+    """(id, sites) for one entry, which may be a name or an object.
+
+    An entry is either `"Name"` or `{"name": "Name", "sites": [...]}`. The
+    object form exists for the case discovery cannot serve: when no prologue,
+    call site or body window is unique, the only thing left is the anchor the
+    caller found for itself, and there has to be a way to hand it over.
+    """
+    if isinstance(entry, dict):
+        name = entry.get("name")
+        sites = normalize_sites(entry.get("sites", ()))
+    else:
+        name, sites = entry, []
+    return entry_id(kind, name), sites
+
+
+def normalize_sites(sites):
+    """[ea, ...] deduplicated and order-stable. Raises on anything else.
+
+    Accepts a bare integer or `{"ea": ...}` so a caller can pass what it
+    already has. Zero and BADADDR are dropped rather than stored: they are how
+    "no address" arrives from IDA, and an export would otherwise try to decode
+    an instruction at address zero and report a confusing rejection.
+    """
+    out = []
+    seen = set()
+    for site in sites or ():
+        if isinstance(site, dict):
+            value = site.get("ea")
+        else:
+            value = site
+        if value is None:
+            continue
+        try:
+            ea = int(value)
+        except (TypeError, ValueError):
+            raise RegistryError("site %r is not an address" % (site,))
+        if ea == 0 or ea == _NO_EA:
+            continue
+        if ea not in seen:
+            seen.add(ea)
+            out.append(ea)
+    return out
+
+
+def normalize_entries(kind, entries):
+    """(ids, sites_by_id, rejected) for a batch, order-stable, deduplicated.
 
     Never raises on a bad member of the batch: an agent registering fifty
     names should learn which two were wrong and keep the other forty-eight,
@@ -73,18 +123,32 @@ def normalize(kind, names):
     """
     ids = []
     seen = set()
+    sites_by_id = {}
     rejected = []
 
-    for name in names or ():
+    for entry in entries or ():
         try:
-            iid = entry_id(kind, name)
+            iid, sites = normalize_entry(kind, entry)
         except RegistryError as exc:
+            name = entry.get("name") if isinstance(entry, dict) else entry
             rejected.append({"name": name, "kind": kind, "reason": str(exc)})
             continue
         if iid not in seen:
             seen.add(iid)
             ids.append(iid)
+        if sites:
+            # Re-registering with more sites adds to them rather than
+            # replacing: an agent that finds a second anchor should not have
+            # to repeat the first one.
+            merged = sites_by_id.setdefault(iid, [])
+            merged.extend(s for s in sites if s not in merged)
 
+    return ids, sites_by_id, rejected
+
+
+def normalize(kind, names):
+    """(ids, rejected) for a batch, ignoring any sites the entries carry."""
+    ids, _sites, rejected = normalize_entries(kind, names)
     return ids, rejected
 
 

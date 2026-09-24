@@ -79,45 +79,76 @@ def _resolve(kind, name):
     return ea, None
 
 
-def _collect(function_names, global_names, check_db=True):
-    """([function_ea], [global_ea], unresolved) for two batches of names."""
+def _collect(function_names, global_names, sites_by_id=None):
+    """([function_ea], [global_ea], sites_by_ea, unresolved) for two batches."""
     function_eas, global_eas, unresolved = [], [], []
+    sites_by_id = sites_by_id or {}
+    sites_by_ea = {}
 
     for kind, names, bucket in (
         (registry.KIND_FUNCTION, function_names, function_eas),
         (registry.KIND_GLOBAL, global_names, global_eas),
     ):
-        ids, bad = registry.normalize(kind, names)
+        ids, entry_sites, bad = registry.normalize_entries(kind, names)
         unresolved.extend(bad)
         for iid in ids:
             name = registry.parse_entry_id(iid)[1]
-            if not check_db:
-                bucket.append(name)
-                continue
             ea, error = _resolve(kind, name)
             if error is not None:
                 unresolved.append({"kind": kind, "name": name, "reason": error})
                 continue
             bucket.append(ea)
+            # Sites given in this call and sites stored at registration are
+            # the same kind of evidence; use both.
+            merged = list(sites_by_id.get(iid, ()))
+            merged.extend(s for s in entry_sites.get(iid, ()) if s not in merged)
+            if merged and kind == registry.KIND_FUNCTION:
+                sites_by_ea[ea] = merged
 
-    return function_eas, global_eas, unresolved
+    return function_eas, global_eas, sites_by_ea, unresolved
 
 
 def register(function_names=(), global_names=()):
     """Add names to this IDB's export set.
+
+    An entry is a name, or an object carrying anchor sites:
+
+        register(function_names=[
+            "CCSPlayer_Think",
+            {"name": "ui_toolkit_show_generic_popup_ok",
+             "sites": [0x108C545]},
+        ])
+
+    A site is an address you have already determined identifies the function:
+    an instruction that references it (a `call`, a `jmp`, or the `lea` that
+    passes it to a registrar), or an instruction inside it to anchor a body
+    pattern on. It exists because automatic discovery legitimately runs out of
+    options -- a function whose only reference is from a vtable has no call
+    site, and one belonging to a family of byte-identical clones has no unique
+    prologue -- and when it does, the address you found by hand is the only
+    evidence left.
+
+    What a site is **not** is a signature. The exporter re-decodes it, re-
+    derives what it references, and refuses it if that is not this function;
+    then it builds and uniqueness-checks a pattern exactly as it would for a
+    discovered anchor. You supply where to look; the database supplies the
+    answer. A refused site is reported in `unresolved` and in the export's
+    `advisory` list -- it never silently exports something else.
 
     Names are validated for shape and checked against the database now, so a
     typo is reported at registration instead of silently producing nothing at
     export time. Registration itself does no analysis and is cheap.
     """
     existing = set(store.load_registry())
+    stored_sites = store.load_sites()
     added, already, unresolved = [], [], []
+    site_count = 0
 
     for kind, names in (
         (registry.KIND_FUNCTION, function_names),
         (registry.KIND_GLOBAL, global_names),
     ):
-        ids, bad = registry.normalize(kind, names)
+        ids, entry_sites, bad = registry.normalize_entries(kind, names)
         unresolved.extend(bad)
         for iid in ids:
             name = registry.parse_entry_id(iid)[1]
@@ -125,6 +156,20 @@ def register(function_names=(), global_names=()):
             if error is not None:
                 unresolved.append({"kind": kind, "name": name, "reason": error})
                 continue
+
+            sites = entry_sites.get(iid, ())
+            if sites and kind != registry.KIND_FUNCTION:
+                unresolved.append({
+                    "kind": kind, "name": name,
+                    "reason": "sites apply to functions only; a global is "
+                              "anchored from its data references",
+                })
+            elif sites:
+                merged = list(stored_sites.get(iid, ()))
+                merged.extend(s for s in sites if s not in merged)
+                stored_sites[iid] = merged
+                site_count += len(sites)
+
             if iid in existing:
                 already.append(name)
                 continue
@@ -134,6 +179,13 @@ def register(function_names=(), global_names=()):
     if not store.save_registry(existing):
         return _result(error="could not persist the export set to the IDB",
                        unresolved=unresolved, added=0, already=0, total=0)
+    if site_count and not store.save_sites(stored_sites):
+        # The names are in; saying the sites are too would be a lie the
+        # caller only discovers as a mysteriously unanchored export.
+        unresolved.append({
+            "kind": registry.KIND_FUNCTION, "name": "<sites>",
+            "reason": "the export set was saved but its anchor sites were not",
+        })
 
     accepted = len(added) + len(already)
     ok, partial = registry.outcome(accepted + len(unresolved), accepted,
@@ -145,6 +197,7 @@ def register(function_names=(), global_names=()):
         unresolved=unresolved,
         added=len(added), added_names=sorted(added),
         already=len(already),
+        sites=site_count,
         total=len(existing),
     )
 
@@ -152,6 +205,7 @@ def register(function_names=(), global_names=()):
 def unregister(function_names=(), global_names=()):
     """Remove names from the export set. Absent names are not an error."""
     existing = set(store.load_registry())
+    stored_sites = store.load_sites()
     removed = []
 
     for kind, names in (
@@ -160,6 +214,9 @@ def unregister(function_names=(), global_names=()):
     ):
         ids, _bad = registry.normalize(kind, names)
         for iid in ids:
+            # Sites go with the entry: leaving them behind would silently
+            # re-attach them if the same name were registered again later.
+            stored_sites.pop(iid, None)
             if iid in existing:
                 existing.discard(iid)
                 removed.append(registry.parse_entry_id(iid)[1])
@@ -167,6 +224,7 @@ def unregister(function_names=(), global_names=()):
     if not store.save_registry(existing):
         return _result(error="could not persist the export set to the IDB",
                        removed=0, total=0)
+    store.save_sites(stored_sites)
     return _result(ok=True, removed=len(removed),
                    removed_names=sorted(removed), total=len(existing))
 
@@ -175,6 +233,7 @@ def clear():
     """Empty the export set."""
     if not store.save_registry([]):
         return _result(error="could not persist the export set")
+    store.save_sites({})
     return _result(ok=True, total=0)
 
 
@@ -194,6 +253,13 @@ def registered():
             if error is not None:
                 unresolved.append({"kind": kind, "name": name, "reason": error})
 
+    sites = {}
+    for iid, eas in store.load_sites().items():
+        try:
+            sites[registry.parse_entry_id(iid)[1]] = [ea_str(ea) for ea in eas]
+        except registry.RegistryError:
+            continue
+
     resolved = len(ids) - len(unresolved)
     ok, partial = registry.outcome(len(ids), resolved, unresolved)
     return _result(
@@ -201,6 +267,7 @@ def registered():
         unresolved=unresolved,
         functions=by_kind[registry.KIND_FUNCTION],
         globals=by_kind[registry.KIND_GLOBAL],
+        sites=sites,
         declared_members=[d.qualified for d in store.load_all()],
         counts={
             "functions": len(by_kind[registry.KIND_FUNCTION]),
@@ -402,7 +469,7 @@ def declarations():
 
 
 def _run_export(path, function_eas, global_eas, unresolved, merge, build,
-                include_members):
+                include_members, function_sites=None):
     """Shared tail of `export` and `export_list`."""
     if not isinstance(path, str) or not path:
         return _result(error="path is required", unresolved=unresolved)
@@ -427,6 +494,7 @@ def _run_export(path, function_eas, global_eas, unresolved, merge, build,
         function_eas=function_eas, global_eas=global_eas,
         declarations=declarations,
         build=(build_number, build_source), merge=merge,
+        function_sites=function_sites,
     )
 
     # Names that never resolved never reached the engine, so they have to be
@@ -457,6 +525,10 @@ def _run_export(path, function_eas, global_eas, unresolved, merge, build,
         merged=raw.get("merged"),
         mode=raw.get("mode"),
         cancelled=raw.get("cancelled", False),
+        # Not failures: anchors that exist but could not be exported, and
+        # sites that did not survive verification. An item can be exported
+        # and still have something here worth reading.
+        advisory=raw.get("advisory", []),
         summary=raw.get("summary", ""),
     )
 
@@ -473,11 +545,12 @@ def export(path, merge=_export.MERGE_APPEND, build=None, include_members=True):
     path and never invented (an undetectable build is recorded as unknown).
     """
     by_kind = registry.split_by_kind(store.load_registry())
-    function_eas, global_eas, unresolved = _collect(
-        by_kind[registry.KIND_FUNCTION], by_kind[registry.KIND_GLOBAL]
+    function_eas, global_eas, sites, unresolved = _collect(
+        by_kind[registry.KIND_FUNCTION], by_kind[registry.KIND_GLOBAL],
+        sites_by_id=store.load_sites(),
     )
     return _run_export(path, function_eas, global_eas, unresolved,
-                       merge, build, include_members)
+                       merge, build, include_members, function_sites=sites)
 
 
 def export_list(path, function_names=(), global_names=(),
@@ -486,7 +559,12 @@ def export_list(path, function_names=(), global_names=(),
 
     For the case where the agent already knows the whole list and has no use
     for persistence. Nothing here reads or writes the export set.
+
+    Entries may carry `sites` exactly as in `register`, so a one-shot export
+    can hand over an anchor without registering anything first.
     """
-    function_eas, global_eas, unresolved = _collect(function_names, global_names)
+    function_eas, global_eas, sites, unresolved = _collect(
+        function_names, global_names
+    )
     return _run_export(path, function_eas, global_eas, unresolved,
-                       merge, build, include_members)
+                       merge, build, include_members, function_sites=sites)
