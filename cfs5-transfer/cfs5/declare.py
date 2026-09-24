@@ -115,12 +115,12 @@ class Declaration:
 
     __slots__ = (
         "semantic", "owner", "name", "member", "sites", "discovery",
-        "asserted_value", "value_adjust", "site_options", "version",
+        "asserted_value", "value_adjust", "site_options", "recipe", "version",
     )
 
     def __init__(self, semantic, owner, name, member=None, sites=(),
                  discovery=DISCOVER_SITES_ONLY, asserted_value=None,
-                 value_adjust=0, version=DECL_VERSION):
+                 value_adjust=0, recipe=None, version=DECL_VERSION):
         if semantic not in cfs6.VALID_SEMANTICS:
             raise DeclarationError("unsupported semantic %r" % (semantic,))
         self.semantic = semantic
@@ -195,6 +195,7 @@ class Declaration:
                 )
 
         self.value_adjust = int(value_adjust)
+        self.recipe = dict(recipe or {})
         self.version = int(version)
 
     @property
@@ -259,6 +260,7 @@ class Declaration:
             "discovery": self.discovery,
             "asserted_value": self.asserted_value,
             "value_adjust": self.value_adjust,
+            "recipe": self.recipe,
         }
 
     def __repr__(self):
@@ -310,6 +312,7 @@ def from_dict(data):
         discovery=discovery,
         asserted_value=data.get("asserted_value"),
         value_adjust=data.get("value_adjust", 0),
+        recipe=data.get("recipe") or {},
         version=DECL_VERSION,
     )
 
@@ -323,7 +326,7 @@ def make_member(owner, name, member=None, sites=(),
     )
 
 
-def make_stride(owner, name, value, sites, value_adjust=0):
+def make_stride(owner, name, value, sites, value_adjust=0, recipe=None):
     """An `element_stride` declaration: a constant encoded in code.
 
     Unlike a member offset there is no field in the database to read, so the
@@ -337,10 +340,27 @@ def make_stride(owner, name, value, sites, value_adjust=0):
     finding other instructions encoding the same number would be numeric
     coincidence, not evidence -- the one thing the candidate rules forbid.
     """
+    recipe = dict(recipe or {})
+    if recipe:
+        if recipe.get("op") != cfs6.OP_LEA_SCALE_CHAIN:
+            raise DeclarationError("unsupported stride recipe")
+        steps = recipe.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise DeclarationError("LEA_SCALE_CHAIN requires steps")
+        clean = []
+        for step in steps:
+            if not isinstance(step, dict) or step.get("ea") is None \
+                    or step.get("op") is None:
+                raise DeclarationError("each LEA_SCALE_CHAIN step needs ea and op")
+            clean.append({"ea": int(step["ea"]), "op": int(step["op"])})
+        recipe = {"op": cfs6.OP_LEA_SCALE_CHAIN, "steps": clean}
+    if not sites and recipe.get("op") == cfs6.OP_LEA_SCALE_CHAIN:
+        sites = recipe.get("steps", ())
     return Declaration(
         cfs6.SEM_ELEMENT_STRIDE, owner, name, member=name,
         sites=sites, discovery=DISCOVER_SITES_ONLY,
         asserted_value=value, value_adjust=value_adjust,
+        recipe=recipe,
     )
 
 

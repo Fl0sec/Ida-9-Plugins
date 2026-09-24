@@ -166,6 +166,26 @@ an instruction start in the same function, at or before the extraction
 instruction; the exporter grows only windows starting there and still requires
 image-wide uniqueness.
 
+A compound stride whose value is encoded only by a bounded LEA chain uses a
+closed recipe rather than an expression or caller-provided bytes:
+
+```python
+api.declare_strides([{
+    "owner": "CModelHitboxSet", "name": "kStride", "value": 0x48,
+    "recipe": {"op": "LEA_SCALE_CHAIN", "steps": [
+        {"ea": 0x1000, "op": 1},
+        {"ea": 0x1004, "op": 1},
+        {"ea": 0x1008, "op": 1},
+    ]},
+}])
+```
+
+The exporter requires every step to decode as LEA in one function, derives
+base/index scale coefficients from instruction bytes, ignores additive
+base/displacement terms, and requires the folded coefficient to reproduce the
+asserted stride. The file carries only instruction offsets, sizes, and operand
+indices; consumers independently decode and fold the same chain.
+
 Patch sites are instruction locations, not functions or values:
 
 ```python

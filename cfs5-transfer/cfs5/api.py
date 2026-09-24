@@ -562,10 +562,11 @@ def _declare_asserted(entries, kind, make):
                 raise declare.DeclarationError(
                     "a %s must assert a 'value'" % kind
                 )
-            decl = make(
-                owner, name, entry["value"], entry.get("sites", ()),
-                value_adjust=entry.get("value_adjust", 0),
-            )
+            kwargs = {"value_adjust": entry.get("value_adjust", 0)}
+            if kind == "stride":
+                kwargs["recipe"] = entry.get("recipe")
+            decl = make(owner, name, entry["value"], entry.get("sites", ()),
+                        **kwargs)
         except declare.DeclarationError as exc:
             unresolved.append({"kind": kind, "name": str(entry),
                                "reason": str(exc)})

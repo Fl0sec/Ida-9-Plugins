@@ -92,6 +92,12 @@ Extents are `align_up(DISP + access_width, alignment)` with a required expected
 value; never invent zero. An alternate window start is an instruction in the
 same function and supplies location only, never bytes.
 
+Compound strides use only the closed `LEA_SCALE_CHAIN` recipe. Declarations
+name step EAs and operand indices; producer and consumer decode each LEA and
+fold register coefficients independently. Additive bases/displacements do not
+contribute to stride. Expression strings and supplied pattern bytes are outside
+the format.
+
 ## Derived values (`derived_value` + `VALUE`, schema revision 1)
 
 `member_offset`, `element_stride` and `constant` are produced today; `object_extent` is reserved. `member_offset` takes its value from a live IDA field; the other two assert it and are gated on their own sites instead (`declare.make_stride` / `make_constant` — one shared implementation in `api._declare_asserted`, because they differ only in what a consumer does with the number). `semantic`, extraction `op` (`CONST`/`DISP`/`IMM`/`SCALE`/`DISP_PLUS_WIDTH`) and `VALUE` `origin` are **closed sets** — a consumer rejects an unknown value rather than interpreting it. No expression strings, ever.

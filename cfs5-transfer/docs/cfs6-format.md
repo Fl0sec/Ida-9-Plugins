@@ -301,10 +301,11 @@ would stop matching exactly when the answer became interesting.
 | `IMM` | the instruction immediate at `field_offset` |
 | `SCALE` | the SIB index scale factor |
 | `DISP_PLUS_WIDTH` | `DISP` + `access_width` |
+| `LEA_SCALE_CHAIN` | decode bounded LEA steps and fold index coefficients |
 
 There are deliberately **no expression strings and no embedded scripts**. A
 consumer MUST reject an `op` it does not know. `CONST`, `DISP` and `IMM` are
-produced today; `SCALE` and `DISP_PLUS_WIDTH` are reserved.
+produced today; `SCALE` remains reserved.
 
 **Read the field exactly as `resolve.signed` says, per candidate — not per
 `op`.** A displacement is signed, because a subobject-relative access is
@@ -495,6 +496,13 @@ extent = align_up(read_signed_displacement + access_width, alignment)
 zero. A producer-supplied alternate VALUE window start changes only where
 pattern growth begins. It never supplies pattern bytes and must remain inside
 the same function while containing the extraction instruction.
+
+`LEA_SCALE_CHAIN` is the compound-stride exception to the scalar field layout.
+Its `resolve.steps` is a non-empty ordered list of `instruction_offset`,
+`instruction_size`, and `operand_index`, all contained by the pattern. The
+consumer decodes every LEA, propagates proven register coefficients, ignores
+additive external bases and displacements, and returns the final destination
+coefficient. Expression strings and embedded pattern bytes are not accepted.
 
 ## 6. Resolution
 

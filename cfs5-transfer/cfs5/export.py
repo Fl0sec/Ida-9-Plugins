@@ -33,6 +33,7 @@ from .policy import (
 from .sigs import (
     choose_function_candidates, choose_global_candidates,
     choose_value_candidates, find_patch_candidate,
+    choose_lea_scale_chain_candidate,
 )
 from .typeio import (
     build_local_type_index,
@@ -355,10 +356,32 @@ def _contradicting_sites(decl, expected):
     is fatal.
     """
     out = []
+    if decl.recipe.get("op") == cfs6.OP_LEA_SCALE_CHAIN:
+        # The compound finder decodes and folds the whole chain as one proof;
+        # treating each LEA as if it directly encoded the final stride is the
+        # category error this recipe exists to avoid.
+        return out
     for site_ea, site_op in decl.sites:
         insn = decode_at(site_ea)
         if insn is None:
             continue
+        if decl.semantic == cfs6.SEM_OBJECT_EXTENT:
+            raw, _width = members.operand_displacement(insn, site_op)
+            options = decl.site_options.get((site_ea, site_op), {})
+            if raw is not None:
+                try:
+                    produced = cfs6.evaluate_value_recipe(raw, {
+                        "op": cfs6.OP_DISP_PLUS_WIDTH,
+                        "access_width": options["access_width"],
+                        "value_adjust": decl.value_adjust,
+                        "alignment": options.get("alignment", 1),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    produced = None
+                if produced == expected:
+                    continue
+                out.append((site_ea, "recipe produced %s" % produced))
+                continue
         if infer_displacement_field(insn, expected) is not None:
             continue
         if infer_immediate_field(insn, expected) is not None:
@@ -426,6 +449,8 @@ def write_member(writer, state, decl, ranges):
     reasons = {}
 
     def _generate(into):
+        if decl.recipe.get("op") == cfs6.OP_LEA_SCALE_CHAIN:
+            return choose_lea_scale_chain_candidate(decl, ranges, into)
         return choose_value_candidates(
             site_value, ranges, selected_sites=decl.sites, ref=ref,
             allow_scan=decl.scan_allowed, value_adjust=decl.value_adjust,

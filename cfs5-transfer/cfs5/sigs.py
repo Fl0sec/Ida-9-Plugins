@@ -23,6 +23,7 @@ import ida_ua
 from . import cfs6
 from . import confirm
 from . import memberscan
+from . import leachain
 from . import registry
 from . import rtti
 from . import strloc
@@ -783,7 +784,7 @@ def find_value_candidate_for_site(
         func_size=chunk.end_ea - chunk.start_ea,
         insn_offset=insn_offset,
         extract=extract,
-        value=encoded + int(value_adjust),
+        value=cfs6.evaluate_value_recipe(encoded, extract),
     )
 
 
@@ -896,7 +897,11 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
                     continue
                 access_width = int(options.get("access_width", 0))
                 alignment = int(options.get("alignment", 1))
-                produced = -(-(actual_encoded + access_width) // alignment) * alignment
+                produced = cfs6.evaluate_value_recipe(actual_encoded, {
+                    "op": cfs6.OP_DISP_PLUS_WIDTH,
+                    "access_width": access_width,
+                    "alignment": alignment,
+                })
                 if access_width <= 0 or produced != int(extent_value):
                     if reasons is not None:
                         reasons[int(site_ea)] = REJECT_RECIPE_DISAGREES
@@ -916,8 +921,6 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
                 reasons[int(site_ea)] = "exception: %s" % exc
             continue
         if cand is not None:
-            if extent_value is not None:
-                cand.value = int(extent_value)
             found.append(cand)
 
     selected = select_value_candidates(found)
@@ -972,6 +975,86 @@ def find_patch_candidate(decl, ranges):
         func_ea=chunk.start_ea, func_size=chunk.end_ea - chunk.start_ea,
         insn_offset=decl.ea - stats["start_ea"],
     ), None
+
+
+def choose_lea_scale_chain_candidate(decl, ranges, reasons=None):
+    """One decoder-validated compound stride candidate."""
+    steps = decl.recipe.get("steps", ())
+    decoded = []
+    chunk = None
+    for step in steps:
+        ea = int(step["ea"])
+        op_index = int(step["op"])
+        insn = decode_at(ea)
+        if insn is None or (insn.get_canon_mnem() or "").lower() != "lea":
+            if reasons is not None:
+                reasons[ea] = "LEA_SCALE_CHAIN step is not a LEA"
+            return [], value_coverage([]), len(steps), len(decoded) + 1
+        if not 0 <= op_index < UA_MAXOP or insn.ops[op_index].type not in (
+            ida_ua.o_mem, ida_ua.o_phrase, ida_ua.o_displ,
+        ):
+            if reasons is not None:
+                reasons[ea] = "LEA_SCALE_CHAIN operand is not the memory source"
+            return [], value_coverage([]), len(steps), len(decoded) + 1
+        current = ida_funcs.get_fchunk(ea)
+        if current is None or (chunk is not None and current.start_ea != chunk.start_ea):
+            if reasons is not None:
+                reasons[ea] = "LEA_SCALE_CHAIN steps are not in one function"
+            return [], value_coverage([]), len(steps), len(decoded) + 1
+        chunk = current
+        raw = ida_bytes.get_bytes(ea, insn.size)
+        try:
+            decoded.append(leachain.decode_lea(raw))
+        except leachain.LeaChainError as exc:
+            if reasons is not None:
+                reasons[ea] = str(exc)
+            return [], value_coverage([]), len(steps), len(decoded)
+
+    try:
+        stride = leachain.fold_coefficients(decoded)
+    except leachain.LeaChainError as exc:
+        if reasons is not None:
+            reasons[int(steps[0]["ea"])] = str(exc)
+        return [], value_coverage([]), len(steps), len(steps)
+    if stride != int(decl.asserted_value):
+        if reasons is not None:
+            reasons[int(steps[0]["ea"])] = REJECT_RECIPE_DISAGREES
+        return [], value_coverage([]), len(steps), len(steps)
+
+    insns = decode_chunk(chunk.start_ea, chunk.end_ea)
+    indices = []
+    for step in steps:
+        idx = next((i for i, item in enumerate(insns)
+                    if item["ea"] == int(step["ea"])), None)
+        if idx is None:
+            return [], value_coverage([]), len(steps), len(steps)
+        indices.append(idx)
+    specs = declared_window_specs(insns, indices[0], indices[-1])
+    stats, why = _unique_window_around(
+        insns, indices[-1], ranges, min_exact=value_min_exact, specs=specs,
+    )
+    if stats is None:
+        if reasons is not None:
+            reasons[int(steps[0]["ea"])] = why
+        return [], value_coverage([]), len(steps), len(steps)
+
+    extract_steps = []
+    for step, info in zip(steps, decoded):
+        extract_steps.append({
+            "instruction_offset": int(step["ea"]) - stats["start_ea"],
+            "instruction_size": decode_at(int(step["ea"])).size,
+            "operand_index": int(step["op"]),
+        })
+    cand = Candidate(
+        mode="VALUE", signature=stats["signature"],
+        origin=ORIGIN_SELECTED_OPERAND, byte_len=stats["byte_len"],
+        wildcards=stats["wildcards"], exact=stats["exact"],
+        anchor_ea=stats["start_ea"], func_ea=chunk.start_ea,
+        func_size=chunk.end_ea - chunk.start_ea,
+        extract={"op": cfs6.OP_LEA_SCALE_CHAIN, "steps": extract_steps},
+        value=stride,
+    )
+    return [cand], value_coverage([cand]), len(steps), len(steps)
 
 
 # ---------------------------------------------------------------------------

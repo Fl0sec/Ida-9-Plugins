@@ -135,7 +135,9 @@ OP_DISP = "DISP"                        # signed memory displacement
 OP_IMM = "IMM"                          # instruction immediate
 OP_SCALE = "SCALE"                      # SIB index scale factor
 OP_DISP_PLUS_WIDTH = "DISP_PLUS_WIDTH"  # displacement + width of the access
-VALID_OPS = (OP_CONST, OP_DISP, OP_IMM, OP_SCALE, OP_DISP_PLUS_WIDTH)
+OP_LEA_SCALE_CHAIN = "LEA_SCALE_CHAIN"
+VALID_OPS = (OP_CONST, OP_DISP, OP_IMM, OP_SCALE, OP_DISP_PLUS_WIDTH,
+             OP_LEA_SCALE_CHAIN)
 VALID_FIELD_SIZES = (1, 2, 4, 8)
 
 # Where a derived_value candidate may come from. NORMATIVE: nothing else is
@@ -224,6 +226,24 @@ def unpack_json(payload):
 def normalize_pattern(pattern):
     """Collapse whitespace and upper-case an IDA-style byte pattern."""
     return " ".join(str(pattern).split()).upper()
+
+
+def evaluate_value_recipe(encoded_value, resolve):
+    """Evaluate a closed scalar VALUE recipe after decoding its field."""
+    op = resolve.get("op")
+    if op == OP_CONST:
+        value = int(resolve["value"])
+    elif op in (OP_DISP, OP_IMM):
+        value = int(encoded_value)
+    elif op == OP_DISP_PLUS_WIDTH:
+        value = int(encoded_value) + int(resolve.get("access_width", 0))
+    else:
+        raise ValueError("unsupported extraction op %r" % op)
+    value += int(resolve.get("value_adjust", 0))
+    alignment = int(resolve.get("alignment", 1))
+    if alignment > 1:
+        value = -(-value // alignment) * alignment
+    return value
 
 
 def item_id(kind, name):
@@ -1108,6 +1128,27 @@ def _validate_value_candidate(rec, pattern_len, line_no):
         raise ValueError("line %d: alignment must be >= 1" % line_no)
     if rec.access_width < 0:
         raise ValueError("line %d: access_width must be >= 0" % line_no)
+
+    if op == OP_LEA_SCALE_CHAIN:
+        steps = rec.resolve.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("line %d: LEA_SCALE_CHAIN needs steps" % line_no)
+        previous = -1
+        for step in steps:
+            if not isinstance(step, dict):
+                raise ValueError("line %d: LEA_SCALE_CHAIN step must be an object"
+                                 % line_no)
+            offset = int(step.get("instruction_offset", -1))
+            size = int(step.get("instruction_size", 0))
+            operand = int(step.get("operand_index", -1))
+            if offset < 0 or size <= 0 or offset + size > pattern_len:
+                raise ValueError("line %d: LEA_SCALE_CHAIN step is outside pattern"
+                                 % line_no)
+            if offset <= previous or operand != 1:
+                raise ValueError("line %d: LEA_SCALE_CHAIN steps are invalid"
+                                 % line_no)
+            previous = offset
+        return
 
     if op == OP_CONST:
         if "value" not in rec.resolve:

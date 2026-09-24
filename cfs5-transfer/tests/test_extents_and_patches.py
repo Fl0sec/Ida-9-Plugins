@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from _support import cfs6, sample_image, site_candidate, value_candidate
-from cfs5 import declare, patchdecl, policy
+from cfs5 import declare, leachain, patchdecl, policy
 import cfs6_resolve
 
 
@@ -25,6 +25,21 @@ class _Image:
 
 
 class ExtentDeclarationTests(unittest.TestCase):
+    def test_extent_recipe_applies_width_adjust_and_alignment(self):
+        self.assertEqual(cfs6.evaluate_value_recipe(0xC, {
+            "op": cfs6.OP_DISP_PLUS_WIDTH, "access_width": 8,
+        }), 0x14)
+        self.assertEqual(cfs6.evaluate_value_recipe(0x10, {
+            "op": cfs6.OP_DISP, "value_adjust": 4,
+        }), 0x14)
+        self.assertEqual(cfs6.evaluate_value_recipe(0x1D15, {
+            "op": cfs6.OP_DISP, "alignment": 8,
+        }), 0x1D18)
+        self.assertEqual(cfs6.evaluate_value_recipe(0xBB, {
+            "op": cfs6.OP_DISP_PLUS_WIDTH, "access_width": 2,
+            "value_adjust": 1, "alignment": 16,
+        }), 0xC0)
+
     def test_extent_preserves_recipe_inputs(self):
         decl = declare.make_extent("TraceFilter", "kSize", 0x40, [{
             "ea": 0x1234, "op": 0, "access_width": 1, "alignment": 8,
@@ -74,6 +89,53 @@ class ExtentDeclarationTests(unittest.TestCase):
         finally:
             if os.path.exists(path):
                 os.unlink(path)
+
+
+class LeaScaleChainTests(unittest.TestCase):
+    STEPS = [
+        bytes.fromhex("48 8D 04 C0"),      # rax = rax + rax*8 => 9
+        bytes.fromhex("48 8D 40 0C"),      # rax = rax + 0xC   => 9
+        bytes.fromhex("49 8D 04 C0"),      # rax = r8 + rax*8  => 72
+    ]
+
+    def test_decoder_folds_only_index_coefficients(self):
+        decoded = [leachain.decode_lea(raw) for raw in self.STEPS]
+        self.assertEqual(leachain.fold_coefficients(decoded), 0x48)
+
+    def test_stride_declaration_accepts_only_bounded_step_metadata(self):
+        recipe = {"op": cfs6.OP_LEA_SCALE_CHAIN, "steps": [
+            {"ea": 0x1000, "op": 1}, {"ea": 0x1004, "op": 1},
+            {"ea": 0x1008, "op": 1},
+        ]}
+        decl = declare.make_stride("CModelHitboxSet", "kStride", 0x48,
+                                   (), recipe=recipe)
+        self.assertEqual(decl.asserted_value, 0x48)
+        self.assertEqual(decl.recipe, recipe)
+        self.assertEqual(len(decl.sites), 3)
+
+    def test_reference_resolver_redecodes_every_lea(self):
+        data = b"".join(self.STEPS)
+        cand = cfs6.CandidateRecord(
+            1, "stride:CModelHitboxSet::kStride", 0, "VALUE",
+            " ".join("%02X" % b for b in data), "selected_operand",
+            resolve={"op": cfs6.OP_LEA_SCALE_CHAIN, "steps": [
+                {"instruction_offset": 0, "instruction_size": 4,
+                 "operand_index": 1},
+                {"instruction_offset": 4, "instruction_size": 4,
+                 "operand_index": 1},
+                {"instruction_offset": 8, "instruction_size": 4,
+                 "operand_index": 1},
+            ]},
+        )
+        value, error = cfs6_resolve.resolve_value(_Image(data), cand, 0)
+        self.assertIsNone(error)
+        self.assertEqual(value, 0x48)
+
+        bad = bytearray(data)
+        bad[8] = 0x90
+        value, error = cfs6_resolve.resolve_value(_Image(bytes(bad)), cand, 0)
+        self.assertIsNone(value)
+        self.assertIn("LEA", error)
 
 
 class PatchModelTests(unittest.TestCase):

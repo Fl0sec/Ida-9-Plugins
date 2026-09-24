@@ -19,6 +19,7 @@ sys.path.insert(
 )
 
 from cfs5 import cfs6          # noqa: E402
+from cfs5 import leachain      # noqa: E402
 from cfs5.peinfo import PeImage  # noqa: E402
 
 
@@ -119,7 +120,21 @@ def resolve_value(image, cand, match_rva):
     the field is described by operand as well as by position.
     """
     if cand.op == cfs6.OP_CONST:
-        return cand.const_value + cand.value_adjust, None
+        return cfs6.evaluate_value_recipe(0, cand.resolve), None
+    if cand.op == cfs6.OP_LEA_SCALE_CHAIN:
+        decoded = []
+        try:
+            for step in cand.resolve.get("steps", ()):
+                raw = image.read(
+                    match_rva + int(step["instruction_offset"]),
+                    int(step["instruction_size"]),
+                )
+                if raw is None:
+                    return None, "LEA_SCALE_CHAIN step bytes are not mapped"
+                decoded.append(leachain.decode_lea(raw))
+            return leachain.fold_coefficients(decoded), None
+        except (KeyError, TypeError, ValueError, leachain.LeaChainError) as exc:
+            return None, "invalid LEA_SCALE_CHAIN: %s" % exc
 
     insn_rva = match_rva + cand.instruction_offset
     field_rva = match_rva + cand.field_offset
@@ -133,23 +148,10 @@ def resolve_value(image, cand, match_rva):
         return None, "field bytes are not mapped"
     value = int.from_bytes(raw, "little", signed=cand.field_signed)
 
-    if cand.op == cfs6.OP_DISP:
-        result = value
-    elif cand.op == cfs6.OP_IMM:
-        # An immediate is read exactly as `resolve.signed` says. A stride or a
-        # size is a magnitude, so `0x80` in one byte is 128 -- reading it
-        # signed would silently produce -128. A displacement is the opposite
-        # case, which is why the flag is per candidate and not per op.
-        result = value
-    elif cand.op == cfs6.OP_DISP_PLUS_WIDTH:
-        result = value + cand.access_width
-    else:
-        return None, "unsupported extraction op %s" % cand.op
-
-    result += cand.value_adjust
-    if cand.alignment > 1:
-        result = -(-result // cand.alignment) * cand.alignment
-    return result, None
+    try:
+        return cfs6.evaluate_value_recipe(value, cand.resolve), None
+    except ValueError as exc:
+        return None, str(exc)
 
 
 def resolve_item(image, item):
