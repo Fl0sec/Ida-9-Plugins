@@ -103,6 +103,9 @@ def resolve(image, cand):
     if cand.mode == "VALUE":
         return resolve_value(image, cand, match_rva)
 
+    if cand.mode == cfs6.MODE_SITE:
+        return match_rva + cand.instruction_offset, None
+
     return None, "unsupported mode %s" % cand.mode
 
 
@@ -159,6 +162,13 @@ def resolve_item(image, item):
             details.append("rank%d/%s/%s: %s"
                            % (cand.rank, cand.mode, cand.origin, error))
         else:
+            if getattr(item, "kind", None) == cfs6.REC_PATCH:
+                expected = bytes.fromhex(item.expected_bytes)
+                raw = image.read(target, item.patch_size)
+                if raw is None or not raw.startswith(expected):
+                    details.append("rank%d/SITE: original opcode/span mismatch"
+                                   % cand.rank)
+                    continue
             results.append((cand, target))
             details.append("rank%d/%s/%s -> 0x%X"
                            % (cand.rank, cand.mode, cand.origin, target))

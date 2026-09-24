@@ -16,6 +16,7 @@ The REL machinery is target-agnostic: pass a code-xref collector to anchor a
 function, or a data-xref collector to anchor a global.
 """
 
+import ida_bytes
 import ida_funcs
 import ida_ua
 
@@ -49,6 +50,7 @@ from .policy import (
     AXIS_VTABLE,
     AXIS_STRING_REL,
     Candidate,
+    declared_window_specs,
     ENVELOPE_WORTH_PROBES,
     anchored_window_specs,
     FunctionSearch,
@@ -644,7 +646,7 @@ REJECT_NO_UNIQUE_WINDOW = "no_unique_pattern_around_the_site"
 
 def find_value_candidate_for_site(
     site_ea, encoded_value, ranges, origin, op_hint=None, value_adjust=0,
-    reasons=None,
+    reasons=None, window_start_ea=None, access_width=None, alignment=1,
 ):
     """A VALUE Candidate anchored at `site_ea` whose field holds `encoded_value`.
 
@@ -709,6 +711,19 @@ def find_value_candidate_for_site(
     if xidx is None:
         return _reject(REJECT_SITE_NOT_IN_CHUNK)
 
+    specs = None
+    if window_start_ea is not None:
+        window_start_ea = int(window_start_ea)
+        if not (chunk.start_ea <= window_start_ea <= site_ea < chunk.end_ea):
+            return _reject("window_start_is_not_in_the_same_function")
+        start_idx = next(
+            (i for i, item in enumerate(insns) if item["ea"] == window_start_ea),
+            None,
+        )
+        if start_idx is None:
+            return _reject("window_start_is_not_an_instruction_start")
+        specs = declared_window_specs(insns, start_idx, xidx)
+
     # The recipe this candidate will publish has to produce the number the
     # candidate claims. Checked here, before any of the expensive window work:
     # `source.expected_value` comes from the decoder's operand and the consumer
@@ -727,7 +742,7 @@ def find_value_candidate_for_site(
 
     stats, why = _unique_window_around(
         insns, xidx, ranges, min_exact=value_min_exact,
-        specs=anchored_window_specs(insns, xidx),
+        specs=specs or anchored_window_specs(insns, xidx),
     )
     if stats is None:
         return _reject(why or REJECT_NO_UNIQUE_WINDOW)
@@ -749,6 +764,10 @@ def find_value_candidate_for_site(
             # and reading 0x80 as -128 would be wrong.
             "signed": field.get("signed", True),
         }
+        if access_width is not None:
+            extract["op"] = cfs6.OP_DISP_PLUS_WIDTH
+            extract["access_width"] = int(access_width)
+            extract["alignment"] = int(alignment)
     if value_adjust:
         extract["value_adjust"] = int(value_adjust)
 
@@ -792,7 +811,8 @@ def _zero_offset_extract(insn, encoded, op_hint):
 
 def choose_value_candidates(encoded_value, ranges, selected_sites=(),
                             ref=None, allow_scan=True, value_adjust=0,
-                            sibling_offsets=None, reasons=None):
+                            sibling_offsets=None, reasons=None,
+                            site_options=None, extent_value=None):
     """Ranked VALUE candidates for one derived value.
 
     `encoded_value` is the number the *instruction* must encode, which for a
@@ -832,6 +852,8 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
     sites = []
     seen = set()
 
+    site_options = site_options or {}
+
     def _add(ea, op_hint, origin):
         ea = int(ea)
         if ea in seen:
@@ -858,9 +880,34 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
     for site_ea, op_hint, origin in sites:
         searched += 1
         try:
+            options = site_options.get((int(site_ea), int(op_hint)), {}) \
+                if op_hint is not None else {}
+            actual_encoded = encoded_value
+            if extent_value is not None:
+                insn = decode_at(site_ea)
+                if insn is None or op_hint is None:
+                    if reasons is not None:
+                        reasons[int(site_ea)] = REJECT_NO_DECODE
+                    continue
+                actual_encoded, _width = operand_displacement(insn, int(op_hint))
+                if actual_encoded is None:
+                    if reasons is not None:
+                        reasons[int(site_ea)] = REJECT_NO_FIELD
+                    continue
+                access_width = int(options.get("access_width", 0))
+                alignment = int(options.get("alignment", 1))
+                produced = -(-(actual_encoded + access_width) // alignment) * alignment
+                if access_width <= 0 or produced != int(extent_value):
+                    if reasons is not None:
+                        reasons[int(site_ea)] = REJECT_RECIPE_DISAGREES
+                    continue
             cand = find_value_candidate_for_site(
-                site_ea, encoded_value, ranges, origin,
+                site_ea, actual_encoded, ranges, origin,
                 op_hint=op_hint, value_adjust=value_adjust, reasons=reasons,
+                window_start_ea=options.get("window_start_ea"),
+                access_width=(options.get("access_width")
+                              if extent_value is not None else None),
+                alignment=options.get("alignment", 1),
             )
         except Exception as exc:
             # One odd instruction must not cost the whole member -- but say so,
@@ -869,6 +916,8 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
                 reasons[int(site_ea)] = "exception: %s" % exc
             continue
         if cand is not None:
+            if extent_value is not None:
+                cand.value = int(extent_value)
             found.append(cand)
 
     selected = select_value_candidates(found)
@@ -889,6 +938,40 @@ def choose_member_candidates(ref, ranges, selected_sites=(), value_adjust=0,
         allow_scan=allow_scan, value_adjust=value_adjust,
         sibling_offsets=sibling_offsets, reasons=reasons,
     )
+
+
+def find_patch_candidate(decl, ranges):
+    """A unique SITE candidate after validating opcode and instruction bounds."""
+    insn = decode_at(decl.ea)
+    if insn is None or (insn.get_canon_mnem() or "").lower() != decl.expected_instruction:
+        return None, "declared instruction does not match"
+    expected = bytes.fromhex(decl.expected_bytes)
+    raw = ida_bytes.get_bytes(decl.ea, decl.patch_size)
+    if raw is None or len(raw) != decl.patch_size or not raw.startswith(expected):
+        return None, "declared opcode bytes or patch span do not match"
+    if decl.patch_size < insn.size:
+        return None, "patch_size cuts through the declared instruction"
+    chunk = ida_funcs.get_fchunk(decl.ea)
+    if chunk is None:
+        return None, "patch site is not inside a function"
+    insns = decode_chunk(chunk.start_ea, chunk.end_ea)
+    xidx = next((i for i, item in enumerate(insns) if item["ea"] == decl.ea), None)
+    if xidx is None:
+        return None, "patch site is not an instruction start"
+    stats, reason = _unique_window_around(
+        insns, xidx, ranges, min_exact=candidate_min_exact,
+        specs=anchored_window_specs(insns, xidx),
+    )
+    if stats is None:
+        return None, reason
+    return Candidate(
+        mode=cfs6.MODE_SITE, signature=stats["signature"],
+        origin=cfs6.ORIGIN_DECLARED_PATCH_SITE,
+        byte_len=stats["byte_len"], wildcards=stats["wildcards"],
+        exact=stats["exact"], anchor_ea=stats["start_ea"],
+        func_ea=chunk.start_ea, func_size=chunk.end_ea - chunk.start_ea,
+        insn_offset=decl.ea - stats["start_ea"],
+    ), None
 
 
 # ---------------------------------------------------------------------------

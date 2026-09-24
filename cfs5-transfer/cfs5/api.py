@@ -40,6 +40,7 @@ import ida_name
 from . import declare
 from . import export as _export
 from . import members as _members
+from . import patchdecl
 from . import registry
 from . import rtti
 from . import selection
@@ -507,6 +508,39 @@ def declare_constants(constants=()):
     return _declare_asserted(constants, "constant", declare.make_constant)
 
 
+def declare_extents(extents=()):
+    """Declare object extents derived from displacement + access width.
+
+    Every site requires positive `access_width`; `alignment` defaults to 1.
+    The exported consumer recipe is DISP_PLUS_WIDTH followed by align-up.
+    """
+    return _declare_asserted(extents, "extent", declare.make_extent)
+
+
+def declare_patches(patches=()):
+    """Declare instruction patch locations with validated original bytes."""
+    stored, unresolved = [], []
+    for entry in patches or ():
+        try:
+            if not isinstance(entry, dict):
+                raise declare.DeclarationError("a patch declaration must be an object")
+            decl = patchdecl.PatchDeclaration(
+                entry.get("owner"), entry.get("name"), entry.get("site")
+            )
+        except (declare.DeclarationError, TypeError, ValueError) as exc:
+            unresolved.append({"kind": "patch", "name": str(entry),
+                               "reason": str(exc)})
+            continue
+        if not store.save_patch(decl):
+            unresolved.append({"kind": "patch", "name": decl.qualified,
+                               "reason": "could not be stored in the IDB"})
+            continue
+        stored.append(decl.qualified)
+    ok, partial = registry.outcome(len(stored) + len(unresolved), len(stored), unresolved)
+    return _result(ok=ok, partial=partial, unresolved=unresolved,
+                   declared=len(stored), declared_names=sorted(stored))
+
+
 def _declare_asserted(entries, kind, make):
     """Shared body for the semantics whose value the caller asserts.
 
@@ -555,6 +589,8 @@ def _declare_asserted(entries, kind, make):
 def undeclare(names=()):
     """Remove declarations by qualified name (`"Owner::name"`) or stored id."""
     by_qualified = {d.qualified: d.id for d in store.load_all()}
+    patch_ids = {d.qualified: d.id for d in store.load_patches()}
+    by_qualified.update(patch_ids)
     removed, unresolved = [], []
 
     for name in names or ():
@@ -563,7 +599,8 @@ def undeclare(names=()):
             unresolved.append({"kind": "declaration", "name": str(name),
                                "reason": "not declared"})
             continue
-        if store.delete(decl_id):
+        delete = store.delete_patch if str(decl_id).startswith("patch:") else store.delete
+        if delete(decl_id):
             removed.append(str(name))
         else:
             unresolved.append({"kind": "declaration", "name": str(name),
@@ -585,7 +622,9 @@ def declarations():
             "semantic": decl.semantic,
             "qualified": decl.qualified,
             "member": decl.member,
-            "sites": [{"ea": ea_str(ea), "op": op} for ea, op in decl.sites],
+            "sites": [dict({"ea": ea_str(ea), "op": op},
+                           **decl.site_options.get((ea, op), {}))
+                      for ea, op in decl.sites],
             "discovery": decl.discovery,
             "asserted_value": decl.asserted_value,
             "value_adjust": decl.value_adjust,
@@ -602,6 +641,15 @@ def declarations():
                 entry["offset"] = ref.byte_offset
         out.append(entry)
 
+    for decl in store.load_patches():
+        out.append({
+            "id": decl.id, "semantic": "patch", "qualified": decl.qualified,
+            "site": {"ea": ea_str(decl.ea),
+                     "expected_instruction": decl.expected_instruction,
+                     "expected_bytes": decl.expected_bytes,
+                     "patch_size": decl.patch_size},
+        })
+
     ok, partial = registry.outcome(len(out), len(out) - len(unresolved),
                                    unresolved)
     return _result(ok=ok, partial=partial, unresolved=unresolved,
@@ -617,7 +665,9 @@ def _run_export(path, function_eas, global_eas, unresolved, merge, build,
         path += ".cfs"
 
     declarations = store.load_all() if include_members else []
-    requested = len(function_eas) + len(global_eas) + len(declarations)
+    patches = store.load_patches() if include_members else []
+    requested = (len(function_eas) + len(global_eas) + len(declarations)
+                 + len(patches))
     if not requested:
         return _result(error="nothing resolved to export", unresolved=unresolved)
 
@@ -633,6 +683,7 @@ def _run_export(path, function_eas, global_eas, unresolved, merge, build,
         path, get_search_ranges(),
         function_eas=function_eas, global_eas=global_eas,
         declarations=declarations,
+        patches=patches,
         build=(build_number, build_source), merge=merge,
         function_sites=function_sites,
         function_locators=function_locators,
@@ -662,6 +713,7 @@ def _run_export(path, function_eas, global_eas, unresolved, merge, build,
         functions=raw.get("functions", 0),
         globals=raw.get("globals", 0),
         members=raw.get("members", 0),
+        patches=raw.get("patches", 0),
         types=raw.get("types", 0),
         merged=raw.get("merged"),
         mode=raw.get("mode"),
@@ -736,7 +788,8 @@ def export_selected(path, declaration_names=(), item_ids=(), build=None):
         )
 
     chosen = selection.resolve(
-        store.load_all(), declaration_names=declaration_names, item_ids=item_ids
+        store.load_all(), declaration_names=declaration_names, item_ids=item_ids,
+        patches=store.load_patches(),
     )
     unresolved = chosen["unresolved"]
     requested = chosen["requested"]
@@ -774,6 +827,7 @@ def export_selected(path, declaration_names=(), item_ids=(), build=None):
         path, get_search_ranges(),
         function_eas=function_eas, global_eas=global_eas,
         declarations=chosen["declarations"],
+        patches=chosen["patches"],
         build=(build_number, build_source), merge=_export.MERGE_APPEND,
         function_sites=sites, function_locators=locators,
         require_all=True, validate_output=True,
@@ -796,5 +850,6 @@ def export_selected(path, declaration_names=(), item_ids=(), build=None):
         dropped_records=stats.get("dropped_records", 0),
         functions=raw.get("functions", 0), globals=raw.get("globals", 0),
         declarations=raw.get("members", 0), types=raw.get("types", 0),
+        patches=raw.get("patches", 0),
         advisory=raw.get("advisory", []), summary=raw.get("summary", ""),
     )

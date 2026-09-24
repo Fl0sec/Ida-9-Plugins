@@ -69,13 +69,15 @@ AXIS_VTABLE = "vtable"
 AXIS_STRING_REL = "string_rel"
 
 _MODE_ORDER = {"ENTRY": 0, "REL": 1, "BODY": 2, "VALUE": 3,
-               cfs6.MODE_VTABLE: 4, cfs6.MODE_STRING_REL: 5}
+               cfs6.MODE_VTABLE: 4, cfs6.MODE_STRING_REL: 5,
+               cfs6.MODE_SITE: 6}
 # A locator is not scored against patterns -- it does not compete with them,
 # it covers a different axis -- but it still needs a defined penalty so the
 # total order stays deterministic. It sits last because when a pattern axis
 # does work, it needs no RTTI table to resolve.
 _MODE_PENALTY = {"ENTRY": 0, "REL": 12, "BODY": 18, "VALUE": 12,
                  cfs6.MODE_VTABLE: 24, cfs6.MODE_STRING_REL: 24}
+_MODE_PENALTY[cfs6.MODE_SITE] = 12
 
 
 def candidate_min_exact(total_bytes):
@@ -124,6 +126,20 @@ def anchored_window_specs(insns, xidx, max_bytes=MAX_PATTERN_BYTES):
     # the same preference `windows.window_ladder` encodes for the modes whose
     # pattern starts at the anchor.
     specs.sort(key=lambda ab: (span(ab[0], ab[1]), ab[0]))
+    return specs
+
+
+def declared_window_specs(insns, start_idx, xidx,
+                          max_bytes=MAX_PATTERN_BYTES):
+    """Windows beginning exactly where a caller anchored them, containing xidx."""
+    if not (0 <= start_idx <= xidx < len(insns)):
+        return []
+    specs = []
+    for end in range(xidx + 1, len(insns) + 1):
+        size = insns[end - 1]["ea"] + insns[end - 1]["size"] - insns[start_idx]["ea"]
+        if size > max_bytes:
+            break
+        specs.append((start_idx, end))
     return specs
 
 
@@ -439,6 +455,8 @@ class Candidate:
             # Built entirely by the finder from decoded operand metadata; the
             # policy layer never invents or edits an extraction field.
             resolve = dict(self.extract)
+        elif self.mode == cfs6.MODE_SITE:
+            resolve = {"instruction_offset": self.insn_offset}
         elif self.is_locator:
             resolve = dict(self.locator)
         else:

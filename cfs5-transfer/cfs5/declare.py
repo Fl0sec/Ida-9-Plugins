@@ -27,7 +27,7 @@ from . import cfs6
 #    `discovery` plus `asserted_value`. Version 1 records still load -- their
 #    one site becomes a one-element list -- because re-declaring by hand is
 #    exactly the work this is meant to stop repeating.
-DECL_VERSION = 2
+DECL_VERSION = 3
 
 # How a declaration's candidate sites are found.
 #   sites_only      use exactly the sites given; never scan.
@@ -115,7 +115,7 @@ class Declaration:
 
     __slots__ = (
         "semantic", "owner", "name", "member", "sites", "discovery",
-        "asserted_value", "value_adjust", "version",
+        "asserted_value", "value_adjust", "site_options", "version",
     )
 
     def __init__(self, semantic, owner, name, member=None, sites=(),
@@ -133,6 +133,28 @@ class Declaration:
         self.name = _check_identifier("name", name)
         self.member = _check_identifier("member", member or name)
         self.sites = normalize_sites(sites)
+        self.site_options = {}
+        for site in sites or ():
+            if not isinstance(site, dict):
+                continue
+            if site.get("ea") is None or site.get("op") is None:
+                continue
+            key = (int(site["ea"]), int(site["op"]))
+            options = {}
+            for field in ("window_start_ea", "access_width", "alignment"):
+                if site.get(field) is not None:
+                    try:
+                        options[field] = int(site[field])
+                    except (TypeError, ValueError):
+                        raise DeclarationError("%s must be an integer" % field)
+            if options:
+                if options.get("window_start_ea", 1) <= 0:
+                    raise DeclarationError("window_start_ea must be positive")
+                if options.get("access_width", 1) <= 0:
+                    raise DeclarationError("access_width must be positive")
+                if options.get("alignment", 1) <= 0:
+                    raise DeclarationError("alignment must be positive")
+                self.site_options[key] = options
 
         if discovery not in VALID_DISCOVERY:
             raise DeclarationError(
@@ -231,7 +253,9 @@ class Declaration:
             "owner": self.owner,
             "name": self.name,
             "member": self.member,
-            "sites": [{"ea": ea, "op": op} for ea, op in self.sites],
+            "sites": [dict({"ea": ea, "op": op},
+                           **self.site_options.get((ea, op), {}))
+                      for ea, op in self.sites],
             "discovery": self.discovery,
             "asserted_value": self.asserted_value,
             "value_adjust": self.value_adjust,
@@ -342,4 +366,24 @@ def make_constant(owner, name, value, sites, value_adjust=0):
         cfs6.SEM_CONSTANT, owner, name, member=name,
         sites=sites, discovery=DISCOVER_SITES_ONLY,
         asserted_value=value, value_adjust=value_adjust,
+    )
+
+
+def make_extent(owner, name, value, sites, value_adjust=0):
+    """An object extent derived as align_up(displacement + width, alignment)."""
+    if int(value_adjust):
+        raise DeclarationError("object_extent does not use value_adjust")
+    for site in sites or ():
+        try:
+            width = int(site.get("access_width", 0)) if isinstance(site, dict) else 0
+        except (TypeError, ValueError):
+            width = 0
+        if width <= 0:
+            raise DeclarationError(
+                "object_extent sites require a positive access_width"
+            )
+    return Declaration(
+        cfs6.SEM_OBJECT_EXTENT, owner, name, member=name,
+        sites=sites, discovery=DISCOVER_SITES_ONLY,
+        asserted_value=value,
     )

@@ -50,24 +50,27 @@ FORMAT_VERSION = 6
 # kinds already behave. An item fails only when no candidate survives, which
 # was always the semantics, so an older reader degrades to "this item has
 # fewer candidates" instead of "this file is broken".
-SCHEMA_REVISION = 2
+SCHEMA_REVISION = 3
 GENERATOR_NAME = "cfs5-transfer"
-GENERATOR_VERSION = "6.2.0"
+GENERATOR_VERSION = "6.3.0"
 
 REC_HEADER = "header"
 REC_FUNCTION = "function"
 REC_GLOBAL = "global"
 REC_DERIVED_VALUE = "derived_value"
+REC_PATCH = "patch"
 REC_CANDIDATE = "candidate"
 REC_FUNC_TYPE = "function_type"
 REC_GLOB_TYPE = "global_type"
 REC_LOCAL_TYPE = "local_type"
 
-ITEM_KINDS = (REC_FUNCTION, REC_GLOBAL, REC_DERIVED_VALUE)
+ITEM_KINDS = (REC_FUNCTION, REC_GLOBAL, REC_DERIVED_VALUE, REC_PATCH)
 ADDRESS_ITEM_KINDS = (REC_FUNCTION, REC_GLOBAL)
 MODE_VTABLE = "VTABLE"
 MODE_STRING_REL = "STRING_REL"
-MODES = ("ENTRY", "BODY", "REL", "VALUE", MODE_VTABLE, MODE_STRING_REL)
+MODE_SITE = "SITE"
+MODES = ("ENTRY", "BODY", "REL", "VALUE", MODE_VTABLE, MODE_STRING_REL,
+         MODE_SITE)
 # Modes that locate a function structurally instead of by a unique pattern.
 # Their `pattern` is a *confirm* signature: it is matched only inside the
 # already-located function, so it is not required to be image-unique.
@@ -105,6 +108,7 @@ ORIGIN_ANCHOR_STRING = "anchor_string"
 VALID_STRING_REL_ORIGINS = (ORIGIN_ANCHOR_STRING,)
 STRING_MATCH_NUL_EXACT = "nul_terminated_exact"
 WINDOW_BOUND_PDATA_CHUNK = "pdata_chunk"
+ORIGIN_DECLARED_PATCH_SITE = "declared_patch_site"
 
 # A raw MSVC type descriptor, never a demangled name: `.?AVCCSPlayerInventory@@`
 # is in the image, `CCSPlayerInventory` is IDA's rendering of it.
@@ -223,8 +227,11 @@ def normalize_pattern(pattern):
 
 
 def item_id(kind, name):
-    """Stable item identifier. `kind` is REC_FUNCTION or REC_GLOBAL."""
-    return ("fn:" if kind == REC_FUNCTION else "global:") + name
+    """Stable address/patch item identifier."""
+    prefix = {REC_FUNCTION: "fn:", REC_GLOBAL: "global:", REC_PATCH: "patch:"}
+    if kind not in prefix:
+        raise ValueError("unsupported item kind %r" % kind)
+    return prefix[kind] + name
 
 
 def derived_item_id(semantic, owner, name):
@@ -445,6 +452,24 @@ class DerivedValueRecord(ItemRecord):
         return "%s::%s" % (self.owner, self.name) if self.owner else self.name
 
 
+class PatchRecord(ItemRecord):
+    __slots__ = ("owner", "expected_instruction", "expected_bytes", "patch_size")
+
+    def __init__(self, line_no, id, name, owner, source=None, coverage=None,
+                 candidate_count=0):
+        ItemRecord.__init__(self, line_no, REC_PATCH, id, name, coverage,
+                            candidate_count)
+        source = source or {}
+        self.owner = owner
+        self.expected_instruction = source.get("expected_instruction", "")
+        self.expected_bytes = source.get("expected_bytes", "")
+        self.patch_size = int(source.get("patch_size", 0))
+
+    @property
+    def qualified_name(self):
+        return "%s::%s" % (self.owner, self.name)
+
+
 class ItemMeta:
     """Optional prototype/type payload for a function or global."""
 
@@ -517,6 +542,9 @@ class LoadedCfs:
             out = [i for i in out if i.semantic == semantic]
         return out
 
+    def patches(self):
+        return [i for i in self.items if i.kind == REC_PATCH]
+
     def build_number(self):
         build = self.header.get("build") or {}
         return build.get("number")
@@ -527,9 +555,10 @@ class LoadedCfs:
     def describe_contents(self):
         """One-line inventory, for a merge prompt."""
         return (
-            "%d functions, %d globals, %d derived values, %d local types"
+            "%d functions, %d globals, %d derived values, %d patches, %d local types"
             % (len(self.functions()), len(self.globals()),
-               len(self.derived_values()), len(self.type_records))
+               len(self.derived_values()), len(self.patches()),
+               len(self.type_records))
         )
 
     def describe_source(self):
@@ -619,6 +648,17 @@ class Cfs6Writer:
         if expected_value is not None:
             obj["source"] = {"expected_value": int(expected_value)}
         self._emit(obj)
+        self.items += 1
+        self.item_ids.add(iid)
+        return iid
+
+    def write_patch(self, owner, name, candidate_count, coverage, source):
+        iid = "patch:%s::%s" % (owner, name)
+        self._emit({
+            "record": REC_PATCH, "id": iid, "owner": owner, "name": name,
+            "candidate_count": int(candidate_count), "coverage": coverage,
+            "source": dict(source),
+        })
         self.items += 1
         self.item_ids.add(iid)
         return iid
@@ -935,6 +975,13 @@ def _parse_candidate(obj, line_no):
     elif mode == MODE_STRING_REL:
         _validate_string_rel_candidate(rec, line_no)
 
+    elif mode == MODE_SITE:
+        if rec.origin != ORIGIN_DECLARED_PATCH_SITE:
+            raise ValueError("line %d: SITE candidate has invalid origin" % line_no)
+        if rec.instruction_offset < 0 or rec.instruction_offset >= pattern_len:
+            raise ValueError("line %d: SITE instruction_offset is outside pattern"
+                             % line_no)
+
     return rec
 
 
@@ -1120,9 +1167,9 @@ def _parse_derived_value(obj, line_no):
             raise ValueError(
                 "line %d: source.expected_value must be an integer" % line_no
             )
-    if semantic == SEM_MEMBER_OFFSET and expected is None:
+    if semantic in (SEM_MEMBER_OFFSET, SEM_OBJECT_EXTENT) and expected is None:
         raise ValueError(
-            "line %d: a member_offset must carry source.expected_value" % line_no
+            "line %d: %s must carry source.expected_value" % (line_no, semantic)
         )
 
     return DerivedValueRecord(
@@ -1136,6 +1183,31 @@ def _parse_derived_value(obj, line_no):
 def _parse_item(obj, kind, line_no):
     if kind == REC_DERIVED_VALUE:
         return _parse_derived_value(obj, line_no)
+    if kind == REC_PATCH:
+        iid = obj.get("id")
+        owner = obj.get("owner")
+        name = obj.get("name")
+        source = obj.get("source") or {}
+        if not all(isinstance(x, str) and x for x in (iid, owner, name)):
+            raise ValueError("line %d: patch needs id, owner and name" % line_no)
+        if source.get("expected_instruction") in (None, ""):
+            raise ValueError("line %d: patch needs expected_instruction" % line_no)
+        expected = str(source.get("expected_bytes", "")).replace(" ", "").upper()
+        if not expected or len(expected) % 2:
+            raise ValueError("line %d: patch expected_bytes is invalid" % line_no)
+        try:
+            bytes.fromhex(expected)
+        except ValueError:
+            raise ValueError("line %d: patch expected_bytes is invalid" % line_no)
+        source["expected_bytes"] = expected
+        if int(source.get("patch_size", 0)) <= 0:
+            raise ValueError("line %d: patch_size must be positive" % line_no)
+        if int(source["patch_size"]) < len(bytes.fromhex(expected)):
+            raise ValueError("line %d: patch_size is smaller than expected_bytes"
+                             % line_no)
+        return PatchRecord(line_no, iid, name, owner, source,
+                           obj.get("coverage") or {},
+                           int(obj.get("candidate_count", 0)))
 
     iid = obj.get("id")
     name = obj.get("name")
@@ -1318,6 +1390,15 @@ def _attach_candidates(loaded, by_id, pending, seen_ranks, skipped_ranks, report
         # consumer the wrong sort of answer.
         is_value_item = item.kind == REC_DERIVED_VALUE
         if (cand.mode == "VALUE") != is_value_item:
+            loaded.parse_errors += 1
+            report(
+                "PARSE_ERROR line %d: %s candidate cannot belong to a %s item"
+                % (cand.line_no, cand.mode, item.kind)
+            )
+            continue
+
+        is_patch_item = item.kind == REC_PATCH
+        if (cand.mode == MODE_SITE) != is_patch_item:
             loaded.parse_errors += 1
             report(
                 "PARSE_ERROR line %d: %s candidate cannot belong to a %s item"

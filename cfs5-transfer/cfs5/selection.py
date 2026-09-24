@@ -3,7 +3,7 @@
 from . import registry
 
 
-def resolve(declarations, declaration_names=(), item_ids=()):
+def resolve(declarations, declaration_names=(), item_ids=(), patches=()):
     """Return an exact incremental-export selection without guessing.
 
     The result has `function_names`, `global_names`, `declarations`, `ids`, and
@@ -11,6 +11,7 @@ def resolve(declarations, declaration_names=(), item_ids=()):
     callers must use an exact item id in that case.
     """
     decl_by_id = {decl.id: decl for decl in declarations or ()}
+    patch_by_id = {decl.id: decl for decl in patches or ()}
     decl_by_name = {}
     for decl in declarations or ():
         decl_by_name.setdefault(decl.qualified, []).append(decl)
@@ -38,6 +39,10 @@ def resolve(declarations, declaration_names=(), item_ids=()):
             if iid not in ids:
                 ids.append(iid)
             continue
+        if iid in patch_by_id:
+            if iid not in ids:
+                ids.append(iid)
+            continue
         try:
             kind, name = registry.parse_entry_id(iid)
         except registry.RegistryError:
@@ -55,6 +60,7 @@ def resolve(declarations, declaration_names=(), item_ids=()):
         "function_names": function_names,
         "global_names": global_names,
         "declarations": [decl_by_id[iid] for iid in ids if iid in decl_by_id],
+        "patches": [patch_by_id[iid] for iid in ids if iid in patch_by_id],
         "unresolved": unresolved,
         "requested": len(ids) + len(unresolved),
     }

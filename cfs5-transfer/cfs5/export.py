@@ -32,7 +32,7 @@ from .policy import (
 )
 from .sigs import (
     choose_function_candidates, choose_global_candidates,
-    choose_value_candidates,
+    choose_value_candidates, find_patch_candidate,
 )
 from .typeio import (
     build_local_type_index,
@@ -86,6 +86,7 @@ class ExportState:
         self.global_candidates = 0
         self.global_types = 0
         self.member_values = 0
+        self.patches = 0
         self.member_candidates = 0
         # Declarations whose IDA member no longer exists.
         self.member_unresolved = 0
@@ -429,7 +430,9 @@ def write_member(writer, state, decl, ranges):
             site_value, ranges, selected_sites=decl.sites, ref=ref,
             allow_scan=decl.scan_allowed, value_adjust=decl.value_adjust,
             sibling_offsets=sibling_offsets(ref.owner) if ref is not None else None,
-            reasons=into,
+            reasons=into, site_options=decl.site_options,
+            extent_value=(expected if decl.semantic == cfs6.SEM_OBJECT_EXTENT
+                          else None),
         )
 
     try:
@@ -563,6 +566,27 @@ def write_member(writer, state, decl, ranges):
     return decl.id
 
 
+def write_patch(writer, state, decl, ranges):
+    try:
+        cand, reason = find_patch_candidate(decl, ranges)
+    except Exception as exc:
+        cand, reason = None, "exception: %s" % exc
+    if cand is None:
+        state.no_candidate += 1
+        state._miss("patch", decl.qualified, reason, decl.ea)
+        return None
+    iid = writer.write_patch(
+        decl.owner, decl.name, 1, {"site": cfs6.COV_SELECTED},
+        {"expected_instruction": decl.expected_instruction,
+         "expected_bytes": decl.expected_bytes,
+         "patch_size": decl.patch_size},
+    )
+    writer.write_candidate(iid, 0, cand)
+    state.mode_counts[cfs6.MODE_SITE] = state.mode_counts.get(cfs6.MODE_SITE, 0) + 1
+    state.patches += 1
+    return iid
+
+
 def discard_temp(tmp_path):
     try:
         if os.path.exists(tmp_path):
@@ -624,6 +648,7 @@ def summarize(state, path, build_number, build_source, merged=None):
         "  Declarations with no live IDA field: %d\n"
         "  Candidates dropped for disagreeing with IDA: %d\n"
         "  Resolved only on a second identical pass: %d\n"
+        "Patch sites exported: %d\n"
         "Local type definitions: %d\n"
         "ENTRY / BODY / REL / VALUE candidates: %d / %d / %d / %d\n"
         "  BODY not resolvable from .pdata (IDA-only): %d\n"
@@ -641,6 +666,7 @@ def summarize(state, path, build_number, build_source, merged=None):
             state.member_values, state.member_candidates,
             state.member_unresolved, state.member_disagreements,
             state.member_retries_recovered,
+            state.patches,
             len(state.exported_types),
             state.mode_counts.get("ENTRY", 0), state.mode_counts.get("BODY", 0),
             state.mode_counts.get("REL", 0), state.mode_counts.get("VALUE", 0),
@@ -656,7 +682,7 @@ def summarize(state, path, build_number, build_source, merged=None):
 
 
 def export_to_path(path, ranges, function_eas=(), global_eas=(),
-                   declarations=(), build=(None, "unknown"),
+                   declarations=(), patches=(), build=(None, "unknown"),
                    merge=MERGE_APPEND, function_sites=None,
                    function_locators=None, require_all=False,
                    validate_output=False):
@@ -671,13 +697,14 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
     function_eas = sorted(set(function_eas or []))
     global_eas = sorted(set(global_eas or []))
     declarations = sorted(declarations or [], key=lambda d: d.id)
+    patches = sorted(patches or [], key=lambda d: d.id)
 
     result = {
         "ok": False, "path": path, "written": 0, "cancelled": False,
         "uncovered": [], "advisory": [], "error": None, "summary": "",
     }
 
-    if not function_eas and not global_eas and not declarations:
+    if not function_eas and not global_eas and not declarations and not patches:
         result["error"] = "nothing to export"
         return result
     if not ranges:
@@ -737,6 +764,7 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
         [(write_function, ea) for ea in function_eas]
         + [(write_global, ea) for ea in global_eas]
         + [(write_member, decl) for decl in declarations]
+        + [(write_patch, decl) for decl in patches]
     )
     total = len(work)
 
@@ -784,7 +812,8 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
                 result["error"] = "cancelled after %d/%d items" % (done - 1, total)
                 return result
 
-            generated = state.functions + state.globals + state.member_values
+            generated = (state.functions + state.globals + state.member_values
+                         + state.patches)
             if require_all and generated != total:
                 result.update({
                     "error": "selected export generated %d/%d requested items; "
@@ -831,13 +860,14 @@ def export_to_path(path, ranges, function_eas=(), global_eas=(),
         ida_kernwin.clr_cancelled()
         discard_temp(tmp_path)
 
-    written = state.functions + state.globals + state.member_values
+    written = state.functions + state.globals + state.member_values + state.patches
     result.update({
         "ok": written > 0,
         "written": written,
         "functions": state.functions,
         "globals": state.globals,
         "members": state.member_values,
+        "patches": state.patches,
         "types": len(state.exported_types),
         "merged": merged.describe() if merged is not None else None,
         "merge_stats": ({

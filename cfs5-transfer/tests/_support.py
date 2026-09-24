@@ -154,6 +154,19 @@ def string_rel_candidate(pattern="48 83 EC ? E8 ? ? ? ?", anchor=0x101C,
     )
 
 
+def site_candidate(pattern="75 ? 48 8B C8 90", anchor=0x2000,
+                   instruction_offset=0):
+    tokens = pattern.split()
+    return Candidate(
+        mode=cfs6.MODE_SITE, signature=pattern,
+        origin=cfs6.ORIGIN_DECLARED_PATCH_SITE,
+        byte_len=len(tokens), wildcards=tokens.count("?"),
+        exact=len(tokens) - tokens.count("?"),
+        anchor_ea=anchor, func_ea=0x1000, func_size=0x2000,
+        insn_offset=instruction_offset,
+    )
+
+
 def write_member_cfs6(path, members, image=None, build_number=14177):
     """members: [(owner, name, expected, [Candidate, ...]), ...] -> a file."""
     with open(path, "w", encoding="utf-8", newline="") as handle:

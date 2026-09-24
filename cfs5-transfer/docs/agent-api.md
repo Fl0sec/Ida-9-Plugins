@@ -21,6 +21,8 @@ from cfs5 import api
 | `declare_members(members_=[], discovery="sites_only")` | declare `member_offset` values |
 | `declare_strides(strides=[])` | declare `element_stride` constants |
 | `declare_constants(constants=[])` | declare `constant` values (bit positions, sentinels) |
+| `declare_extents(extents=[])` | declare `object_extent` recipes |
+| `declare_patches(patches=[])` | declare validated instruction patch sites |
 | `undeclare(names=[])` | remove declarations by `"Owner::name"` |
 | `declarations()` | every declaration + how it resolves now |
 
@@ -146,6 +148,38 @@ tested by `bt reg, 6` or a sentinel compared against a field.
 Use the semantic signed value for a sign-extended sentinel. An imm8 `FF` that
 the consumer reads with `signed: true` is `-1`, not `0xFF` or `0xFFFFFFFF`;
 the same signed value is written to `source.expected_value`.
+
+Object extents require explicit recipe inputs:
+
+```python
+api.declare_extents([{
+    "owner": "TraceFilter", "name": "kSize", "value": 0x40,
+    "sites": [{"ea": 0x1234, "op": 0,
+               "access_width": 1, "alignment": 8}],
+}])
+```
+
+The consumer computes `align_up(displacement + access_width, alignment)`.
+Every site must independently reproduce the asserted extent; no zero fallback
+is emitted. Any VALUE site may additionally name `window_start_ea`. It must be
+an instruction start in the same function, at or before the extraction
+instruction; the exporter grows only windows starting there and still requires
+image-wide uniqueness.
+
+Patch sites are instruction locations, not functions or values:
+
+```python
+api.declare_patches([{
+    "owner": "spotted", "name": "PlayerGate",
+    "site": {"ea": 0xEB8B9E, "expected_instruction": "jz",
+             "expected_bytes": "0F 84", "patch_size": 6},
+}])
+```
+
+Export decodes the site, verifies mnemonic, opcode prefix, full mapped patch
+span and instruction boundary, then emits a unique `SITE` candidate resolving
+to the instruction start. The patch item carries the expected original bytes
+and span so a consumer can retain its runtime original-byte check.
 
 ### `value_adjust`
 

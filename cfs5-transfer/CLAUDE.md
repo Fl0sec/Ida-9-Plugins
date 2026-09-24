@@ -85,6 +85,13 @@ RIP-relative target is executable. Never encode a register or fixed byte
 delta. Multiple raw string copies or xrefs are harmless only when this rule
 produces exactly one distinct handler; ambiguity refuses.
 
+Schema revision 3 adds `patch`/`SITE`, produced `object_extent` declarations,
+and caller-anchored VALUE window starts. SITE resolves to the decoded
+instruction start and carries original opcode/span checks on its patch item.
+Extents are `align_up(DISP + access_width, alignment)` with a required expected
+value; never invent zero. An alternate window start is an instruction in the
+same function and supplies location only, never bytes.
+
 ## Derived values (`derived_value` + `VALUE`, schema revision 1)
 
 `member_offset`, `element_stride` and `constant` are produced today; `object_extent` is reserved. `member_offset` takes its value from a live IDA field; the other two assert it and are gated on their own sites instead (`declare.make_stride` / `make_constant` — one shared implementation in `api._declare_asserted`, because they differ only in what a consumer does with the number). `semantic`, extraction `op` (`CONST`/`DISP`/`IMM`/`SCALE`/`DISP_PLUS_WIDTH`) and `VALUE` `origin` are **closed sets** — a consumer rejects an unknown value rather than interpreting it. No expression strings, ever.

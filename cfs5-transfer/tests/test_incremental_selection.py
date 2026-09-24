@@ -2,7 +2,7 @@
 
 import unittest
 
-from cfs5 import declare, selection
+from cfs5 import declare, patchdecl, selection
 
 
 SITE = [{"ea": 0x1000, "op": 1}]
@@ -54,6 +54,15 @@ class IncrementalSelectionTests(unittest.TestCase):
 
         exact = selection.resolve([self.a, stride], item_ids=[self.a.id])
         self.assertEqual(exact["declarations"], [self.a])
+
+    def test_patch_id_selects_only_that_patch(self):
+        patch = patchdecl.PatchDeclaration("spotted", "Gate", {
+            "ea": 0x2000, "expected_instruction": "jz",
+            "expected_bytes": "74", "patch_size": 2,
+        })
+        got = selection.resolve([], item_ids=[patch.id], patches=[patch])
+        self.assertEqual(got["patches"], [patch])
+        self.assertEqual(got["unresolved"], [])
 
 
 if __name__ == "__main__":

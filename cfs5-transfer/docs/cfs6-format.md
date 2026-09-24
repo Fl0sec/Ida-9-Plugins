@@ -61,6 +61,7 @@ quantity in the format is the displacement *read out of the image*, and
 | `function` | — | a function item |
 | `global` | — | a global-variable item |
 | `derived_value` | — | an item whose value is an **integer extracted from code** (schema revision 1) |
+| `patch` | — | an instruction location with validated original opcode bytes (schema revision 3) |
 | `candidate` | — | one signature candidate belonging to an item |
 | `function_type` | optional | IDA `tinfo_t` prototype payload |
 | `global_type` | optional | IDA `tinfo_t` type payload |
@@ -96,8 +97,8 @@ additive revision and not a major version bump.
 ## 3. `header`
 
 ```json
-{"record":"header","format":"CFS","version":6,"schema_revision":2,
- "generator":{"name":"cfs5-transfer","version":"6.2.0"},
+{"record":"header","format":"CFS","version":6,"schema_revision":3,
+ "generator":{"name":"cfs5-transfer","version":"6.3.0"},
  "image":{"name":"client.dll","format":"PE","architecture":"x86_64",
           "timestamp":1788412510,"size_of_image":41803776,"sha256":"…"},
  "build":{"number":14177,"source":"path-confirmed"},
@@ -229,7 +230,7 @@ represent different values.
 |---|---|
 | `item` | the owning item's `id`. |
 | `rank` | **authoritative** order. Contiguous from `0` within an item. |
-| `mode` | `ENTRY`, `REL`, `BODY`, `VTABLE` (function items) or `VALUE` (`derived_value` items). |
+| `mode` | `ENTRY`, `REL`, `BODY`, `VTABLE`, `STRING_REL`, `VALUE`, or `SITE`, according to item kind. |
 | `pattern` | space-separated uppercase hex bytes; `?` is a single-byte wildcard. |
 | `origin` | provenance category (below). Diagnostic. |
 | `score` | **lower is better**. Diagnostic ranking aid — **never** proof of identity. |
@@ -472,6 +473,29 @@ runtime-function entries beginning at the resolved function, with no slack.
 If `.pdata` is unavailable, the producer uses the IDA function extent and
 records `scan_bound: "ida_extent"`.
 
+## 5c. Patch items and `SITE` candidates (revision 3)
+
+A `patch` item identifies one instruction location. Its `source` requires
+`expected_instruction`, contiguous uppercase `expected_bytes`, and a positive
+`patch_size`. A `SITE` candidate's `resolve.instruction_offset` is relative to
+the pattern match and resolves to the instruction start. The producer decodes
+the declared site and refuses mnemonic, opcode, span, or instruction-boundary
+disagreement before testing the surrounding pattern for image-wide uniqueness.
+A consumer must re-check the original bytes across the declared patch span
+before applying any patch.
+
+Revision 3 also produces `object_extent` VALUE recipes using
+`DISP_PLUS_WIDTH` plus `alignment`:
+
+```
+extent = align_up(read_signed_displacement + access_width, alignment)
+```
+
+`source.expected_value` is required and cross-checked; absence never means
+zero. A producer-supplied alternate VALUE window start changes only where
+pattern growth begins. It never supplies pattern bytes and must remain inside
+the same function while containing the extraction instruction.
+
 ## 6. Resolution
 
 Let `match` be the RVA where `pattern` matched. **A pattern that does not match
@@ -606,6 +630,10 @@ Recoverable (count, report with the line number, skip the record):
   `string_match` other than `nul_terminated_exact`; `window_bytes != 128`; a
   `window_bound` other than `pdata_chunk`; invalid shared confirm fields;
   attachment to anything other than a `function`
+- patch/SITE: missing owner/name/instruction/opcode bytes; malformed opcode
+  bytes; non-positive or undersized patch span; SITE instruction offset outside
+  its pattern; SITE attached to a non-patch item or another mode attached to a
+  patch item
 - `derived_value`: unknown `semantic`; missing `owner`; non-integer
   `expected_value`; `member_offset` without an `expected_value`
 - VALUE: `origin` outside {`stroff_xref`, `selected_operand`}; unknown `op`;
@@ -682,6 +710,7 @@ python tools/cfs6_resolve.py <file.cfs> <client.dll> --name ConVarRef_GetFloat -
 | 0 | `function` / `global` items; `ENTRY` / `REL` / `BODY` candidates; type payloads |
 | 1 | `derived_value` items and `VALUE` candidates (`member_offset` produced) |
 | 2 | structural function locators (`VTABLE`, `STRING_REL`) and skip-with-report for unknown candidate modes |
+| 3 | `patch` items with `SITE` candidates; declaration/export workflows for `object_extent`; alternate VALUE window starts |
 
 Revisions are **additive within version 6**: a reader written against an older
 revision skips the newer records as unknown kinds and stays correct on the rest

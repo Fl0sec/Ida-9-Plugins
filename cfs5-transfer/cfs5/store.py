@@ -23,12 +23,14 @@ import ida_netnode
 
 from .common import msg
 from .declare import DeclarationError, from_dict
+from .patchdecl import from_dict as patch_from_dict
 
 
 # "$ " is the documented prefix for private plugin netnodes: it cannot collide
 # with an identifier-shaped name in the database.
 _NODE_PREFIX = "$ cfs6 declaration "
 _INDEX_NODE = "$ cfs6 declarations"
+_PATCH_INDEX_NODE = "$ cfs6 patches"
 # The export set (registry.py entry ids). One node holding one JSON list --
 # it is pure identity, so unlike a declaration there is nothing to shard.
 _REGISTRY_NODE = "$ cfs6 export set"
@@ -262,6 +264,42 @@ def load_all():
     if alive != ids:
         _save_index(alive)
     return out
+
+
+def save_patch(decl):
+    if not _write_json(_node_name(decl.id), decl.to_dict()):
+        return False
+    return _write_json(_PATCH_INDEX_NODE, sorted(set(
+        (_read_json(_PATCH_INDEX_NODE) or []) + [decl.id]
+    )))
+
+
+def load_patches():
+    ids = _read_json(_PATCH_INDEX_NODE) or []
+    out = []
+    for iid in ids:
+        data = _read_json(_node_name(iid))
+        if data is None:
+            continue
+        try:
+            out.append(patch_from_dict(data))
+        except DeclarationError as exc:
+            msg("STORE: patch %s is unusable: %s" % (iid, exc))
+    return out
+
+
+def delete_patch(patch_id):
+    name = _node_name(patch_id)
+    if _exists(name):
+        node = _open(name)
+        if node is not None:
+            try:
+                node.kill()
+            except Exception as exc:
+                msg("STORE: kill(%r) failed: %s" % (name, exc))
+                return False
+    ids = [i for i in (_read_json(_PATCH_INDEX_NODE) or []) if i != patch_id]
+    return _write_json(_PATCH_INDEX_NODE, ids)
 
 
 def delete(decl_id):
