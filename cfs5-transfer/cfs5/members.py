@@ -392,15 +392,21 @@ def typed_stack_local_zero(ref, ea, op_index):
         if not frame.get_func_frame(func):
             return False
         frame_offset = int(frame_offset)
-        _idx, frame_member = frame.get_udm_by_offset(_bits(frame_offset))
+        frame_index, frame_member = frame.get_udm_by_offset(_bits(frame_offset))
         if frame_member is None or _bytes_of(frame_member.offset) != frame_offset:
             return False
 
-        local_tif = ida_typeinf.tinfo_t()
-        if local_tif.get_stkvar(insn, insn.ops[op_index],
-                                int(insn.ops[op_index].addr)) < 0:
+        # `get_stkvar()` fills its tinfo with the complete frame type, not the
+        # member type. Its returned index must therefore identify the exact
+        # frame member found above; that member's own tinfo is the proof.
+        frame_tif = ida_typeinf.tinfo_t()
+        stack_index = frame_tif.get_stkvar(
+            insn, insn.ops[op_index], int(insn.ops[op_index].addr)
+        )
+        if stack_index < 0 or int(stack_index) != int(frame_index):
             return False
-        return local_tif.is_udt() and str(local_tif.get_type_name() or "") == ref.owner
+        member_tif = frame_member.type
+        return member_tif.is_udt() and str(member_tif.get_type_name() or "") == ref.owner
     except Exception as exc:
         msg("MEMBER: typed stack-local proof failed at %s op %d: %s"
             % (ea_str(ea), op_index, exc))
