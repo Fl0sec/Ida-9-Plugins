@@ -6,8 +6,11 @@ transport, and export orchestration.
 ## Declaration evidence
 
 `member_offset` reads its value from a live IDA field. No field means no item.
-Candidate sites may originate only from `stroff_xref`, `selected_operand`, or
-`hexrays_memptr`; the format reader enforces this closed set. A displacement
+Candidate sites may originate only from `stroff_xref`, `selected_operand`,
+`hexrays_memptr`, or `hexrays_typed_local_zero`; the format reader enforces
+this closed set. The last is restricted to an exact offset-zero member
+expression through a typed local aggregate and emits `CONST 0`; it never
+reinterprets a stack-frame displacement as an object offset. A displacement
 search is a prefilter, never proof of owner/member association.
 
 Correct pointer typing can still yield no IDA field xrefs. Explicit sites name

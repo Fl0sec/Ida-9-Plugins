@@ -35,10 +35,13 @@ from .disasm import (
     infer_displacement_field,
     infer_immediate_field,
     infer_pc_relative_field,
+    operand_encoded_ranges,
     pattern_tokens_for_insn,
     recipe_value,
 )
-from .members import decode_at, member_reference_sites, operand_displacement
+from .members import (
+    decode_at, member_from_operand, member_reference_sites, operand_displacement,
+)
 from .policy import (
     CLONE_COUNT_LIMIT,
     MAX_PATTERN_BYTES,
@@ -640,6 +643,7 @@ REJECT_NO_FUNCTION = "site_is_not_inside_a_function"
 # the recipe yields the signed reading (`-1`) -- assert the latter.
 REJECT_RECIPE_DISAGREES = "extraction_recipe_reproduces_a_different_value"
 REJECT_SITE_NOT_IN_CHUNK = "site_is_not_an_instruction_start"
+REJECT_NO_MEMBER_PROVENANCE = "no_type_directed_member_provenance"
 # Fallback only. The window search reports which of its three outcomes fired
 # (`WINDOW_*` below) and that reason is used in preference to this one.
 REJECT_NO_UNIQUE_WINDOW = "no_unique_pattern_around_the_site"
@@ -648,6 +652,7 @@ REJECT_NO_UNIQUE_WINDOW = "no_unique_pattern_around_the_site"
 def find_value_candidate_for_site(
     site_ea, encoded_value, ranges, origin, op_hint=None, value_adjust=0,
     reasons=None, window_start_ea=None, access_width=None, alignment=1,
+    typed_local_zero=False,
 ):
     """A VALUE Candidate anchored at `site_ea` whose field holds `encoded_value`.
 
@@ -681,23 +686,38 @@ def find_value_candidate_for_site(
 
     encoded = int(encoded_value)
     const_extract = None
+    const_wildcard = None
 
-    # A displacement first: it is what a member offset is, and it is the
-    # stricter of the two inferences. An immediate second, because that is how
-    # a stride or a size is normally encoded (`add rax, 0x30`).
-    field = infer_displacement_field(insn, encoded)
+    # A proven typed-local access is a structural offset-zero fact. Its stack
+    # displacement and any initializer immediate are compiler artifacts, not
+    # the member value, so it must never fall through to field inference.
+    field = None
     field_op = cfs6.OP_DISP
-    if field is None:
-        field = infer_immediate_field(insn, encoded)
-        field_op = cfs6.OP_IMM
-
-    if field is None:
-        # No encoded field: the only legitimate reason is an access to offset
-        # zero, which encodes nothing at all.
-        const_extract = _zero_offset_extract(insn, encoded, op_hint)
+    if typed_local_zero:
+        const_extract, const_wildcard = _zero_offset_extract(
+            insn, encoded, op_hint, typed_local_zero=typed_local_zero,
+        )
         if const_extract is None:
             return _reject(REJECT_NO_FIELD)
-    elif op_hint is not None and field["operand_index"] != int(op_hint):
+    else:
+        # A displacement first: it is what a member offset is, and it is the
+        # stricter of the two inferences. An immediate second, because that is
+        # how a stride or a size is normally encoded (`add rax, 0x30`).
+        field = infer_displacement_field(insn, encoded)
+        if field is None:
+            field = infer_immediate_field(insn, encoded)
+            field_op = cfs6.OP_IMM
+
+        if field is None:
+            # No encoded field: the only legitimate reason is an access to
+            # offset zero, which encodes nothing at all.
+            const_extract, const_wildcard = _zero_offset_extract(
+                insn, encoded, op_hint,
+            )
+            if const_extract is None:
+                return _reject(REJECT_NO_FIELD)
+    if field is not None and op_hint is not None \
+            and field["operand_index"] != int(op_hint):
         return _reject(REJECT_WRONG_OPERAND)
 
     chunk = ida_funcs.get_fchunk(site_ea)
@@ -738,6 +758,13 @@ def find_value_candidate_for_site(
         # Wildcard exactly the extracted field and nothing else.
         insns[xidx]["tokens"] = pattern_tokens_for_insn(
             insn, force_wildcard=(field["field_offset"], field["field_size"])
+        )
+        insns[xidx]["insn"] = insn
+    elif const_wildcard is not None:
+        # The stack frame slot is compiler layout, not member layout. It may
+        # drift while the decompiler-backed zero-offset proof remains true.
+        insns[xidx]["tokens"] = pattern_tokens_for_insn(
+            insn, force_wildcard=const_wildcard
         )
         insns[xidx]["insn"] = insn
 
@@ -788,8 +815,8 @@ def find_value_candidate_for_site(
     )
 
 
-def _zero_offset_extract(insn, encoded, op_hint):
-    """CONST recipe for an access to offset zero, or None.
+def _zero_offset_extract(insn, encoded, op_hint, typed_local_zero=False):
+    """(CONST recipe, frame wildcard) for a proven offset-zero access.
 
     `mov rax, [rcx]` reaches the field at offset 0 with no encoded
     displacement at all, so there is no field to point a consumer at. The
@@ -798,7 +825,7 @@ def _zero_offset_extract(insn, encoded, op_hint):
     what the caller-supplied or inferred operand is checked for here.
     """
     if encoded != 0:
-        return None
+        return None, None
 
     indices = [int(op_hint)] if op_hint is not None else range(UA_MAXOP)
     for i in indices:
@@ -806,8 +833,23 @@ def _zero_offset_extract(insn, encoded, op_hint):
             continue
         disp, _width = operand_displacement(insn, i)
         if disp == 0 and insn.ops[i].type == ida_ua.o_phrase:
-            return {"op": cfs6.OP_CONST, "value": 0, "operand_index": i}
-    return None
+            return {"op": cfs6.OP_CONST, "value": 0, "operand_index": i}, None
+
+    # A stack displacement can never stand in for an object-relative offset.
+    # It is admitted only after `memberscan` proved the exact ctree expression
+    # is an offset-zero member of a typed local aggregate.
+    if not typed_local_zero or op_hint is None:
+        return None, None
+    i = int(op_hint)
+    if not 0 <= i < UA_MAXOP or insn.ops[i].type != ida_ua.o_displ:
+        return None, None
+    for operand, offb, end_off, _optype in operand_encoded_ranges(insn):
+        if operand == i and end_off > offb:
+            return (
+                {"op": cfs6.OP_CONST, "value": 0, "operand_index": i},
+                (offb, end_off - offb),
+            )
+    return None, None
 
 
 def choose_value_candidates(encoded_value, ranges, selected_sites=(),
@@ -881,6 +923,12 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
     for site_ea, op_hint, origin in sites:
         searched += 1
         try:
+            if origin == ORIGIN_SELECTED_OPERAND and ref is not None \
+                    and not _selected_member_site_is_proven(
+                        ref, site_ea, op_hint):
+                if reasons is not None:
+                    reasons[int(site_ea)] = REJECT_NO_MEMBER_PROVENANCE
+                continue
             options = site_options.get((int(site_ea), int(op_hint)), {}) \
                 if op_hint is not None else {}
             actual_encoded = encoded_value
@@ -906,13 +954,22 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
                     if reasons is not None:
                         reasons[int(site_ea)] = REJECT_RECIPE_DISAGREES
                     continue
+            typed_local_zero = (
+                ref is not None and int(encoded_value) == 0
+                and memberscan.confirms_typed_local_zero_member_site(ref, site_ea)
+            )
+            candidate_origin = (
+                cfs6.ORIGIN_HEXRAYS_TYPED_LOCAL_ZERO
+                if typed_local_zero else origin
+            )
             cand = find_value_candidate_for_site(
-                site_ea, actual_encoded, ranges, origin,
+                site_ea, actual_encoded, ranges, candidate_origin,
                 op_hint=op_hint, value_adjust=value_adjust, reasons=reasons,
                 window_start_ea=options.get("window_start_ea"),
                 access_width=(options.get("access_width")
                               if extent_value is not None else None),
                 alignment=options.get("alignment", 1),
+                typed_local_zero=typed_local_zero,
             )
         except Exception as exc:
             # One odd instruction must not cost the whole member -- but say so,
@@ -925,6 +982,18 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
 
     selected = select_value_candidates(found)
     return selected, value_coverage(selected), len(sites), searched
+
+
+def _selected_member_site_is_proven(ref, site_ea, site_op):
+    """Require exact owner/member provenance for a caller-selected site."""
+    observed = member_from_operand(site_ea, site_op)
+    if observed is not None:
+        return (
+            observed.owner == ref.owner
+            and observed.name == ref.name
+            and observed.byte_offset == ref.byte_offset
+        )
+    return memberscan.confirms_member_site(ref, site_ea)
 
 
 def choose_member_candidates(ref, ranges, selected_sites=(), value_adjust=0,

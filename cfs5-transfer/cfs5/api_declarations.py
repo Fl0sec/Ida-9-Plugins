@@ -5,7 +5,7 @@ from . import members as _members
 from . import patchdecl
 from . import registry
 from . import store
-from .common import ea_str
+from .common import ea_str, msg
 from .api_result import result as _result
 
 def _split_qualified(entry, key):

@@ -32,6 +32,11 @@ in the two plugin entry files.
 result = api.import_and_migrate(r"C:\catalogues\client.cfs")
 ```
 
+This API accepts one explicit `.cfs` file. It does not implement catalogue-root
+discovery, recursive loading, or active-catalogue selection; those are caller
+or consumer responsibilities and must be inspected in that component before
+being described as CFS API behavior.
+
 This first applies resolvable names and types, then transactionally reconstructs
 producer state from destination-build evidence. The normal policy commits the
 valid subset and reports every non-portable record.
@@ -105,7 +110,10 @@ api.declare_members([
 
 Discovery modes are `sites_only` (default), `sites_plus_auto`, and `auto`.
 Explicit sites are recommended when pointer-backed objects have no IDA field
-xrefs.
+xrefs. A selected member site must still prove the declared owner and member:
+either IDA associates that operand with the member, or Hex-Rays resolves an
+exact member expression at that instruction. A matching displacement alone is
+rejected.
 
 Strides and constants assert values and require evidence sites:
 

@@ -274,9 +274,10 @@ class _StructSiteVisitor(ida_hexrays.ctree_visitor_t):
     the op check is what keeps offset-0 members from matching everything.
     """
 
-    def __init__(self, owner):
+    def __init__(self, owner, typed_local_zero_only=False):
         ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
         self.owner = owner
+        self.typed_local_zero_only = typed_local_zero_only
         self.hits = {}
 
     def visit_expr(self, e):
@@ -289,6 +290,10 @@ class _StructSiteVisitor(ida_hexrays.ctree_visitor_t):
                 return 0
             if _base_type_name(e.x, through_pointer) != self.owner:
                 return 0
+            if self.typed_local_zero_only and (
+                    through_pointer or e.op != ida_hexrays.cot_memref
+                    or e.x.op != ida_hexrays.cot_var or int(e.m) != 0):
+                return 0
             ea = int(e.ea)
             if ea != BADADDR:
                 self.hits.setdefault(int(e.m), set()).add(ea)
@@ -298,7 +303,7 @@ class _StructSiteVisitor(ida_hexrays.ctree_visitor_t):
         return 0
 
 
-def _harvest_struct_in(func_ea, owner):
+def _harvest_struct_in(func_ea, owner, typed_local_zero_only=False):
     """{byte_offset: {ea, ...}} for every `owner` member seen in `func_ea`.
 
     DECOMP_NO_WAIT is not an optimization, it is required for correctness here.
@@ -321,13 +326,55 @@ def _harvest_struct_in(func_ea, owner):
     if cfunc is None:
         return {}
 
-    visitor = _StructSiteVisitor(owner)
+    visitor = _StructSiteVisitor(owner, typed_local_zero_only)
     try:
         visitor.apply_to(cfunc.body, None)
     except Exception as exc:
         msg("MEMBERSCAN: ctree walk of %s failed: %s" % (ea_str(func_ea), exc))
         return {}
     return visitor.hits
+
+
+def confirms_member_site(ref, site_ea):
+    """Whether Hex-Rays proves that `site_ea` accesses `ref` exactly.
+
+    This is the provenance gate for a caller-selected member site when IDA has
+    no stroff annotation for its operand.  The instruction address, owner, and
+    byte offset must all agree; a matching displacement alone is never proof.
+    """
+    if ref is None or not ida_hexrays.init_hexrays_plugin():
+        return False
+    try:
+        func = ida_funcs.get_func(int(site_ea))
+    except Exception:
+        func = None
+    if func is None:
+        return False
+    hits = _harvest_struct_in(int(func.start_ea), ref.owner)
+    return int(site_ea) in hits.get(int(ref.byte_offset), set())
+
+
+def confirms_typed_local_zero_member_site(ref, site_ea):
+    """Whether `site_ea` is an exact offset-zero access through a typed local.
+
+    Frame displacements are compiler layout and cannot be treated as member
+    offsets. This narrower proof admits a CONST-zero recipe only when Hex-Rays
+    names the declared owner/member through a local aggregate at that exact
+    instruction.
+    """
+    if ref is None or int(ref.byte_offset) != 0 \
+            or not ida_hexrays.init_hexrays_plugin():
+        return False
+    try:
+        func = ida_funcs.get_func(int(site_ea))
+    except Exception:
+        func = None
+    if func is None:
+        return False
+    hits = _harvest_struct_in(
+        int(func.start_ea), ref.owner, typed_local_zero_only=True,
+    )
+    return int(site_ea) in hits.get(0, set())
 
 
 def _prototype_seed(owner):

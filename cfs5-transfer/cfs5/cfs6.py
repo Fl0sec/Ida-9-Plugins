@@ -156,8 +156,10 @@ VALID_FIELD_SIZES = (1, 2, 4, 8)
 ORIGIN_STROFF_XREF = "stroff_xref"
 ORIGIN_SELECTED_OPERAND = "selected_operand"
 ORIGIN_HEXRAYS_MEMPTR = "hexrays_memptr"
+ORIGIN_HEXRAYS_TYPED_LOCAL_ZERO = "hexrays_typed_local_zero"
 VALID_VALUE_ORIGINS = (ORIGIN_STROFF_XREF, ORIGIN_SELECTED_OPERAND,
-                       ORIGIN_HEXRAYS_MEMPTR)
+                       ORIGIN_HEXRAYS_MEMPTR,
+                       ORIGIN_HEXRAYS_TYPED_LOCAL_ZERO)
 
 # Item-id prefix per semantic, so derived values share the item namespace with
 # functions and globals without colliding.

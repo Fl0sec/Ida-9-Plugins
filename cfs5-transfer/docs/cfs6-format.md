@@ -375,6 +375,7 @@ integers** instead of addresses.
 | `stroff_xref` | the producer's database associates this instruction's operand with **that exact member** |
 | `selected_operand` | a human explicitly pointed at this operand |
 | `hexrays_memptr` | a decompiler resolved **this instruction** to a member expression naming that owner and offset |
+| `hexrays_typed_local_zero` | a decompiler resolved this instruction to an offset-zero member through a typed local aggregate; the stack-frame displacement is wildcarded and the recipe resolves `CONST 0` |
 
 Every entry names a producer of a **type-directed** association between an
 instruction and a member. They differ only in which producer.
