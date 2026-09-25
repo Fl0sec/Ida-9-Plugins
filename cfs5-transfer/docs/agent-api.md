@@ -211,7 +211,7 @@ Refresh only selected existing records:
 ```python
 api.export_selected(
     path,
-    declaration_names=["TraceShape::m_nKind"],
+    declaration_names=["TraceShape::m_nKind", "spotted::PlayerGate"],
     item_ids=["fn:trace_shape"],
     build=14183,
 )
@@ -219,7 +219,9 @@ api.export_selected(
 
 `export_selected` requires an existing compatible catalogue, resolves the
 complete selection before generation, and replaces the file only when every
-selected item regenerates and the result parses cleanly.
+selected item regenerates and the result parses cleanly. `declaration_names`
+accepts derived declarations and patch declarations; use an exact item ID when
+the same qualified name exists in both groups.
 
 ## Public surface
 

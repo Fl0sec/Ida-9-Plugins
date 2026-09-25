@@ -64,6 +64,28 @@ class IncrementalSelectionTests(unittest.TestCase):
         self.assertEqual(got["patches"], [patch])
         self.assertEqual(got["unresolved"], [])
 
+    def test_patch_qualified_name_selects_only_that_patch(self):
+        patch = patchdecl.PatchDeclaration("spotted", "Gate", {
+            "ea": 0x2000, "expected_instruction": "jz",
+            "expected_bytes": "74", "patch_size": 2,
+        })
+        got = selection.resolve([], declaration_names=["spotted::Gate"],
+                                patches=[patch])
+        self.assertEqual(got["ids"], [patch.id])
+        self.assertEqual(got["patches"], [patch])
+        self.assertEqual(got["unresolved"], [])
+
+    def test_patch_and_derived_name_collision_requires_exact_id(self):
+        patch = patchdecl.PatchDeclaration("Flags", "kA", {
+            "ea": 0x2000, "expected_instruction": "jz",
+            "expected_bytes": "74", "patch_size": 2,
+        })
+        got = selection.resolve([self.a], declaration_names=["Flags::kA"],
+                                patches=[patch])
+        self.assertEqual(got["ids"], [])
+        self.assertEqual(got["unresolved"][0]["reason"],
+                         "ambiguous declaration name")
+
 
 if __name__ == "__main__":
     unittest.main()

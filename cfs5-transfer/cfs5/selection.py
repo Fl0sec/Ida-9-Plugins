@@ -15,6 +15,8 @@ def resolve(declarations, declaration_names=(), item_ids=(), patches=()):
     decl_by_name = {}
     for decl in declarations or ():
         decl_by_name.setdefault(decl.qualified, []).append(decl)
+    for patch in patches or ():
+        decl_by_name.setdefault(patch.qualified, []).append(patch)
 
     ids = []
     unresolved = []
