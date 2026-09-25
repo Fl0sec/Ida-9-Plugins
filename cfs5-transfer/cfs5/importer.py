@@ -539,11 +539,13 @@ def _evaluate_candidates(name, records, ranges, match_cache, prefix):
     them is evidence, and disagreement is a conflict that must be surfaced
     rather than silently decided by rank order.
 
-    Returns (resolved, saw) where resolved is [(rec, target_ea, detail), ...] in
-    rank order and saw records which failure kinds were observed.
+    Returns ``(resolved, saw, outcomes)``.  ``outcomes`` deliberately retains
+    every rejected candidate: reducing an item to merely ``unsafe`` throws
+    away the one fact an operator needs to repair a stale catalogue.
     """
     resolved = []
     saw = {"not-found": False, "ambiguous": False, "unsafe": False}
+    outcomes = []
 
     for rec in records:
         if rec.is_locator:
@@ -551,15 +553,24 @@ def _evaluate_candidates(name, records, ranges, match_cache, prefix):
             # confirm signature, not an image-wide locator, so searching it
             # here would be both wasteful and semantically wrong.
             saw["unsafe"] = True
+            outcomes.append({"rank": rec.rank, "origin": rec.origin,
+                             "mode": rec.mode, "status": "unsafe",
+                             "reason": "export-only structural locator"})
             msg("%s_SKIPPED %-33s rank=%d mode=%s export-only locator"
                 % (prefix, name, rec.rank, rec.mode))
             continue
         status, target_ea, detail = _find_unique_target(rec, ranges, match_cache)
         if status == "ok":
             resolved.append((rec, target_ea, detail))
+            outcomes.append({"rank": rec.rank, "origin": rec.origin,
+                             "mode": rec.mode, "status": "resolved",
+                             "target": target_ea, "detail": detail})
             continue
 
         saw[status] = True
+        outcomes.append({"rank": rec.rank, "origin": rec.origin,
+                         "mode": rec.mode, "status": status,
+                         "reason": detail})
         if status == "not-found":
             msg("%s_NOT_FOUND %-30s rank=%d mode=%s origin=%s"
                 % (prefix, name, rec.rank, rec.mode, rec.origin))
@@ -570,7 +581,7 @@ def _evaluate_candidates(name, records, ranges, match_cache, prefix):
             msg("%s_UNSAFE %-34s rank=%d mode=%s %s"
                 % (prefix, name, rec.rank, rec.mode, detail))
 
-    return resolved, saw
+    return resolved, saw, outcomes
 
 
 def _report_conflict(name, resolved, prefix):
@@ -586,6 +597,32 @@ def _report_conflict(name, resolved, prefix):
     msg("%s_CONFLICT %-33s %d distinct targets: %s"
         % (prefix, name, len(targets), detail))
     return True
+
+
+def _set_candidate_outcome(outcomes, rec, status, reason):
+    """Replace a preliminary resolution after a later ownership check fails."""
+    for row in outcomes:
+        if row["rank"] == rec.rank:
+            row.pop("target", None)
+            row.pop("detail", None)
+            row.update(status=status, reason=reason)
+            return
+
+
+def _candidate_group_failure(resolved, saw, candidate_outcomes):
+    """Return a terminal validation failure, or ``None`` when one agrees."""
+    targets = {target for _rec, target, _detail in resolved}
+    if len(targets) > 1:
+        return "conflict", "candidates resolved to different targets"
+    if targets:
+        return None
+    if saw["unsafe"]:
+        reasons = [row["reason"] for row in candidate_outcomes
+                   if row["status"] == "unsafe"]
+        return "unsafe", "; ".join(reasons)
+    if saw["ambiguous"]:
+        return "ambiguous", "multiple matches"
+    return "not-found", "no candidate matched"
 
 
 def _rename_target(name, func_ea, rec, candidate_index, stats):
@@ -630,6 +667,32 @@ def try_apply_function_group(name, records, ranges, match_cache, stats,
                              claimed, meta=None):
     """Resolve one function group, rename it, then merge its prototype."""
     existing_global = _global_name_ea(name)
+    resolved, saw, candidate_outcomes = _evaluate_candidates(
+        name, records, ranges, match_cache, "CANDIDATE"
+    )
+    # Structural locators are confirmation evidence, not image-wide searches.
+    # An already-correct function name establishes such a record by contract.
+    if existing_global != BADADDR and records and all(rec.is_locator for rec in records):
+        for row in candidate_outcomes:
+            row.update(status="established", reason="established by existing name")
+        stats.already_named_global += 1
+        f = ida_funcs.get_func(existing_global)
+        if f is not None and f.start_ea == existing_global:
+            apply_function_type_safe(existing_global, meta, stats)
+        return "already-global", candidate_outcomes, None
+    terminal = _candidate_group_failure(resolved, saw, candidate_outcomes)
+    if terminal is not None:
+        status, reason = terminal
+        if status == "conflict":
+            stats.conflicts += 1
+        elif status == "unsafe":
+            stats.unsafe += 1
+        elif status == "ambiguous":
+            stats.ambiguous += 1
+        else:
+            stats.not_found += 1
+        return status, candidate_outcomes, reason
+
     if existing_global != BADADDR:
         stats.already_named_global += 1
         f = ida_funcs.get_func(existing_global)
@@ -640,15 +703,7 @@ def try_apply_function_group(name, records, ranges, match_cache, stats,
         else:
             msg("SKIP_NAME_EXISTS %-37s @ %s (not a function start)"
                 % (name, ea_str(existing_global)))
-        return "already-global"
-
-    resolved, saw = _evaluate_candidates(
-        name, records, ranges, match_cache, "CANDIDATE"
-    )
-
-    if _report_conflict(name, resolved, "FUNC"):
-        stats.conflicts += 1
-        return "conflict"
+        return "already-global", candidate_outcomes, None
 
     for rec, target_ea, _detail in resolved:
         allow_create = rec.mode != "BODY"
@@ -658,11 +713,16 @@ def try_apply_function_group(name, records, ranges, match_cache, stats,
 
         if fstatus == "interior":
             saw["unsafe"] = True
+            _set_candidate_outcome(candidate_outcomes, rec, "unsafe",
+                                   "target is inside existing function %s"
+                                   % ea_str(func_ea))
             msg("CANDIDATE_INTERIOR %-33s rank=%d mode=%s target=%s owner=%s"
                 % (name, rec.rank, rec.mode, ea_str(target_ea), ea_str(func_ea)))
             continue
         if fstatus != "ok":
             saw["unsafe"] = True
+            _set_candidate_outcome(candidate_outcomes, rec, "unsafe",
+                                   "destination is not a function start")
             msg("CANDIDATE_NOFUNC %-35s rank=%d mode=%s target=%s"
                 % (name, rec.rank, rec.mode, ea_str(target_ea)))
             continue
@@ -672,7 +732,7 @@ def try_apply_function_group(name, records, ranges, match_cache, stats,
             stats.conflicts += 1
             msg("FUNC_TARGET_CLASH %-34s @ %s already claimed by %s"
                 % (name, ea_str(func_ea), owner))
-            return "conflict"
+            return "conflict", candidate_outcomes, "destination target claimed by %s" % owner
 
         if created:
             stats.created_functions += 1
@@ -691,16 +751,16 @@ def try_apply_function_group(name, records, ranges, match_cache, stats,
             msg("ALREADY_SAME %-41s @ %s via=%s rank=%d%s"
                 % (name, ea_str(func_ea), rec.mode, rec.rank, confirm))
             apply_function_type_safe(func_ea, meta, stats)
-            return "already-same"
+            return "already-same", candidate_outcomes, None
         if outcome == "skip-named":
             stats.skipped_named += 1
-            return "skip-named"
+            return "skip-named", candidate_outcomes, "destination has a protected name"
         if outcome == "name-conflict":
             stats.name_conflicts += 1
-            return "name-conflict"
+            return "name-conflict", candidate_outcomes, "requested name exists elsewhere"
         if outcome == "failure":
             stats.failures += 1
-            return "failure"
+            return "failure", candidate_outcomes, "IDA refused or did not retain rename"
 
         stats.renamed += 1
         if rec.rank > 0:
@@ -710,39 +770,49 @@ def try_apply_function_group(name, records, ranges, match_cache, stats,
             % (name, ea_str(func_ea), rec.mode, rec.origin, rec.rank,
                " FALLBACK" if rec.rank > 0 else "", confirm))
         apply_function_type_safe(func_ea, meta, stats)
-        return "renamed"
+        return "renamed", candidate_outcomes, None
 
     if saw["unsafe"]:
         stats.unsafe += 1
         msg("UNRESOLVED_UNSAFE %-36s" % name)
-        return "unsafe"
+        reasons = [row["reason"] for row in candidate_outcomes
+                   if row["status"] == "unsafe"]
+        return "unsafe", candidate_outcomes, "; ".join(reasons)
     if saw["ambiguous"]:
         stats.ambiguous += 1
         msg("UNRESOLVED_AMBIGUOUS %-33s" % name)
-        return "ambiguous"
+        return "ambiguous", candidate_outcomes, "multiple matches"
     stats.not_found += 1
     msg("NOT_FOUND %-44s" % name)
-    return "not-found"
+    return "not-found", candidate_outcomes, "no candidate matched"
 
 
 def try_apply_global_group(name, records, ranges, match_cache, stats,
                            claimed, meta=None):
     """Resolve one global group by its REL data-anchor(s), rename, apply type."""
+    resolved, saw, candidate_outcomes = _evaluate_candidates(
+        name, records, ranges, match_cache, "GLOB_CAND"
+    )
+    terminal = _candidate_group_failure(resolved, saw, candidate_outcomes)
+    if terminal is not None:
+        status, reason = terminal
+        if status == "conflict":
+            stats.glob_conflicts += 1
+        elif status == "unsafe":
+            stats.glob_unsafe += 1
+        elif status == "ambiguous":
+            stats.glob_ambiguous += 1
+        else:
+            stats.glob_not_found += 1
+        return status, candidate_outcomes, reason
+
     existing_global = _global_name_ea(name)
     if existing_global != BADADDR:
         stats.glob_already_named += 1
         msg("GLOB_SKIP_NAME_EXISTS %-32s @ %s; applying type only"
             % (name, ea_str(existing_global)))
         apply_global_type_safe(existing_global, meta, stats)
-        return "already-global"
-
-    resolved, saw = _evaluate_candidates(
-        name, records, ranges, match_cache, "GLOB_CAND"
-    )
-
-    if _report_conflict(name, resolved, "GLOB"):
-        stats.glob_conflicts += 1
-        return "conflict"
+        return "already-global", candidate_outcomes, None
 
     for rec, target_ea, _detail in resolved:
         owner = claimed.get(target_ea)
@@ -750,7 +820,7 @@ def try_apply_global_group(name, records, ranges, match_cache, stats,
             stats.glob_conflicts += 1
             msg("GLOB_TARGET_CLASH %-34s @ %s already claimed by %s"
                 % (name, ea_str(target_ea), owner))
-            return "conflict"
+            return "conflict", candidate_outcomes, "destination target claimed by %s" % owner
 
         agreed = len(resolved)
         if agreed > 1:
@@ -765,16 +835,16 @@ def try_apply_global_group(name, records, ranges, match_cache, stats,
             msg("GLOB_ALREADY_SAME %-36s @ %s%s"
                 % (name, ea_str(target_ea), confirm))
             apply_global_type_safe(target_ea, meta, stats)
-            return "already-same"
+            return "already-same", candidate_outcomes, None
         if outcome == "skip-named":
             stats.glob_skipped_named += 1
-            return "skip-named"
+            return "skip-named", candidate_outcomes, "destination has a protected name"
         if outcome == "name-conflict":
             stats.glob_name_conflicts += 1
-            return "name-conflict"
+            return "name-conflict", candidate_outcomes, "requested name exists elsewhere"
         if outcome == "failure":
             stats.failures += 1
-            return "failure"
+            return "failure", candidate_outcomes, "IDA refused or did not retain rename"
 
         stats.glob_renamed += 1
         claimed[target_ea] = name
@@ -782,19 +852,21 @@ def try_apply_global_group(name, records, ranges, match_cache, stats,
             % (name, ea_str(target_ea), rec.rank,
                " FALLBACK" if rec.rank > 0 else "", confirm))
         apply_global_type_safe(target_ea, meta, stats)
-        return "renamed"
+        return "renamed", candidate_outcomes, None
 
     if saw["unsafe"]:
         stats.glob_unsafe += 1
         msg("GLOB_UNRESOLVED_UNSAFE %-31s" % name)
-        return "unsafe"
+        reasons = [row["reason"] for row in candidate_outcomes
+                   if row["status"] == "unsafe"]
+        return "unsafe", candidate_outcomes, "; ".join(reasons)
     if saw["ambiguous"]:
         stats.glob_ambiguous += 1
         msg("GLOB_UNRESOLVED_AMBIGUOUS %-28s" % name)
-        return "ambiguous"
+        return "ambiguous", candidate_outcomes, "multiple matches"
     stats.glob_not_found += 1
     msg("GLOB_NOT_FOUND %-39s" % name)
-    return "not-found"
+    return "not-found", candidate_outcomes, "no candidate matched"
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +906,8 @@ def _result(ok=False, partial=False, error=None, unresolved=None, **extra):
     return result
 
 
-def import_catalogue(path, show_progress=False):
+def import_catalogue(path, show_progress=False, transport_types=False,
+                     return_member_baseline=False):
     """Resolve and apply one catalogue without prompts or modal UI.
 
     The return value is JSON-serializable and follows the agent API's strict
@@ -857,16 +930,10 @@ def import_catalogue(path, show_progress=False):
     stats.groups = len(func_groups)
     stats.glob_groups = len(glob_groups)
 
-    if not func_groups and not glob_groups:
-        return _result(error="no CFS6 function or global records found", path=path)
-
-    # derived_value items (member offsets and friends) carry no name or type to
-    # apply to an IDB -- they exist for a non-IDA consumer. Say so rather than
-    # letting the user wonder why the counts do not add up.
     derived = loaded.derived_values()
-    if derived:
-        msg("Skipping %d derived_value item(s): they resolve to integers for "
-            "an external consumer, not to anything importable." % len(derived))
+    patches = loaded.patches()
+    if not func_groups and not glob_groups and not derived and not patches:
+        return _result(error="no CFS6 item records found", path=path)
 
     ranges = get_search_ranges()
     if not ranges:
@@ -890,20 +957,32 @@ def import_catalogue(path, show_progress=False):
         % ", ".join("%s[%s-%s]" % (name, ea_str(a), ea_str(b)) for a, b, name in ranges))
     msg("=" * 72)
 
-    # Register missing local types once, before any prototype/type application.
-    if show_progress:
-        ida_kernwin.show_wait_box("NODELAY\nRegistering missing CFS6 local types...")
-    try:
-        type_state = register_missing_types(loaded.type_records, stats)
-    except Exception as exc:
-        type_state = {"preexisting": set(), "registered": set(),
-                      "failed": set(loaded.type_records)}
-        stats.types_total = len(loaded.type_records)
-        stats.types_failed = len(loaded.type_records)
-        msg("TYPE_REGISTRATION_FATAL: %s" % exc)
-    finally:
+    # Snapshot before optional type transport: imported layouts are bootstrap
+    # material, never independent proof for a migrated member declaration.
+    member_baseline = _capture_destination_members(derived)
+
+    # Ordinary catalogue import never manufactures member-layout evidence from
+    # the catalogue.  Explicit import-and-migrate opts into type transport.
+    if transport_types:
         if show_progress:
-            ida_kernwin.hide_wait_box()
+            ida_kernwin.show_wait_box("NODELAY\nRegistering missing CFS6 local types...")
+        try:
+            type_state = register_missing_types(loaded.type_records, stats)
+        except Exception as exc:
+            type_state = {"preexisting": set(), "registered": set(),
+                          "failed": set(loaded.type_records)}
+            stats.types_total = len(loaded.type_records)
+            stats.types_failed = len(loaded.type_records)
+            msg("TYPE_REGISTRATION_FATAL: %s" % exc)
+        finally:
+            if show_progress:
+                ida_kernwin.hide_wait_box()
+    else:
+        preexisting = {name for name in loaded.type_records if named_type_present(name)}
+        type_state = {"preexisting": preexisting, "registered": set(),
+                      "failed": set()}
+        stats.types_total = len(loaded.type_records)
+        stats.types_existing = len(preexisting)
 
     msg("Types: %d kept-existing, %d registered, %d failed"
         % (len(type_state["preexisting"]), len(type_state["registered"]),
@@ -911,6 +990,53 @@ def import_catalogue(path, show_progress=False):
 
     match_cache = {}
     total = len(func_groups) + len(glob_groups)
+    outcomes = []
+
+    # VALUE and SITE records are intentionally validation-only here.  Importing
+    # a catalogue must expose stale dumper inputs, but it must never apply a
+    # patch or reconstruct producer state; that remains migrate_state's job.
+    for item in derived:
+        evidence, error, candidates = _resolve_declaration_evidence(
+            item, ranges, match_cache
+        )
+        row = {"kind": item.semantic, "id": item.id,
+               "name": item.qualified_name, "candidates": candidates}
+        if error:
+            row.update(status="unsafe", reason=error)
+        else:
+            row.update(status="validated", value=evidence["value"],
+                       evidence=evidence["evidence"])
+            if item.semantic == cfs6.SEM_MEMBER_OFFSET:
+                observed = member_baseline[item.id]
+                if observed is None:
+                    row.update(status="destination-unverified", destination={
+                        "status": "unavailable", "member": item.qualified_name,
+                    })
+                elif observed != evidence["value"]:
+                    row.update(status="destination-disagrees", reason=(
+                        "destination IDA field disagrees: type=0x%X code=0x%X; "
+                        "update the type from independent evidence"
+                        % (observed, evidence["value"])
+                    ), destination={"status": "disagrees", "offset": observed})
+                else:
+                    row.update(status="destination-agrees", destination={
+                        "status": "agrees", "offset": observed,
+                    })
+            if item.expected_value is not None and item.expected_value != evidence["value"]:
+                row["drift"] = {"source": item.expected_value,
+                                "destination": evidence["value"]}
+        outcomes.append(row)
+
+    for item in patches:
+        planned, error, candidates = _validate_patch(item, ranges, match_cache)
+        row = {"kind": "patch", "id": item.id,
+               "name": item.qualified_name, "candidates": candidates}
+        if error:
+            row.update(status="unsafe", reason=error)
+        else:
+            row.update(status="validated", site=planned["site"],
+                       evidence=planned["evidence"])
+        outcomes.append(row)
 
     if show_progress:
         ida_kernwin.clr_cancelled()
@@ -920,8 +1046,6 @@ def import_catalogue(path, show_progress=False):
 
     # Reverse map so two different items resolving to one address is caught.
     claimed = {}
-    outcomes = []
-
     try:
         done = 0
         cancelled = False
@@ -942,12 +1066,16 @@ def import_catalogue(path, show_progress=False):
                        stats.types_registered, item.name)
                 )
             try:
-                status = try_apply_function_group(
+                status, candidates, reason = try_apply_function_group(
                     item.name, item.candidates, ranges, match_cache, stats,
                     claimed, meta=loaded.item_meta.get(item.id),
                 )
-                outcomes.append({"kind": "function", "id": item.id,
-                                 "name": item.name, "status": status})
+                row = {"kind": "function", "id": item.id,
+                       "name": item.name, "status": status,
+                       "candidates": candidates}
+                if reason:
+                    row["reason"] = reason
+                outcomes.append(row)
             except Exception as exc:
                 stats.failures += 1
                 msg("FAIL_EXCEPTION %-39s error=%s" % (item.name, exc))
@@ -972,12 +1100,16 @@ def import_catalogue(path, show_progress=False):
                            stats.glob_types_applied, item.name)
                     )
                 try:
-                    status = try_apply_global_group(
+                    status, candidates, reason = try_apply_global_group(
                         item.name, item.candidates, ranges, match_cache, stats,
                         claimed, meta=loaded.item_meta.get(item.id),
                     )
-                    outcomes.append({"kind": "global", "id": item.id,
-                                     "name": item.name, "status": status})
+                    row = {"kind": "global", "id": item.id,
+                           "name": item.name, "status": status,
+                           "candidates": candidates}
+                    if reason:
+                        row["reason"] = reason
+                    outcomes.append(row)
                 except Exception as exc:
                     stats.failures += 1
                     msg("GLOB_FAIL_EXCEPTION %-34s error=%s" % (item.name, exc))
@@ -1000,7 +1132,8 @@ def import_catalogue(path, show_progress=False):
         msg(line)
     msg("-" * 72)
 
-    good = {"renamed", "already-same", "already-global"}
+    good = {"renamed", "already-same", "already-global", "validated",
+            "destination-agrees", "destination-unverified"}
     unresolved = [
         {"kind": row["kind"], "name": row["name"],
          "reason": row.get("reason", row["status"])}
@@ -1009,18 +1142,24 @@ def import_catalogue(path, show_progress=False):
     succeeded = len(outcomes) - len(unresolved)
     ok = not unresolved and not stats.cancelled and stats.parse_errors == 0 \
         and stats.failures == 0
-    return _result(
+    result = _result(
         ok=ok, partial=(not ok and succeeded > 0), unresolved=unresolved,
         error="cancelled" if stats.cancelled else None,
-        path=path, requested=len(func_groups) + len(glob_groups),
+        path=path, requested=len(func_groups) + len(glob_groups) + len(derived) + len(patches),
         applied=succeeded, outcomes=outcomes, summary=stats.summary(),
         source=loaded.describe_source(), parse_errors=stats.parse_errors,
         skipped_records=loaded.skipped_records,
-        derived_values=len(derived),
+        derived_values=len(derived), patches=len(patches),
+        warnings=[row for row in outcomes
+                  if row["status"] == "destination-unverified"],
+        type_transport=bool(transport_types),
         types={"preexisting": len(type_state["preexisting"]),
                "registered": len(type_state["registered"]),
                "failed": len(type_state["failed"])},
     )
+    if return_member_baseline:
+        result["member_baseline"] = member_baseline
+    return result
 
 
 def _snapshot_state():
@@ -1056,29 +1195,51 @@ def _restore_state(snapshot):
     return ok
 
 
-def _plan_declaration(item, ranges, match_cache):
+def _capture_destination_members(items):
+    """Snapshot independent member evidence before any optional type transport."""
+    out = {}
+    for item in items:
+        if item.semantic != cfs6.SEM_MEMBER_OFFSET:
+            continue
+        ref = members.lookup_member(item.owner, item.name)
+        out[item.id] = None if ref is None else int(ref.byte_offset)
+    return out
+
+
+def _resolve_declaration_evidence(item, ranges, match_cache):
+    """Resolve VALUE candidates without consulting or changing destination types."""
     resolved = []
     failures = []
     recipes = []
+    candidate_outcomes = []
     for rec in item.candidates:
         match_ea, error = _find_unique_match(rec, ranges, match_cache)
         if error:
             failures.append("rank%d/%s: %s" % (rec.rank, rec.origin, error))
+            candidate_outcomes.append({"rank": rec.rank, "origin": rec.origin,
+                                       "mode": rec.mode, "status": error,
+                                       "reason": error})
             continue
         value, site, recipe, error = _resolve_value_at_match(rec, match_ea)
         if error:
             failures.append("rank%d/%s: %s" % (rec.rank, rec.origin, error))
+            candidate_outcomes.append({"rank": rec.rank, "origin": rec.origin,
+                                       "mode": rec.mode, "status": "unsafe",
+                                       "reason": error})
             continue
         resolved.append((rec, value, site))
+        candidate_outcomes.append({"rank": rec.rank, "origin": rec.origin,
+                                   "mode": rec.mode, "status": "resolved",
+                                   "value": value, "site": site["ea"]})
         if recipe:
             recipes.append(recipe)
     values = {value for _rec, value, _site in resolved}
     if not resolved:
-        return None, "no candidate resolved (%s)" % "; ".join(failures)
+        return None, "no candidate resolved (%s)" % "; ".join(failures), candidate_outcomes
     if len(values) != 1:
         return None, "candidate conflict: %s" % ", ".join(
             "rank%d=%s" % (rec.rank, value) for rec, value, _site in resolved
-        )
+        ), candidate_outcomes
     value = next(iter(values))
     sites = []
     seen = set()
@@ -1089,50 +1250,131 @@ def _plan_declaration(item, ranges, match_cache):
             sites.append(site)
     adjustments = {rec.value_adjust for rec, _value, _site in resolved}
     if len(adjustments) != 1:
-        return None, "candidate value_adjust conflict"
+        return None, "candidate value_adjust conflict", candidate_outcomes
     adjust = next(iter(adjustments))
 
+    return {"value": value, "sites": sites, "adjust": adjust,
+            "recipes": recipes, "evidence": len(resolved),
+            "failures": failures, "candidates": candidate_outcomes}, None, candidate_outcomes
+
+
+def _plan_declaration(item, ranges, match_cache, member_baseline=None):
+    """Make a migration declaration only after independent type agreement."""
+    evidence, error, candidate_outcomes = _resolve_declaration_evidence(
+        item, ranges, match_cache
+    )
+    if error:
+        return None, error, candidate_outcomes
+    value = evidence["value"]
     try:
         if item.semantic == cfs6.SEM_MEMBER_OFFSET:
-            ref = members.lookup_member(item.owner, item.name)
-            if ref is None:
-                return None, "destination has no IDA field %s.%s" % (
+            if member_baseline is None:
+                ref = members.lookup_member(item.owner, item.name)
+                observed = None if ref is None else int(ref.byte_offset)
+            else:
+                observed = member_baseline.get(item.id)
+            if observed is None:
+                return None, "destination has no independent IDA field %s.%s" % (
                     item.owner, item.name
-                )
-            if ref.byte_offset != value:
+                ), candidate_outcomes
+            if observed != value:
                 return None, (
                     "destination IDA field is stale or disagrees: type=0x%X "
                     "code=0x%X; update the type from independent evidence"
-                    % (ref.byte_offset, value)
-                )
+                    % (observed, value)
+                ), candidate_outcomes
             decl = declare.make_member(
-                item.owner, item.name, sites=sites,
-                discovery=declare.DISCOVER_SITES_ONLY, value_adjust=adjust,
+                item.owner, item.name, sites=evidence["sites"],
+                discovery=declare.DISCOVER_SITES_ONLY,
+                value_adjust=evidence["adjust"],
             )
         elif item.semantic == cfs6.SEM_ELEMENT_STRIDE:
-            recipe = recipes[0] if recipes else None
             decl = declare.make_stride(
-                item.owner, item.name, value, sites,
-                value_adjust=adjust, recipe=recipe,
+                item.owner, item.name, value, evidence["sites"],
+                value_adjust=evidence["adjust"],
+                recipe=evidence["recipes"][0] if evidence["recipes"] else None,
             )
         elif item.semantic == cfs6.SEM_CONSTANT:
             decl = declare.make_constant(
-                item.owner, item.name, value, sites, value_adjust=adjust,
+                item.owner, item.name, value, evidence["sites"],
+                value_adjust=evidence["adjust"],
             )
         elif item.semantic == cfs6.SEM_OBJECT_EXTENT:
-            decl = declare.make_extent(item.owner, item.name, value, sites)
+            decl = declare.make_extent(item.owner, item.name, value,
+                                       evidence["sites"])
         else:
-            return None, "unsupported semantic %s" % item.semantic
+            return None, "unsupported semantic %s" % item.semantic, candidate_outcomes
     except declare.DeclarationError as exc:
-        return None, str(exc)
+        return None, str(exc), candidate_outcomes
     drift = None
     if item.expected_value is not None and item.expected_value != value:
         drift = {"source": item.expected_value, "destination": value}
-    return {"declaration": decl, "value": value, "drift": drift,
-            "evidence": len(resolved), "failures": failures}, None
+    evidence.update(declaration=decl, drift=drift)
+    return evidence, None, candidate_outcomes
 
 
-def migrate_producer_state(path, require_all=False):
+def _validate_patch(item, ranges, match_cache):
+    """Validate one patch record without modifying destination bytes or state."""
+    resolved = []
+    candidates = []
+    failures = []
+    expected = bytes.fromhex(item.expected_bytes)
+    for rec in item.candidates:
+        match_ea, error = _find_unique_match(rec, ranges, match_cache)
+        if error:
+            failures.append("rank%d/%s: %s" % (rec.rank, rec.origin, error))
+            candidates.append({"rank": rec.rank, "origin": rec.origin,
+                               "mode": rec.mode, "status": error,
+                               "reason": error})
+            continue
+        site_ea = match_ea + rec.instruction_offset
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, site_ea) <= 0 or insn.size <= 0:
+            failures.append("rank%d/%s: patch instruction does not decode"
+                            % (rec.rank, rec.origin))
+            candidates.append({"rank": rec.rank, "origin": rec.origin,
+                               "mode": rec.mode, "status": "unsafe",
+                               "reason": "patch instruction does not decode"})
+            continue
+        if item.patch_size < insn.size:
+            failures.append("rank%d/%s: patch span cuts through decoded instruction"
+                            % (rec.rank, rec.origin))
+            candidates.append({"rank": rec.rank, "origin": rec.origin,
+                               "mode": rec.mode, "status": "unsafe",
+                               "reason": "patch span cuts through decoded instruction"})
+            continue
+        raw = ida_bytes.get_bytes(site_ea, item.patch_size)
+        if raw is None or len(raw) != item.patch_size or not raw.startswith(expected):
+            failures.append("rank%d/%s: original opcode bytes or patch span differ"
+                            % (rec.rank, rec.origin))
+            candidates.append({"rank": rec.rank, "origin": rec.origin,
+                               "mode": rec.mode, "status": "unsafe",
+                               "reason": "original opcode bytes or patch span differ"})
+            continue
+        mnemonic = (ida_ua.print_insn_mnem(site_ea) or "").lower()
+        if mnemonic != item.expected_instruction:
+            failures.append("rank%d/%s: expected instruction %s, decoded %s"
+                            % (rec.rank, rec.origin, item.expected_instruction,
+                               mnemonic or "?"))
+            candidates.append({"rank": rec.rank, "origin": rec.origin,
+                               "mode": rec.mode, "status": "unsafe",
+                               "reason": "expected instruction %s, decoded %s"
+                               % (item.expected_instruction, mnemonic or "?")})
+            continue
+        resolved.append(site_ea)
+        candidates.append({"rank": rec.rank, "origin": rec.origin,
+                           "mode": rec.mode, "status": "resolved",
+                           "site": site_ea})
+    if not resolved:
+        return None, "no candidate resolved (%s)" % "; ".join(failures), candidates
+    if len(set(resolved)) != 1:
+        return None, "candidate conflict: %s" % ", ".join(
+            ea_str(ea) for ea in sorted(set(resolved))), candidates
+    return {"site": resolved[0], "evidence": len(resolved),
+            "candidates": candidates}, None, candidates
+
+
+def migrate_producer_state(path, require_all=False, member_baseline=None):
     """Rebuild portable exporter state from a CFS catalogue transactionally.
 
     Absolute source addresses are never copied.  Declarations and patch sites
@@ -1179,7 +1421,9 @@ def migrate_producer_state(path, require_all=False):
                 planned_locators[item.id] = locators
 
     for item in loaded.derived_values():
-        planned, error = _plan_declaration(item, ranges, match_cache)
+        planned, error, _candidates = _plan_declaration(
+            item, ranges, match_cache, member_baseline=member_baseline
+        )
         if error:
             unresolved.append({"kind": item.semantic,
                                "name": item.qualified_name, "reason": error})
@@ -1293,8 +1537,15 @@ def migrate_producer_state(path, require_all=False):
 
 def import_and_migrate(path, require_all_state=False, show_progress=False):
     """Apply a catalogue, then transactionally reconstruct producer state."""
-    catalogue = import_catalogue(path, show_progress=show_progress)
-    state = migrate_producer_state(path, require_all=require_all_state)
+    catalogue = import_catalogue(
+        path, show_progress=show_progress, transport_types=True,
+        return_member_baseline=True,
+    )
+    member_baseline = catalogue.pop("member_baseline", None)
+    state = migrate_producer_state(
+        path, require_all=require_all_state,
+        member_baseline=member_baseline,
+    )
     ok = bool(catalogue.get("ok") and state.get("ok"))
     combined = []
     seen = set()

@@ -11,6 +11,21 @@ Catalogue application changes the destination analysis:
 - register missing named types without replacing complete definitions;
 - merge function prototypes and apply safe global types.
 
+It also validates every catalogue candidate against the destination image.
+Derived values and patches are validation-only during this phase: import never
+writes patch bytes or producer state. Each outcome includes every candidate's
+rank, origin, status and exact refusal reason, so a partly portable item can
+report (for example) two agreements and three rejected candidates rather than
+a generic `unsafe`.
+
+For a resolved member candidate, ordinary import reports destination evidence
+separately: `destination-agrees`, `destination-unverified` (no pre-existing
+field), or `destination-disagrees`. The unavailable case is a warning, not a
+CFS candidate failure. Ordinary import does not register transported local
+types or create/repair member layouts. `import_and_migrate()` explicitly opts
+into type transport and producer-state reconstruction, while retaining a
+pre-transport snapshot so an imported layout cannot become its own proof.
+
 Producer-state migration prepares the destination to produce its own next
 catalogue:
 
@@ -34,8 +49,10 @@ proof. Persist the declaration only when:
 1. its VALUE candidates agree on one destination value; and
 2. the destination IDA field independently exists at that value.
 
-A missing field or type/code disagreement is unresolved. Never repair the type
-from the same pattern and then treat the agreement as independent evidence.
+A missing field is destination-unverified during ordinary import and cannot be
+migrated. A type/code disagreement is unresolved for migration. Never repair
+the type from the same pattern and then treat the agreement as independent
+evidence.
 
 Strides, constants, and extents have no backing IDA field. Their agreeing
 destination candidates supply the migrated asserted value. Report a difference
@@ -48,6 +65,13 @@ from `source.expected_value` as drift.
 - Decode, ownership, target, operand, opcode, or span failure: `unsafe`.
 - Independent candidates resolving differently: `conflict`.
 - A protected destination name: preserve it and report the item.
+
+`import_catalogue()` returns an `outcomes` row for every function, global,
+derived value and patch. `unresolved` remains the compact failures-only view.
+For function/global candidates, unsafe diagnostics retain the failed boundary,
+decode, mapping, ownership, interior-function, or claim check. For VALUE and
+SITE candidates, validation reuses the migration decoder and patch opcode/span
+checks without applying a patch.
 
 Structural `VTABLE` and `STRING_REL` modes are not image-wide patterns. The
 catalogue importer skips them unless another candidate or an existing correct

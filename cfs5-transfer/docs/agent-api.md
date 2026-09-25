@@ -20,6 +20,15 @@ Every call returns:
 | `error` | operation-level failure, otherwise `None` |
 | `unresolved` | per-item failures with `kind`, `name`, and `reason` |
 
+Import results additionally contain `outcomes`: one row for every catalogue
+record, with its candidate-level resolution results. Derived values and patches
+are resolved and checked during `import_catalogue()`, but never applied there;
+patching and producer-state writes remain exclusive to migration/export flows.
+For member values, `destination-unverified` is advisory: code candidates
+validated but the destination had no independently existing field. Ordinary
+import does not transport local type/member layouts; `import_and_migrate()` is
+the explicit type/state reconstruction operation.
+
 Check `ok`. When false, inspect both `error` and every `unresolved` entry.
 Partial success is deliberately not success.
 
