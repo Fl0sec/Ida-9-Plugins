@@ -28,6 +28,22 @@ class Cfs6TempFileCase(unittest.TestCase):
 
 
 class TestRoundTrip(Cfs6TempFileCase):
+    def test_revalidated_candidate_rewrites_rank_and_source(self):
+        original = os.path.join(self.dir.name, "original.cfs")
+        write_cfs6(original, [(cfs6.REC_FUNCTION, "popup", [entry_candidate("90 90 90 90 90 90")])])
+        rec = cfs6.load_cfs6(original).functions()[0].candidates[0]
+        with open(self.path, "w", encoding="utf-8", newline="") as handle:
+            writer = cfs6.Cfs6Writer(handle)
+            writer.write_header(_support.sample_image(), 14184, "user")
+            iid = writer.write_item(cfs6.REC_FUNCTION, "popup", 1, {})
+            writer.write_revalidated_candidate(
+                iid, 0, rec, {"anchor_rva": 123, "function_rva": 100,
+                              "function_size": 9}
+            )
+        got = self.load().functions()[0].candidates[0]
+        self.assertEqual(got.rank, 0)
+        self.assertEqual(got.source["anchor_rva"], 123)
+
     def test_string_rel_candidate_round_trip(self):
         cand = string_rel_candidate()
         write_cfs6(self.path, [(cfs6.REC_FUNCTION, "popup", [cand])])

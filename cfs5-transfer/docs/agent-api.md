@@ -223,6 +223,30 @@ selected item regenerates and the result parses cleanly. `declaration_names`
 accepts derived declarations and patch declarations; use an exact item ID when
 the same qualified name exists in both groups.
 
+## Promote selected records across builds
+
+`append` and `export_selected` never cross a header build boundary. Use
+promotion to make a new target-build catalogue from explicitly selected,
+revalidated source records:
+
+```python
+api.promote_catalogue(
+    source_path=r"C:\catalogues\client-14182.cfs",
+    destination_path=r"C:\catalogues\client-14184.cfs",
+    declaration_names=["spotted::PlantedC4Gate"],
+    build=14184,
+)
+```
+
+Promotion does not copy records blindly. Every retained candidate must match
+uniquely in the target; failed candidates are dropped, ranks are compacted,
+derived values are recomputed, and patches must still pass opcode, mnemonic,
+and span checks. The output has a fresh target header and rebased diagnostic
+RVAs. It intentionally does not carry type payloads or unrelated records:
+those require their own target validation before a later full-catalogue mode.
+Pass `preserve_validated=True` to revalidate every source item and retain only
+the target-valid subset; the result is partial when any item cannot promote.
+
 ## Public surface
 
 | Branch | Calls |
@@ -230,7 +254,7 @@ the same qualified name exists in both groups.
 | Registry | `register`, `unregister`, `clear`, `registered` |
 | Declarations | `declare_members`, `declare_strides`, `declare_constants`, `declare_extents`, `declare_patches`, `undeclare`, `declarations` |
 | Export | `export`, `export_list`, `export_selected` |
-| Import | `import_catalogue`, `migrate_state`, `import_and_migrate` |
+| Import | `import_catalogue`, `migrate_state`, `import_and_migrate`, `promote_catalogue` |
 
 Adding a public call requires one implementation branch, a facade re-export,
 the shared result envelope, an API layout test update, and documentation here.

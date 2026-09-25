@@ -703,6 +703,16 @@ class Cfs6Writer:
         self._emit(obj)
         self.candidates += 1
 
+    def write_revalidated_candidate(self, iid, rank, rec, source):
+        """Write a loaded candidate after target-build validation/rebasing."""
+        self._emit({
+            "record": REC_CANDIDATE, "item": iid, "rank": int(rank),
+            "mode": rec.mode, "pattern": rec.pattern, "origin": rec.origin,
+            "score": int(rec.score), "source": dict(source),
+            "resolve": dict(rec.resolve),
+        })
+        self.candidates += 1
+
     def write_item_type(self, iid, name, quality, blobs, dependencies,
                         is_global=False):
         self._emit({

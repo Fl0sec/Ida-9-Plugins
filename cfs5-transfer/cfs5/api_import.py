@@ -1,6 +1,7 @@
 """Programmatic catalogue application and producer-state migration."""
 
 from . import importer as _importer
+from . import promotion as _promotion
 
 
 def import_catalogue(path):
@@ -17,4 +18,13 @@ def import_and_migrate(path, require_all_state=False):
     """Apply a catalogue, then reconstruct producer state from resolved proof."""
     return _importer.import_and_migrate(
         path, require_all_state=require_all_state, show_progress=False
+    )
+
+
+def promote_catalogue(source_path, destination_path, build=None, item_ids=(),
+                      declaration_names=(), preserve_validated=False):
+    """Revalidate selected records and write a fresh target-build catalogue."""
+    return _promotion.promote_catalogue(
+        source_path, destination_path, build=build, item_ids=item_ids,
+        declaration_names=declaration_names, preserve_validated=preserve_validated,
     )
