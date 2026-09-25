@@ -224,18 +224,21 @@ class ReaderValidationTests(_TempFileCase):
             self.assertEqual(len(loaded.derived_values()[0].candidates), 1)
 
     def test_typed_local_zero_origin_accepts_the_const_zero_recipe(self):
-        loaded, _ = self.load([
-            header_line(), _item_line(source={"expected_value": 0}),
-            _cand_line(
-                origin=cfs6.ORIGIN_HEXRAYS_TYPED_LOCAL_ZERO,
-                resolve={"op": cfs6.OP_CONST, "value": 0},
-            ),
-        ])
-        self.assertEqual(loaded.parse_errors, 0)
-        candidate = loaded.derived_values()[0].candidates[0]
-        self.assertEqual(candidate.origin, cfs6.ORIGIN_HEXRAYS_TYPED_LOCAL_ZERO)
-        self.assertEqual(candidate.op, cfs6.OP_CONST)
-        self.assertEqual(candidate.resolve["value"], 0)
+        for origin in (
+                cfs6.ORIGIN_HEXRAYS_TYPED_LOCAL_ZERO,
+                cfs6.ORIGIN_IDA_TYPED_STACK_LOCAL_ZERO):
+            loaded, _ = self.load([
+                header_line(), _item_line(source={"expected_value": 0}),
+                _cand_line(
+                    origin=origin,
+                    resolve={"op": cfs6.OP_CONST, "value": 0},
+                ),
+            ])
+            self.assertEqual(loaded.parse_errors, 0, origin)
+            candidate = loaded.derived_values()[0].candidates[0]
+            self.assertEqual(candidate.origin, origin)
+            self.assertEqual(candidate.op, cfs6.OP_CONST)
+            self.assertEqual(candidate.resolve["value"], 0)
 
     def test_unknown_extraction_op_is_rejected(self):
         loaded, _ = self.load([

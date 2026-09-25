@@ -22,6 +22,7 @@ import ida_ua
 
 from . import cfs6
 from . import confirm
+from . import members
 from . import memberscan
 from . import leachain
 from . import registry
@@ -923,9 +924,14 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
     for site_ea, op_hint, origin in sites:
         searched += 1
         try:
+            typed_stack_local_zero = (
+                origin == ORIGIN_SELECTED_OPERAND and ref is not None
+                and int(encoded_value) == 0 and op_hint is not None
+                and members.typed_stack_local_zero(ref, site_ea, op_hint)
+            )
             if origin == ORIGIN_SELECTED_OPERAND and ref is not None \
-                    and not _selected_member_site_is_proven(
-                        ref, site_ea, op_hint):
+                    and not typed_stack_local_zero \
+                    and not _selected_member_site_is_proven(ref, site_ea, op_hint):
                 if reasons is not None:
                     reasons[int(site_ea)] = REJECT_NO_MEMBER_PROVENANCE
                 continue
@@ -954,13 +960,17 @@ def choose_value_candidates(encoded_value, ranges, selected_sites=(),
                     if reasons is not None:
                         reasons[int(site_ea)] = REJECT_RECIPE_DISAGREES
                     continue
-            typed_local_zero = (
+            hexrays_typed_local_zero = (
                 ref is not None and int(encoded_value) == 0
                 and memberscan.confirms_typed_local_zero_member_site(ref, site_ea)
             )
+            typed_local_zero = typed_stack_local_zero or hexrays_typed_local_zero
             candidate_origin = (
-                cfs6.ORIGIN_HEXRAYS_TYPED_LOCAL_ZERO
-                if typed_local_zero else origin
+                cfs6.ORIGIN_IDA_TYPED_STACK_LOCAL_ZERO
+                if typed_stack_local_zero else (
+                    cfs6.ORIGIN_HEXRAYS_TYPED_LOCAL_ZERO
+                    if hexrays_typed_local_zero else origin
+                )
             )
             cand = find_value_candidate_for_site(
                 site_ea, actual_encoded, ranges, candidate_origin,

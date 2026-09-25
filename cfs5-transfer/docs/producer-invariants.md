@@ -7,11 +7,13 @@ transport, and export orchestration.
 
 `member_offset` reads its value from a live IDA field. No field means no item.
 Candidate sites may originate only from `stroff_xref`, `selected_operand`,
-`hexrays_memptr`, or `hexrays_typed_local_zero`; the format reader enforces
-this closed set. The last is restricted to an exact offset-zero member
-expression through a typed local aggregate and emits `CONST 0`; it never
-reinterprets a stack-frame displacement as an object offset. A displacement
-search is a prefilter, never proof of owner/member association.
+`hexrays_memptr`, `hexrays_typed_local_zero`, or
+`ida_typed_stack_local_zero`; the format reader enforces this closed set. The
+two typed-local origins are restricted to an exact offset-zero member proof:
+the former uses a ctree expression, the latter requires IDA to map the
+selected operand to the exact start of a typed frame UDT. Both emit `CONST 0`;
+neither reinterprets a stack-frame displacement as an object offset. A
+displacement search is a prefilter, never proof of owner/member association.
 
 Correct pointer typing can still yield no IDA field xrefs. Explicit sites name
 where evidence exists, not what value it should produce. The exporter decodes

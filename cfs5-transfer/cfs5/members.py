@@ -27,6 +27,8 @@ byte offset is explicit below.
 """
 
 import ida_bytes
+import ida_frame
+import ida_funcs
 import ida_name
 import ida_pro
 import ida_typeinf
@@ -353,6 +355,56 @@ def member_from_operand(ea, op_index):
         msg("MEMBER: operand at %s resolves to a negative offset" % ea_str(ea))
         return None
     return member_at_offset(owner, byte_offset)
+
+
+def typed_stack_local_zero(ref, ea, op_index):
+    """Whether an operand names the start of `ref.owner` in the IDA frame.
+
+    This is intentionally narrower than a stack-relative displacement. IDA
+    must mark the exact operand as a stack variable, map it to the exact start
+    of a frame member, and report that member as the declared owner UDT. The
+    only value this proves is the owner's offset-zero member; frame layout is
+    never used as object layout.
+    """
+    if ref is None or int(ref.byte_offset) != 0:
+        return False
+    try:
+        op_index = int(op_index)
+        if not 0 <= op_index < UA_MAXOP:
+            return False
+        insn = decode_at(ea)
+        if insn is None or insn.ops[op_index].type != ida_ua.o_displ:
+            return False
+        flags = ida_bytes.get_full_flags(ea)
+        if not ida_bytes.is_stkvar(flags, op_index):
+            return False
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            return False
+
+        frame_offset = ida_frame.calc_stkvar_struc_offset_ea(
+            ea, insn, op_index
+        )
+        if frame_offset == BADADDR:
+            return False
+
+        frame = ida_typeinf.tinfo_t()
+        if not frame.get_func_frame(func):
+            return False
+        frame_offset = int(frame_offset)
+        _idx, frame_member = frame.get_udm_by_offset(_bits(frame_offset))
+        if frame_member is None or _bytes_of(frame_member.offset) != frame_offset:
+            return False
+
+        local_tif = ida_typeinf.tinfo_t()
+        if local_tif.get_stkvar(insn, insn.ops[op_index],
+                                int(insn.ops[op_index].addr)) < 0:
+            return False
+        return local_tif.is_udt() and str(local_tif.get_type_name() or "") == ref.owner
+    except Exception as exc:
+        msg("MEMBER: typed stack-local proof failed at %s op %d: %s"
+            % (ea_str(ea), op_index, exc))
+        return False
 
 
 def _struct_name_for_tid(tid):
