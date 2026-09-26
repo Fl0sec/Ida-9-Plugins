@@ -47,6 +47,69 @@ def _active_counts(source_items, emitted_active_ids):
     }
 
 
+def _is_same_target_cfs7(loaded, image, build_number):
+    """Whether ``loaded`` is a target-local CFS7 stage we may carry types from.
+
+    CFS6 type blobs belong to its source IDB and are never portable evidence.
+    A CFS7 stage made for this exact image, however, already contains types
+    freshly exported from this target.  Refresh jobs deliberately feed such a
+    stage into the next bounded step, so dropping its metadata would make the
+    last step silently win.
+    """
+    return (
+        loaded.header.get("version") == cfs6.CFS7_FORMAT_VERSION
+        and loaded.image() == image
+        and loaded.build_number() == build_number
+    )
+
+
+def _target_type_payloads(source, active, output_ids, image, build_number):
+    """Merge target-local item metadata and its complete local-type closure.
+
+    ``active`` is the newly exported selection for this step.  It supersedes
+    same-item and same-name records from a same-target CFS7 stage; CFS6 source
+    payloads are intentionally excluded because they describe an older IDB.
+    """
+    metas = {}
+    local_types = {}
+    if _is_same_target_cfs7(source, image, build_number):
+        metas.update({
+            iid: meta for iid, meta in source.item_meta.items()
+            if iid in output_ids and meta.type_blob is not None
+        })
+        local_types.update(source.type_records)
+
+    if active is not None:
+        active_ids = {item.id for item in active.items}
+        # A selected current-target item replaces its old target payload even
+        # when it no longer has an exportable type.
+        for iid in active_ids:
+            metas.pop(iid, None)
+        for iid, meta in active.item_meta.items():
+            if iid in output_ids and meta.type_blob is not None:
+                metas[iid] = meta
+        local_types.update(active.type_records)
+
+    needed = {
+        dependency for meta in metas.values() for dependency in meta.dependencies
+    }
+    missing = sorted(needed - set(local_types))
+    if missing:
+        raise ValueError(
+            "target type closure is incomplete: missing local type(s) %s"
+            % ", ".join(missing)
+        )
+    return metas, {name: local_types[name] for name in sorted(needed)}
+
+
+def _type_counts(metas, local_types):
+    return {
+        "function_types": sum(1 for meta in metas.values() if not meta.is_global),
+        "global_types": sum(1 for meta in metas.values() if meta.is_global),
+        "local_types": len(local_types),
+    }
+
+
 def _limit(item):
     if item.kind == cfs6.REC_FUNCTION:
         return MAX_EXPORTED_CANDIDATES
@@ -222,18 +285,19 @@ def refresh_catalogue(source_path, destination_path, build=None, item_ids=(),
                 iid = _write_item(writer, item, candidates, active=is_active)
                 if is_active:
                     active_ids.add(iid)
-            # Type records are emitted only from the current-target selected export.
-            if active is not None:
-                for iid in sorted(active_ids):
-                    meta = active.item_meta.get(iid)
-                    if meta is not None and meta.type_blob is not None:
-                        writer.write_item_type(iid, meta.name, meta.quality,
-                            (meta.type_blob, meta.fields_blob, meta.fldcmts_blob),
-                            meta.dependencies, is_global=meta.is_global)
-                for name in sorted(active.type_records):
-                    record = active.type_records[name]
-                    writer.write_local_type(record.name, record.kind,
-                        (record.type_blob, record.fields_blob, record.fldcmts_blob))
+            output_ids = {item.id for item, _candidates, _active in planned}
+            metas, local_types = _target_type_payloads(
+                source, active, output_ids, image, build_number,
+            )
+            for iid in sorted(metas):
+                meta = metas[iid]
+                writer.write_item_type(iid, meta.name, meta.quality,
+                    (meta.type_blob, meta.fields_blob, meta.fldcmts_blob),
+                    meta.dependencies, is_global=meta.is_global)
+            for name in sorted(local_types):
+                record = local_types[name]
+                writer.write_local_type(record.name, record.kind,
+                    (record.type_blob, record.fields_blob, record.fldcmts_blob))
         checked = cfs6.load_catalogue(tmp)
         if checked.parse_errors:
             raise ValueError("generated CFS7 has %d parse errors" % checked.parse_errors)
@@ -252,5 +316,6 @@ def refresh_catalogue(source_path, destination_path, build=None, item_ids=(),
         "target": {"image": image, "build": {"number": build_number,
                    "source": build_source}},
         "retained": len(planned), "removed": removed,
+        **_type_counts(metas, local_types),
         **counts,
     }

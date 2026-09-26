@@ -269,8 +269,14 @@ because of their age; they are removed only after target validation fails.
 
 `item_ids` and `declaration_names` add exact active-IDB evidence. Those records
 are freshly exported from the target and therefore carry target provenance.
-The selection is all-or-nothing. Type payloads are included only for those
-fresh target records; refresh never carries type payloads from an older build.
+The selection is all-or-nothing. Type payloads are included only for freshly
+exported target records; refresh never carries type payloads from an older
+build. A resumable job's private CFS7 stage is already target-local, so later
+steps preserve its retained item payloads and their reachable local-type
+closure while replacing payloads for the item currently refreshed.
+Successful refresh results report `function_types`, `global_types`, and
+`local_types`, allowing callers to verify the type surface as well as item
+resolution.
 
 For more than eight active records, use the restart-resumable job API instead
 of one long refresh call:

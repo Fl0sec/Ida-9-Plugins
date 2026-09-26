@@ -94,3 +94,54 @@ class TestRefreshCounts(unittest.TestCase):
             rolling._active_counts(source, {"fn:old"}),
             {"added": 0, "refreshed": 1},
         )
+
+
+class TestRefreshTypePayloads(unittest.TestCase):
+    """The bounded refresh stage must not let its last unit erase prior types."""
+
+    def _catalogue(self, version=7):
+        image = _support.sample_image()
+        header = {"version": version, "image": image,
+                  "build": {"number": 14185, "source": "user"}}
+        return cfs6.LoadedCfs(header), image
+
+    @staticmethod
+    def _meta(iid, name, dependency, is_global=False):
+        return cfs6.ItemMeta(
+            1, iid, name, "USER", b"type:" + name.encode(), b"", b"",
+            [dependency], is_global=is_global,
+        )
+
+    @staticmethod
+    def _local(name):
+        return cfs6.TypeRecord(1, name, "STRUCT", b"body:" + name.encode(), b"", b"")
+
+    def test_second_bounded_step_preserves_prior_target_type_closure(self):
+        # Step one has already made a target-local CFS7 stage for fn:first.
+        stage, image = self._catalogue()
+        stage.item_meta["fn:first"] = self._meta("fn:first", "first", "FirstDep")
+        stage.type_records["FirstDep"] = self._local("FirstDep")
+
+        # Step two exports fn:second.  The old implementation serialized only
+        # this active catalogue, losing fn:first and FirstDep.
+        active, _ = self._catalogue()
+        active.items.append(cfs6.ItemRecord(1, cfs6.REC_FUNCTION, "fn:second", "second"))
+        active.item_meta["fn:second"] = self._meta("fn:second", "second", "SecondDep")
+        active.type_records["SecondDep"] = self._local("SecondDep")
+
+        metas, local_types = rolling._target_type_payloads(
+            stage, active, {"fn:first", "fn:second"}, image, 14185,
+        )
+        self.assertEqual(sorted(metas), ["fn:first", "fn:second"])
+        self.assertEqual(sorted(local_types), ["FirstDep", "SecondDep"])
+
+    def test_cfs6_source_types_are_not_carried_to_new_target(self):
+        source, image = self._catalogue(version=6)
+        source.item_meta["fn:old"] = self._meta("fn:old", "old", "OldDep")
+        source.type_records["OldDep"] = self._local("OldDep")
+
+        metas, local_types = rolling._target_type_payloads(
+            source, None, {"fn:old"}, image, 14185,
+        )
+        self.assertEqual(metas, {})
+        self.assertEqual(local_types, {})
