@@ -12,7 +12,10 @@ import ida_funcs
 import ida_ua
 
 from . import cfs6
+from . import confirm
 from . import importer
+from . import rtti
+from . import strloc
 from .common import find_up_to_two, get_search_ranges
 from .image import describe_image, get_imagebase, open_image_view
 
@@ -39,7 +42,42 @@ def _rebased_source(rec, match_ea, imagebase):
     return source
 
 
-def _validate(item, rec, ranges, imagebase):
+def _validate_locator(item, rec, imagebase, ownership):
+    """Resolve a structural locator, then verify its bounded confirm pattern."""
+    if item.kind != cfs6.REC_FUNCTION:
+        return None, "structural locator does not identify a function"
+    try:
+        if rec.mode == cfs6.MODE_VTABLE:
+            vtable = rtti.find_vtable(rec.type_descriptor, rec.subobject_offset)
+            target, _slot_ea = rtti.read_slot(vtable, rec.slot)
+        elif rec.mode == cfs6.MODE_STRING_REL:
+            target = strloc.resolve_anchor_string(rec.anchor_string, ownership)[
+                "function_ea"
+            ]
+        else:
+            return None, "unsupported structural locator mode %s" % rec.mode
+    except Exception as exc:
+        return None, "structural locator failed: %s" % exc
+
+    func = ida_funcs.get_func(target)
+    if func is None or func.start_ea != target:
+        return None, "structural locator target is not a function start"
+    _start, _end, scan_bound = confirm.scan_range_for(target, ownership)
+    if scan_bound != rec.scan_bound:
+        return None, "confirm scan bound changed from %s to %s" % (
+            rec.scan_bound, scan_bound or "unavailable",
+        )
+    if not confirm.verify_confirm_signature(rec.pattern, target, ownership):
+        return None, "confirm signature is not unique in the resolved function"
+
+    source = _rebased_source(rec, target + rec.confirm_offset, imagebase)
+    source["function_rva"] = target - imagebase
+    return (rec, source, target), None
+
+
+def _validate(item, rec, ranges, imagebase, ownership=None):
+    if rec.is_locator:
+        return _validate_locator(item, rec, imagebase, ownership)
     match, error = _unique_match(rec, ranges)
     if error:
         return None, error

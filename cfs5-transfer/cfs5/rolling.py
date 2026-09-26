@@ -10,7 +10,7 @@ from . import selection
 from . import store
 from .api_registry import _collect
 from .common import get_search_ranges
-from .image import describe_image, get_imagebase, open_image_view, detect_build
+from .image import BodyOwnership, describe_image, get_imagebase, open_image_view, detect_build
 from .policy import (
     MAX_EXPORTED_CANDIDATES, MAX_GLOBAL_CANDIDATES, MAX_VALUE_CANDIDATES,
 )
@@ -34,6 +34,16 @@ def _candidate_key(rec):
 def _candidate_provenance(rec, fallback):
     """Keep CFS7's candidate origin; use a CFS6 header only as fallback."""
     return rec.provenance or fallback
+
+
+def _active_counts(source_items, emitted_active_ids):
+    """Report only selected active records that actually reached the output."""
+    source_ids = {item.id for item in source_items}
+    emitted = set(emitted_active_ids)
+    return {
+        "added": len(emitted - source_ids),
+        "refreshed": len(emitted & source_ids),
+    }
 
 
 def _limit(item):
@@ -122,6 +132,7 @@ def refresh_catalogue(source_path, destination_path, build=None, item_ids=(),
     imagebase = get_imagebase()
     view, view_source = open_image_view()
     image, _notes = describe_image(view, view_source)
+    ownership = BodyOwnership.for_current_idb(view, imagebase)
     active, active_errors = _selected_active_catalogue(
         destination_path, item_ids, declaration_names, build, ranges
     )
@@ -139,14 +150,18 @@ def refresh_catalogue(source_path, destination_path, build=None, item_ids=(),
             "number": build_number, "source": build_source}}, True))
     for loaded, provenance, is_active in sources:
         for item in loaded.items:
-            entry = entries.setdefault(item.id, {"item": item, "records": [], "active": is_active})
+            entry = entries.setdefault(item.id, {
+                "item": item, "records": [], "active": is_active,
+            })
             if is_active:
                 # Active selected evidence provides current expected values and
                 # target-only type payloads for this item.
                 entry["item"] = item
                 entry["active"] = True
             for rec in item.candidates:
-                resolved, error = promotion._validate(item, rec, ranges, imagebase)
+                resolved, error = promotion._validate(
+                    item, rec, ranges, imagebase, ownership=ownership,
+                )
                 if error:
                     if not is_active:
                         removed += 1
@@ -169,14 +184,14 @@ def refresh_catalogue(source_path, destination_path, build=None, item_ids=(),
             value[0].score, _candidate_key(value[0])
         ))[:_limit(item)]
         if item.kind == cfs6.REC_DERIVED_VALUE:
-            values = {promotion._validate(item, rec, ranges, imagebase)[0][2]
-                      for rec, _diag, _prov in candidates}
+            values = {promotion._validate(
+                item, rec, ranges, imagebase, ownership=ownership,
+            )[0][2] for rec, _diag, _prov in candidates}
             if len(values) > 1:
                 candidates = []
                 unresolved.append({"kind": item.semantic, "name": item.qualified_name,
                                    "reason": "target candidate value conflict"})
         if not candidates:
-            removed += 1
             if not any(row.get("name") == item.name for row in unresolved):
                 unresolved.append({"kind": item.kind, "name": item.name,
                                    "reason": "no candidate uniquely matched target"})
@@ -217,11 +232,12 @@ def refresh_catalogue(source_path, destination_path, build=None, item_ids=(),
         for path in (tmp, active_tmp):
             if os.path.exists(path):
                 os.remove(path)
+    counts = _active_counts(source.items, active_ids)
     return {
         "ok": not unresolved, "partial": bool(unresolved), "error": None,
         "unresolved": unresolved, "path": destination_path,
         "target": {"image": image, "build": {"number": build_number,
                    "source": build_source}},
         "retained": len(planned), "removed": removed,
-        "added": 0 if active is None else len(active.items),
+        **counts,
     }
