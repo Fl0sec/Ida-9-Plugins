@@ -3,6 +3,7 @@
 import os
 
 from . import export as _export
+from . import annotated_export_jobs
 from . import registry
 from . import selection
 from . import store
@@ -82,16 +83,7 @@ def _run_export(path, function_eas, global_eas, unresolved, merge, build,
 
 
 def export(path, merge=_export.MERGE_APPEND, build=None, include_members=True):
-    """Export the registered set to `path`.
-
-    `merge="append"` refreshes items already in the file and keeps the rest;
-    `merge="replace"` discards what is there. Appending is refused when the
-    existing file describes a different image or build -- that is reported as
-    an error rather than resolved by guessing.
-
-    `build` is an explicit build number; omitted, it is detected from the IDB
-    path and never invented (an undetectable build is recorded as unknown).
-    """
+    """Export the registered set, preserving compatible existing records."""
     by_kind = registry.split_by_kind(store.load_registry())
     function_eas, global_eas, sites, locators, unresolved = _collect(
         by_kind[registry.KIND_FUNCTION], by_kind[registry.KIND_GLOBAL],
@@ -105,15 +97,7 @@ def export(path, merge=_export.MERGE_APPEND, build=None, include_members=True):
 
 def export_list(path, function_names=(), global_names=(),
                 merge=_export.MERGE_APPEND, build=None, include_members=False):
-    """Export an explicit list, ignoring the registered set entirely.
-
-    For the case where the agent already knows the whole list and has no use
-    for persistence. Nothing here reads or writes the export set.
-
-    Entries may carry `sites` or a `vtable` locator exactly as in `register`,
-    so a one-shot export can hand over evidence without registering anything
-    first.
-    """
+    """Export an explicit list without reading or changing the registry."""
     function_eas, global_eas, sites, locators, unresolved = _collect(
         function_names, global_names
     )
@@ -122,15 +106,36 @@ def export_list(path, function_names=(), global_names=(),
                        function_locators=locators)
 
 
-def export_selected(path, declaration_names=(), item_ids=(), build=None):
-    """Atomically refresh only explicitly selected items in an existing file.
+def plan_annotated_export(build=None):
+    """Preview the human-curated function/global snapshot without writes."""
+    return annotated_export_jobs.plan_annotated_export(build)
 
-    `declaration_names` are qualified derived-value names (`Owner::name`).
-    `item_ids` are exact CFS ids (`fn:`, `global:`, `member:`, `stride:`,
-    `const:` or `extent:`). Selection is resolved completely before candidate
-    generation; any unknown or ambiguous input refuses the whole call rather
-    than falling back to a full export.
-    """
+
+def begin_annotated_export(destination_path, expected_selection_digest,
+                           build=None):
+    """Freeze a reviewed annotated selection into a durable export job."""
+    return annotated_export_jobs.begin_annotated_export(
+        destination_path, expected_selection_digest, build
+    )
+
+
+def run_annotated_export(job_path, budget_seconds=90):
+    """Advance a bounded annotated export job without a per-item caller loop."""
+    return annotated_export_jobs.run_annotated_export(job_path, budget_seconds)
+
+
+def annotated_export_status(job_path):
+    """Report durable annotated export progress without exporting an item."""
+    return annotated_export_jobs.annotated_export_status(job_path)
+
+
+def discard_annotated_export(job_path):
+    """Discard only private files owned by one annotated export job."""
+    return annotated_export_jobs.discard_annotated_export(job_path)
+
+
+def export_selected(path, declaration_names=(), item_ids=(), build=None):
+    """Atomically refresh only explicitly selected items in an existing file."""
     if not isinstance(path, str) or not path:
         return _result(error="path is required", requested=0, refreshed=0)
     if not path.lower().endswith(".cfs"):

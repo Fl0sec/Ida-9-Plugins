@@ -37,6 +37,7 @@ import ida_typeinf
 import idautils
 
 from cfs5 import VERSION
+from cfs5 import annotated
 from cfs5 import cfs6
 from cfs5 import declare
 from cfs5 import export
@@ -298,21 +299,7 @@ def prompt_for_function_ea():
 def get_all_user_named_function_eas():
     """Human-renamed function starts: user name, plain identifier, not a FLIRT
     library match, not a compiler/RTTI symbol."""
-    result = []
-    for ea in idautils.Functions():
-        f = ida_funcs.get_func(ea)
-        if f is None or f.start_ea != ea:
-            continue
-        # FLIRT library match or a thunk (j_*): not a genuine rename, and a
-        # thunk's lone jmp makes a poor signature anyway.
-        if f.flags & (ida_funcs.FUNC_LIB | ida_funcs.FUNC_THUNK):
-            continue
-        flags = ida_bytes.get_full_flags(ea)
-        if not ida_bytes.has_user_name(flags):
-            continue
-        if _is_human_named(ida_name.get_name(ea)):
-            result.append(ea)
-    return result
+    return [ea for _name, ea in annotated.discover()["functions"]]
 
 
 def _import_thunk_eas():
@@ -359,32 +346,7 @@ def get_user_global_eas():
     data segment, must not be an import thunk (unless it is a g_* tier0 global),
     and must not carry an analyzer/loader-generated data name.
     """
-    imports = _import_thunk_eas()
-
-    result = []
-    for ea, name in idautils.Names():
-        if not name:
-            continue
-        flags = ida_bytes.get_full_flags(ea)
-        if ida_bytes.is_code(flags) or ida_bytes.is_tail(flags):
-            continue
-        if ida_funcs.get_func(ea) is not None:
-            continue
-        is_prefixed = bool(_GLOBAL_PREFIX_RE.match(name))
-        if not (ida_bytes.has_user_name(flags) or is_prefixed):
-            continue
-        if not _is_human_named(name):
-            continue
-        if _AUTO_DATA_RE.match(name):
-            continue
-        if _segment_name(ea) not in _GLOBAL_SEGMENTS:
-            continue
-        # An import is resolvable by name from the import table; only a
-        # deliberately g_*-named one (tier0's exported globals) earns a slot.
-        if ea in imports and not is_prefixed:
-            continue
-        result.append(ea)
-    return sorted(set(result))
+    return [ea for _name, ea in annotated.discover()["globals"]]
 
 
 def _chooser_ea(ctx, row):

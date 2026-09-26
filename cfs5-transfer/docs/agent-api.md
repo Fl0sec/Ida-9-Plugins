@@ -206,6 +206,49 @@ api.export_list(
 )
 ```
 
+## Export the annotated IDB surface
+
+The exporter UI already offers all-user export.  The programmatic equivalent is
+a fresh **CFS6** snapshot of human-curated functions, eligible data globals,
+and the type closure required by their prototypes.  It deliberately excludes
+stored members, derived values, and patches: those are separate semantic claims.
+
+Plan first.  This is a true dry run: it reads the active IDB but generates no
+patterns/types and writes neither a catalogue nor producer state.
+
+```python
+plan = api.plan_annotated_export(build=14185)
+assert plan["dry_run"]
+```
+
+The selector is identical to the UI: user-named human functions, plus human
+data globals that are user-named or deliberately `g_`-prefixed.  Imports,
+thunks, library symbols, and generated names are excluded.  The result returns
+counts, compact samples/exclusion summaries, and `selection_digest`; it does
+not return an unbounded name list.
+
+For real output, use the bounded job API.  `begin_annotated_export` recomputes
+the selection and refuses when the reviewed digest changed.  The job writes
+private one-item fragments and publishes the final CFS6 file atomically only
+after it parses cleanly.
+
+```python
+job = api.begin_annotated_export(
+    r"C:\catalogues\client-14185.cfs", plan["selection_digest"], build=14185
+)
+for _ in range(5):
+    progress = api.run_annotated_export(job["job_path"], budget_seconds=90)
+    if progress["finalized"]:
+        break
+```
+
+**Agent pacing rule:** never manufacture a per-item MCP loop for this job.
+Use the 90-second driver; it rejects budgets below 10 or above 90 seconds and
+checkpoints each completed item.  Make at most five driver calls, then report
+the measured job state if it remains incomplete.  Use
+`annotated_export_status` for inspection and `discard_annotated_export` only
+for the exact job being abandoned.
+
 Refresh only selected existing records:
 
 ```python

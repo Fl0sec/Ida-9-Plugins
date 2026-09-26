@@ -100,6 +100,12 @@ difference between 560 candidates (78% of them IAT slots) and 47 real globals.
 Each action asks for an output `.cfs` path. So you can export functions only,
 globals only, a hand-picked subset of either, or everything.
 
+For automation, the CFS API exposes a dry-run annotated snapshot plan and a
+bounded resumable export job.  It uses the same user-name/global filter as the
+UI and emits functions, globals, and their prototype/type closure only;
+declared members and patches remain explicit opt-ins in the regular export
+workflow.  See [agent API](docs/agent-api.md#export-the-annotated-idb-surface).
+
 **Features**
 - Function signatures in three modes, each searched **independently**:
   - `ENTRY` — at function start.

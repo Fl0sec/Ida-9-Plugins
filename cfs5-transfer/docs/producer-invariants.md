@@ -106,6 +106,14 @@ before generation; every selected item must regenerate successfully; validate
 the completed temporary file before replacing the destination. Never fall back
 to a full export or retain a stale selected record.
 
+Annotated snapshot export is a separate, read-only selection mode for the
+human-curated function/global surface. Its dry run discovers names and image
+identity only; candidate construction, type serialization, and file writes
+occur exclusively in its bounded durable export job. Job fragments are one
+item each and final CFS6 composition happens once, so a large snapshot does not
+reparse or rewrite the growing catalogue per item. Members, derived values,
+and patches are never inferred by this mode.
+
 ## API boundary
 
 UI and programmatic calls use `export.export_to_path`; fixes belong in the
