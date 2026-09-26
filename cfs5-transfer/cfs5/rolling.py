@@ -64,10 +64,16 @@ def _write_item(writer, item, candidates, active=False):
         iid = writer.write_item(item.kind, item.name, len(candidates), item.coverage)
     elif item.kind == cfs6.REC_DERIVED_VALUE:
         schema = item.portable_member_schema
-        if active and item.semantic == cfs6.SEM_MEMBER_OFFSET:
-            schema = members.portable_member_schema(
+        # Schema semantics come from the exact source-side member, while the
+        # candidate independently proves the target offset.  Do not require
+        # the historical evidence operand to retain an IDA stroff annotation:
+        # refresh has already revalidated the stored candidate above.
+        if item.semantic == cfs6.SEM_MEMBER_OFFSET:
+            live_schema = members.portable_member_schema(
                 item.owner, item.name, expected_offset=item.expected_value
             )
+            if live_schema is not None:
+                schema = live_schema
         iid = writer.write_derived_value(item.semantic, item.owner, item.name,
                                          len(candidates), item.coverage,
                                          expected_value=item.expected_value,
