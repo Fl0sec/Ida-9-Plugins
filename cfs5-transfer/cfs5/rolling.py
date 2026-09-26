@@ -65,7 +65,9 @@ def _write_item(writer, item, candidates, active=False):
     elif item.kind == cfs6.REC_DERIVED_VALUE:
         schema = item.portable_member_schema
         if active and item.semantic == cfs6.SEM_MEMBER_OFFSET:
-            schema = members.portable_member_schema(item.owner, item.name)
+            schema = members.portable_member_schema(
+                item.owner, item.name, expected_offset=item.expected_value
+            )
         iid = writer.write_derived_value(item.semantic, item.owner, item.name,
                                          len(candidates), item.coverage,
                                          expected_value=item.expected_value,

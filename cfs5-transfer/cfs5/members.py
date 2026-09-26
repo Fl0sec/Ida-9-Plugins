@@ -526,7 +526,7 @@ def create_member(owner, name, byte_offset, byte_size):
     return created
 
 
-def portable_member_schema(owner, member_name):
+def portable_member_schema(owner, member_name, expected_offset=None):
     """Return the narrow CFS7 schema for a safely recreatable member.
 
     Complete IDA UDT payloads are intentionally not represented here.  A
@@ -538,6 +538,9 @@ def portable_member_schema(owner, member_name):
     try:
         _idx, udm = tif.get_udm(member_name)
         if udm is None:
+            return None
+        if (expected_offset is not None and
+                _bytes_of(udm.offset) != int(expected_offset)):
             return None
         mt = udm.type
         width = int(mt.get_size())
@@ -558,6 +561,44 @@ def portable_member_schema(owner, member_name):
     except Exception as exc:
         msg("MEMBER: portable schema for %s.%s failed: %s" % (owner, member_name, exc))
     return None
+
+
+def owner_shell_state(owner):
+    """Classify whether a named owner can safely receive portable fields."""
+    tif = get_struct_tinfo(owner)
+    if tif is None:
+        # A colliding non-UDT Local Type is not safe to replace.
+        probe = ida_typeinf.tinfo_t()
+        if probe.get_named_type(ida_typeinf.get_idati(), owner):
+            return "blocked_owner_type_conflict", None
+        return "create_owner_shell", None
+    if tif.is_union():
+        return "blocked_owner_union", tif
+    try:
+        if tif.is_forward_decl():
+            return "create_owner_shell", tif
+    except Exception:
+        pass
+    return "existing_exact", tif
+
+
+def create_owner_shell(owner, replace=False):
+    """Create an empty concrete struct, with a read-back verification."""
+    try:
+        details = ida_typeinf.udt_type_data_t()
+        shell = ida_typeinf.tinfo_t()
+        if not shell.create_udt(details, ida_typeinf.BTF_STRUCT):
+            return None
+        flags = ida_typeinf.NTF_REPLACE if replace else 0
+        if shell.set_named_type(ida_typeinf.get_idati(), owner, flags) != ida_typeinf.TERR_OK:
+            return None
+    except Exception as exc:
+        msg("MEMBER: create owner shell %s failed: %s" % (owner, exc))
+        return None
+    tif = get_struct_tinfo(owner)
+    if tif is None or tif.is_union():
+        return None
+    return tif
 
 
 def _portable_tinfo(schema):

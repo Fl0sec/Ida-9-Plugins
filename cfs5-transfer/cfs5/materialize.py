@@ -38,6 +38,7 @@ def _plan_digest(loaded, catalogue_path, image, rows):
         "rows": [{"id": row["id"], "action": row["action"],
                   "schema": row.get("field_schema"),
                   "offset": row.get("resolved_offset"),
+                  "owner_action": row.get("owner_action"),
                   "owner_layout": row.get("owner_layout", [])}
                  for row in rows],
     }
@@ -54,12 +55,10 @@ def _classify(item, evidence):
     if schema is None:
         row.update(action="blocked_insufficient_evidence", reason="catalogue has no portable member schema")
         return row
-    owner = members.get_struct_tinfo(item.owner)
-    if owner is None:
-        row.update(action="blocked_owner_missing", reason="destination owner type is missing")
-        return row
-    if owner.is_union():
-        row.update(action="blocked_overlap", reason="union owner is ambiguous")
+    owner_action, owner = members.owner_shell_state(item.owner)
+    row["owner_action"] = owner_action
+    if owner_action.startswith("blocked"):
+        row.update(action=owner_action, reason="destination owner type is incompatible")
         return row
     offset = int(evidence["value"])
     row["resolved_offset"] = offset
@@ -132,10 +131,18 @@ def apply_type_materialization(catalogue_path, item_ids, expected_plan_digest,
                                                   "reason": row["action"]} for row in unsafe],
                       rows=selected, plan_digest=planned["plan_digest"])
     snapshots = {}
+    created_shells = []
     for row in selected:
         if row["action"] == "create" and row["owner"] not in snapshots:
-            tif = members.get_struct_tinfo(row["owner"])
-            snapshots[row["owner"]] = tif.copy()
+            _state, tif = members.owner_shell_state(row["owner"])
+            snapshots[row["owner"]] = None if tif is None else tif.copy()
+    for owner, snapshot in snapshots.items():
+        state, tif = members.owner_shell_state(owner)
+        if state != "create_owner_shell":
+            continue
+        if members.create_owner_shell(owner, replace=snapshot is not None) is None:
+            return result(error="unable to create owner shell %s" % owner, rows=selected)
+        created_shells.append(owner)
     created = []
     for row in selected:
         if row["action"] != "create":
@@ -143,10 +150,19 @@ def apply_type_materialization(catalogue_path, item_ids, expected_plan_digest,
         made = members.create_portable_member(row["owner"], row["member"],
                                               row["resolved_offset"], row["field_schema"])
         if made is None:
+            rollback_ok = True
             for owner, snapshot in snapshots.items():
-                snapshot.set_named_type(ida_typeinf.get_idati(), owner, ida_typeinf.NTF_REPLACE)
-            return result(error="materialization failed; owner type snapshots restored", rows=selected)
+                if snapshot is None:
+                    rollback_ok = ida_typeinf.del_named_type(
+                        ida_typeinf.get_idati(), owner, 0
+                    ) and rollback_ok
+                else:
+                    rollback_ok = (snapshot.set_named_type(
+                        ida_typeinf.get_idati(), owner, ida_typeinf.NTF_REPLACE
+                    ) == ida_typeinf.TERR_OK) and rollback_ok
+            return result(error="materialization failed; rollback attempted", rows=selected,
+                          rollback_verified=rollback_ok)
         created.append(row["id"])
     return result(ok=True, rows=selected, created=created,
                   already_exact=[row["id"] for row in selected if row["action"] == "already_exact"],
-                  plan_digest=planned["plan_digest"])
+                  owner_shells=created_shells, plan_digest=planned["plan_digest"])
