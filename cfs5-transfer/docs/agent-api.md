@@ -272,6 +272,21 @@ are freshly exported from the target and therefore carry target provenance.
 The selection is all-or-nothing. Type payloads are included only for those
 fresh target records; refresh never carries type payloads from an older build.
 
+For more than eight active records, use the restart-resumable job API instead
+of one long refresh call:
+
+```python
+job = api.begin_refresh(source_path, destination_path, build=14185,
+                        item_ids=active_ids)
+while not api.refresh_status(job["job_path"])["remaining_units"] == 0:
+    api.refresh_step(job["job_path"])
+api.finalize_refresh(job["job_path"])
+```
+
+The manifest and private stage survive an MCP/IDA restart. `finalize_refresh`
+is the only operation that publishes the destination; use `discard_refresh`
+to remove an abandoned job.
+
 ## Materialize safe target-side members
 
 Only CFS7 revision-4 member records with a portable primitive/pointer schema
