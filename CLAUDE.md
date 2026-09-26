@@ -175,6 +175,20 @@ Copies entry `.py` files plus package directories into
 shadowing an edited module is a classic phantom bug). Then restart IDA or
 reload the plugin. Full loop in [docs/workflow.md](docs/workflow.md).
 
+## Deployment is completion
+
+Any change that executes in IDA is incomplete until its deployed copy has been
+verified. Run the matching installer after checks pass, inspect the installed
+file for the changed module or public symbol, and state the required restart in
+the handoff. Do this before reporting the change as deployed.
+
+- Repository plugins, including CFS: `pwsh tools/deploy.ps1 <plugin-dir>`.
+- `ida-pro-mcp` GUI package: from its checkout, `uv run ida-pro-mcp --install`.
+  The interactive client-config selector may be cancelled after the IDA plugin
+  install; never use it to add a Codex global connector.
+
+Source commits and passing tests prove source readiness, not deployment.
+
 ## Using the ida-pro-mcp tooling
 
 The `ida-pro-mcp` MCP server and its `idapython` skill are available in this
