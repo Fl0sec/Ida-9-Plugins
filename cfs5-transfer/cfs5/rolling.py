@@ -118,6 +118,38 @@ def _limit(item):
     return MAX_VALUE_CANDIDATES
 
 
+def revalidate_item(item, provenance, ranges, imagebase, ownership):
+    """Validate one item's candidates once for a resumable refresh job.
+
+    The returned values are retained for derived-value agreement checks.  A
+    job must not rescan the image merely to repeat that check at finalization.
+    """
+    records = {}
+    for rec in item.candidates:
+        resolved, error = promotion._validate(
+            item, rec, ranges, imagebase, ownership=ownership,
+        )
+        if error:
+            continue
+        key = _candidate_key(rec)
+        value = resolved[2]
+        old = records.get(key)
+        if old is None or (rec.score, key) < (old[0].score, key):
+            records[key] = (rec, resolved[1], _candidate_provenance(rec, provenance),
+                            value)
+    ranked = sorted(records.items(), key=lambda row: (
+        row[1][0].score, row[0],
+    ))[:_limit(item)]
+    if not ranked:
+        return [], {}, "no candidate uniquely matched target"
+    candidates = [(rec, source, candidate_provenance)
+                  for _key, (rec, source, candidate_provenance, _value) in ranked]
+    values = {key: value for key, (_rec, _source, _provenance, value) in ranked}
+    if item.kind == cfs6.REC_DERIVED_VALUE and len(set(values.values())) > 1:
+        return [], values, "target candidate value conflict"
+    return candidates, values, None
+
+
 def _write_item(writer, item, candidates, active=False):
     if item.kind == cfs6.REC_PATCH:
         iid = writer.write_patch(item.owner, item.name, len(candidates), item.coverage,

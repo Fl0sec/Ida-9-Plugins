@@ -131,35 +131,38 @@ def materialize_full_definition(source_tif):
 # Local-type discovery + dependency closure (export side)
 # ---------------------------------------------------------------------------
 
+class _LocalTypeIndex:
+    """Lazy ordinal lookup used by one export's reachable type closure.
+
+    A one-item resumable export usually references only a few named types.  A
+    full ordinal walk for every unit was therefore pure repeated IDA work.
+    """
+
+    def __init__(self):
+        self.idati = ida_typeinf.get_idati()
+        self.cache = {}
+
+    def get(self, ordinal, default=None):
+        ordinal = int(ordinal)
+        if ordinal not in self.cache:
+            try:
+                name = ida_typeinf.get_numbered_type_name(self.idati, ordinal)
+            except Exception:
+                name = None
+            if not name or str(name).startswith("#"):
+                self.cache[ordinal] = None
+            else:
+                try:
+                    tif = self.idati.get_numbered_type(ordinal)
+                except Exception:
+                    tif = None
+                self.cache[ordinal] = ((str(name), tif) if tif is not None else None)
+        return self.cache.get(ordinal) or default
+
+
 def build_local_type_index():
-    """Return {ordinal: (name, tinfo)} for named Local Types."""
-    idati = ida_typeinf.get_idati()
-    result = {}
-    try:
-        limit = int(ida_typeinf.get_ordinal_limit(idati))
-    except Exception:
-        limit = 0
-
-    for ordinal in range(1, max(1, limit)):
-        try:
-            name = ida_typeinf.get_numbered_type_name(idati, ordinal)
-        except Exception:
-            name = None
-
-        if not name or str(name).startswith("#"):
-            continue
-
-        try:
-            tif = idati.get_numbered_type(ordinal)
-        except Exception:
-            tif = None
-
-        if tif is None:
-            continue
-
-        result[int(ordinal)] = (str(name), tif)
-
-    return result
+    """Return a lazy {ordinal: (name, tinfo)}-compatible local-type index."""
+    return _LocalTypeIndex()
 
 
 def _collect_direct_local_ordinals(tif, out, depth=0):

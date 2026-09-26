@@ -271,9 +271,9 @@ because of their age; they are removed only after target validation fails.
 are freshly exported from the target and therefore carry target provenance.
 The selection is all-or-nothing. Type payloads are included only for freshly
 exported target records; refresh never carries type payloads from an older
-build. A resumable job's private CFS7 stage is already target-local, so later
-steps preserve its retained item payloads and their reachable local-type
-closure while replacing payloads for the item currently refreshed.
+build. A resumable job preserves same-target CFS7 payloads for surviving items,
+then replaces selected items with freshly exported target payloads and their
+reachable local-type closure.
 Successful refresh results report `function_types`, `global_types`, and
 `local_types`, allowing callers to verify the type surface as well as item
 resolution.
@@ -284,14 +284,18 @@ of one long refresh call:
 ```python
 job = api.begin_refresh(source_path, destination_path, build=14185,
                         item_ids=active_ids)
-while not api.refresh_status(job["job_path"])["remaining_units"] == 0:
+while api.refresh_status(job["job_path"])["phase"] != "ready_to_finalize":
     api.refresh_step(job["job_path"])
 api.finalize_refresh(job["job_path"])
 ```
 
-The manifest and private stage survive an MCP/IDA restart. `finalize_refresh`
-is the only operation that publishes the destination; use `discard_refresh`
-to remove an abandoned job.
+Each step processes exactly one source-validation or active-export record. The
+job writes durable one-item fragments, so it does not revalidate or rewrite the
+complete catalogue for every active item. The manifest and private fragments
+survive an MCP/IDA restart. `finalize_refresh` composes, parses, and atomically
+publishes the complete destination once; use `discard_refresh` to remove an
+abandoned job. Version-1 jobs are intentionally refused as obsolete and must
+be discarded/restarted.
 
 ## Materialize safe target-side members
 
