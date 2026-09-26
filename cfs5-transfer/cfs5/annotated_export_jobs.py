@@ -6,7 +6,7 @@ import shutil
 import tempfile
 import time
 
-from . import annotated, cfs6, export
+from . import annotated, annotated_export_policy, cfs6, export
 from .api_result import result
 from .common import get_search_ranges
 from .image import describe_image, detect_build, get_imagebase, open_image_view
@@ -49,6 +49,9 @@ def _load(job_path):
         return None, "invalid_job: malformed annotated export job"
     if os.path.abspath(job["work_dir"]) != _work_dir(job["destination_path"]):
         return None, "invalid_job: unexpected annotated export work directory"
+    # Version 1 initially stopped on a safe no-candidate result.  Treat old
+    # manifests as having no exclusions so they resume without recreation.
+    job.setdefault("skipped", [])
     return job, None
 
 
@@ -111,6 +114,7 @@ def begin_annotated_export(destination_path, expected_selection_digest, build=No
     job = {"version": JOB_VERSION, "status": "active", "destination_path": destination_path,
            "work_dir": work_dir, "target": preview["target"], "build": preview["build"],
            "selection_digest": expected_selection_digest, "units": units, "cursor": 0,
+           "skipped": [],
            "created_at": time.time(), "last_error": None}
     try:
         os.makedirs(os.path.join(work_dir, "fragments"), exist_ok=False)
@@ -128,7 +132,9 @@ def annotated_export_status(job_path):
     if error:
         return result(error=error)
     return result(ok=True, job_path=os.path.abspath(job_path), status=job["status"],
-                  completed=job["cursor"], total=len(job["units"]), last_error=job["last_error"])
+                  completed=job["cursor"], total=len(job["units"]),
+                  skipped=len(job["skipped"]), unresolved=list(job["skipped"]),
+                  last_error=job["last_error"])
 
 
 def _fragment_path(job, index):
@@ -145,10 +151,15 @@ def _step(job, index, ranges):
         build=(job["build"]["number"], job["build"]["source"]),
         merge=export.MERGE_OVERWRITE, validate_output=True,
     )
-    if raw.get("error") or raw.get("written") != 1:
+    if raw.get("error"):
         raise ValueError("%s %s was not exportable: %s" % (
-            unit["kind"], unit["name"], raw.get("error") or raw.get("uncovered")))
-    return unit
+            unit["kind"], unit["name"], raw["error"]))
+    issue = annotated_export_policy.unexportable_issue(unit, raw)
+    if issue is not None:
+        if os.path.exists(fragment):
+            os.remove(fragment)
+        return unit, issue
+    return unit, None
 
 
 def _compose(job):
@@ -156,7 +167,10 @@ def _compose(job):
     local_types = {}
     items, metas = [], {}
     try:
+        skipped = {int(entry["index"]) for entry in job["skipped"]}
         for index in range(len(job["units"])):
+            if index in skipped:
+                continue
             loaded = cfs6.load_catalogue(_fragment_path(job, index))
             if loaded.parse_errors or len(loaded.items) != 1:
                 raise ValueError("invalid annotated export fragment %d" % index)
@@ -207,7 +221,10 @@ def run_annotated_export(job_path, budget_seconds=RUN_DEFAULT_BUDGET_SEC):
     if error:
         return result(error=error)
     if job["status"] == "finalized":
-        return result(ok=True, job_path=job_path, path=job["destination_path"], completed=len(job["units"]), total=len(job["units"]))
+        partial = bool(job["skipped"])
+        return result(ok=not partial, partial=partial, unresolved=list(job["skipped"]),
+                      job_path=job_path, path=job["destination_path"],
+                      completed=len(job["units"]), total=len(job["units"]))
     if job["status"] != "active":
         return result(error="invalid_job: annotated export job is not active", job_path=job_path)
     _image, binding_error = _binding(job)
@@ -225,13 +242,17 @@ def run_annotated_export(job_path, budget_seconds=RUN_DEFAULT_BUDGET_SEC):
         if units and deadline - time.monotonic() < 30.0:
             break
         try:
-            unit = _step(job, job["cursor"], ranges)
+            index = job["cursor"]
+            unit, issue = _step(job, index, ranges)
         except Exception as exc:
             job["last_error"] = str(exc)
             _atomic_json(job_path, job)
             return result(partial=bool(job["cursor"]), error=str(exc), job_path=job_path,
                           completed=job["cursor"], total=len(job["units"]), units_processed=units)
         job["cursor"] += 1
+        if issue is not None:
+            issue["index"] = index
+            job["skipped"].append(issue)
         job["last_error"] = None
         _atomic_json(job_path, job)
         units += 1
@@ -247,8 +268,11 @@ def run_annotated_export(job_path, budget_seconds=RUN_DEFAULT_BUDGET_SEC):
             job["last_error"] = "finalize failed: %s" % exc
             _atomic_json(job_path, job)
             return result(partial=True, error=job["last_error"], job_path=job_path,
-                          completed=job["cursor"], total=len(job["units"]))
-    return result(ok=job["status"] == "finalized", job_path=job_path,
+                          completed=job["cursor"], total=len(job["units"]),
+                          unresolved=list(job["skipped"]))
+    partial = bool(job["skipped"])
+    return result(ok=job["status"] == "finalized" and not partial, partial=partial,
+                  unresolved=list(job["skipped"]), job_path=job_path,
                   completed=job["cursor"], total=len(job["units"]), units_processed=units,
                   elapsed_ms=int((time.monotonic() - started) * 1000),
                   finalized=job["status"] == "finalized", **extra)

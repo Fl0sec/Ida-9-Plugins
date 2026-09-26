@@ -232,6 +232,11 @@ the selection and refuses when the reviewed digest changed.  The job writes
 private one-item fragments and publishes the final CFS6 file atomically only
 after it parses cleanly.
 
+An annotation that has no safe unique candidate (for example, a clone family
+with no usable caller anchor) is recorded in `unresolved`, skipped, and does
+not stop the job. The finalized result is `partial=true`; an exporter/IO error
+still stops without publishing a destination.
+
 ```python
 job = api.begin_annotated_export(
     r"C:\catalogues\client-14185.cfs", plan["selection_digest"], build=14185

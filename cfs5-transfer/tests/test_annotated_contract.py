@@ -8,8 +8,28 @@ import unittest
 
 import _support  # noqa: F401
 
+from cfs5 import annotated_export_policy
+
 
 class AnnotatedContractTests(unittest.TestCase):
+    def test_safe_no_candidate_is_a_durable_exclusion_not_a_job_error(self):
+        issue = annotated_export_policy.unexportable_issue(
+            {"kind": "function", "name": "GetResourceManifestCount"},
+            {"written": 0, "uncovered": [{
+                "reason": "no unique signature (entry: clone_family)",
+                "diagnosis": {"entry": {"matches": 8}},
+            }]},
+        )
+        self.assertEqual("function", issue["kind"])
+        self.assertEqual("GetResourceManifestCount", issue["name"])
+        self.assertIn("clone_family", issue["reason"])
+        self.assertEqual(8, issue["diagnosis"]["entry"]["matches"])
+
+    def test_engine_errors_remain_fatal_not_exclusions(self):
+        self.assertIsNone(annotated_export_policy.unexportable_issue(
+            {"kind": "global", "name": "g_bad"},
+            {"written": 0, "error": "disk full"},
+        ))
     def test_digest_is_stable_and_binds_the_reviewed_selection(self):
         selection = {"functions": [("alpha", 0x1000)], "globals": [("g_beta", 0x2000)]}
         payload = {
