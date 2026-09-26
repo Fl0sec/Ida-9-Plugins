@@ -284,9 +284,15 @@ of one long refresh call:
 ```python
 job = api.begin_refresh(source_path, destination_path, build=14185,
                         item_ids=active_ids)
-while api.refresh_status(job["job_path"])["phase"] != "ready_to_finalize":
-    api.refresh_step(job["job_path"])
-api.finalize_refresh(job["job_path"])
+# Drive deliberately: source validation is cheap, but active export can be slow.
+# Do not put this in an unbounded agent/MCP tight loop.
+for _ in range(10):
+    progress = api.refresh_step(job["job_path"])
+    if progress["ready_to_finalize"]:
+        break
+# Report progress here and resume only in a later, deliberate checkpoint.
+if api.refresh_status(job["job_path"])["phase"] == "ready_to_finalize":
+    api.finalize_refresh(job["job_path"])
 ```
 
 Each step processes exactly one source-validation or active-export record. The
@@ -296,6 +302,12 @@ survive an MCP/IDA restart. `finalize_refresh` composes, parses, and atomically
 publishes the complete destination once; use `discard_refresh` to remove an
 abandoned job. Version-1 jobs are intentionally refused as obsolete and must
 be discarded/restarted.
+
+**Agent pacing rule:** never self-drive a refresh job in an unbounded tight
+loop. Process at most ten cheap `validate_source` units in one turn, or exactly
+one `export_active` unit, then call `refresh_status`, report the checkpoint,
+and wait for the next deliberate request. Calls are synchronous, but this rule
+keeps MCP traffic, transcripts, and cancellation boundaries manageable.
 
 ## Materialize safe target-side members
 
