@@ -14,7 +14,7 @@ PUBLIC = {
     "declare_patches", "declare_strides", "declarations", "export",
     "export_list", "export_selected", "import_and_migrate",
     "import_catalogue", "migrate_state", "promote_catalogue", "refresh_catalogue",
-    "begin_refresh", "refresh_step", "refresh_status", "finalize_refresh",
+    "begin_refresh", "refresh_step", "refresh_run", "refresh_status", "finalize_refresh",
     "discard_refresh",
     "apply_type_materialization", "plan_type_materialization",
     "register", "registered",

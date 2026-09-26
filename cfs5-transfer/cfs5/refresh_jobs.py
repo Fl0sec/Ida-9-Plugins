@@ -20,6 +20,9 @@ from .common import get_search_ranges
 
 JOB_VERSION = 2
 LEGACY_MAX_SELECTION = 8
+RUN_MIN_BUDGET_SEC = 10
+RUN_MAX_BUDGET_SEC = 90
+RUN_DEFAULT_BUDGET_SEC = 90
 
 
 def _hash(path):
@@ -346,6 +349,73 @@ def refresh_step(job_path, max_items=1):
                   active_completed=job["active_cursor"], active_total=len(job["active_units"]),
                   ready_to_finalize=(job["source_cursor"] == len(job["source_units"])
                                      and job["active_cursor"] == len(job["active_units"])))
+
+
+def refresh_run(job_path, budget_seconds=RUN_DEFAULT_BUDGET_SEC):
+    """Advance many durable units within one conservative MCP time budget.
+
+    Each unit still commits independently through :func:`refresh_step`.  The
+    driver deliberately leaves a phase-sensitive reserve before starting the
+    next unit, so a slow active export cannot be started at the end of a
+    ninety-second request.
+    """
+    try:
+        budget = int(budget_seconds)
+    except (TypeError, ValueError):
+        return result(error="budget_seconds must be an integer")
+    if not RUN_MIN_BUDGET_SEC <= budget <= RUN_MAX_BUDGET_SEC:
+        return result(error="budget_seconds must be between %d and %d" % (
+            RUN_MIN_BUDGET_SEC, RUN_MAX_BUDGET_SEC,
+        ))
+
+    started = time.monotonic()
+    deadline = started + budget
+    units = 0
+    unresolved = []
+    last = None
+    active_observed_sec = 0.0
+    while True:
+        status = refresh_status(job_path)
+        if status.get("error"):
+            return result(error=status["error"], job_path=job_path)
+        phase = status["phase"]
+        if phase == "ready_to_finalize":
+            break
+        remaining = deadline - time.monotonic()
+        # Source validation is normally sub-second.  An active export has no
+        # fixed cost, so retain a larger margin after observing one in this
+        # request.  The first active item starts only with at least 30s left.
+        reserve = (max(30.0, active_observed_sec * 1.25)
+                   if phase == "export_active" else 2.0)
+        if units and remaining < reserve:
+            break
+        stepped = refresh_step(job_path, max_items=1)
+        last = stepped
+        units += 1
+        unresolved.extend(stepped.get("unresolved", []))
+        if stepped.get("error"):
+            return result(partial=True, error=stepped["error"],
+                          unresolved=unresolved, job_path=job_path,
+                          units_processed=units,
+                          elapsed_ms=int((time.monotonic() - started) * 1000))
+        if phase == "export_active":
+            active_observed_sec = max(active_observed_sec,
+                                      float(stepped.get("elapsed_ms", 0)) / 1000.0)
+        if stepped.get("ready_to_finalize"):
+            break
+
+    status = refresh_status(job_path)
+    return result(ok=not unresolved, partial=bool(unresolved), error=None,
+                  unresolved=unresolved, job_path=job_path,
+                  units_processed=units, budget_seconds=budget,
+                  elapsed_ms=int((time.monotonic() - started) * 1000),
+                  phase=status.get("phase"),
+                  source_completed=status.get("source_completed"),
+                  source_total=status.get("source_total"),
+                  active_completed=status.get("active_completed"),
+                  active_total=status.get("active_total"),
+                  ready_to_finalize=(status.get("phase") == "ready_to_finalize"),
+                  last_item_id=(last or {}).get("item_id"))
 
 
 def _outcome(path):

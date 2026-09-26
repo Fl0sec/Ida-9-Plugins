@@ -284,13 +284,14 @@ of one long refresh call:
 ```python
 job = api.begin_refresh(source_path, destination_path, build=14185,
                         item_ids=active_ids)
-# Drive deliberately: source validation is cheap, but active export can be slow.
-# Do not put this in an unbounded agent/MCP tight loop.
-for _ in range(10):
-    progress = api.refresh_step(job["job_path"])
+# Prefer the 90-second driver. It commits after every item but returns only one
+# progress checkpoint; never pass a budget below 10 seconds.
+for _ in range(5):
+    progress = api.refresh_run(job["job_path"], budget_seconds=90)
     if progress["ready_to_finalize"]:
         break
-# Report progress here and resume only in a later, deliberate checkpoint.
+# If still incomplete after five driver requests, report the measured phase
+# and timing rather than starting an unbounded loop.
 if api.refresh_status(job["job_path"])["phase"] == "ready_to_finalize":
     api.finalize_refresh(job["job_path"])
 ```
@@ -303,11 +304,12 @@ publishes the complete destination once; use `discard_refresh` to remove an
 abandoned job. Version-1 jobs are intentionally refused as obsolete and must
 be discarded/restarted.
 
-**Agent pacing rule:** never self-drive a refresh job in an unbounded tight
-loop. Process at most ten cheap `validate_source` units in one turn, or exactly
-one `export_active` unit, then call `refresh_status`, report the checkpoint,
-and wait for the next deliberate request. Calls are synchronous, but this rule
-keeps MCP traffic, transcripts, and cancellation boundaries manageable.
+**Agent pacing rule:** prefer `refresh_run` with its 90-second default. It
+rejects budgets below 10 or above 90 seconds and persists each completed unit
+before returning. Make at most five driver requests for one job; if it remains
+incomplete, report the returned phase and timing rather than reverting to an
+unbounded `refresh_step` loop. `refresh_step` is a recovery/debug primitive,
+not the normal MCP driver.
 
 ## Materialize safe target-side members
 

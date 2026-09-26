@@ -77,3 +77,24 @@ class RefreshJobV2Tests(unittest.TestCase):
         discarded = refresh_jobs.discard_refresh(path)
         self.assertTrue(discarded["ok"])
         self.assertFalse(os.path.exists(path))
+
+    def test_budgeted_driver_advances_many_units_in_one_request(self):
+        self._source(12)
+        begun = self._begin()
+        job_path = begun["job_path"]
+        self.assertIn("between 10 and 90", refresh_jobs.refresh_run(job_path, 9)["error"])
+
+        def validate_once(item, provenance, _ranges, _base, _ownership):
+            rec = item.candidates[0]
+            return [(rec, dict(rec.source), provenance)], {}, None
+
+        binding = (None, (None, self.image))
+        with mock.patch.object(refresh_jobs, "_job_binding", return_value=binding), \
+             mock.patch.object(refresh_jobs, "_validation_context", return_value=([], 0, None)), \
+             mock.patch.object(rolling, "revalidate_item", side_effect=validate_once) as validated:
+            driven = refresh_jobs.refresh_run(job_path, 10)
+
+        self.assertTrue(driven["ok"])
+        self.assertEqual(driven["units_processed"], 12)
+        self.assertTrue(driven["ready_to_finalize"])
+        self.assertEqual(validated.call_count, 12)

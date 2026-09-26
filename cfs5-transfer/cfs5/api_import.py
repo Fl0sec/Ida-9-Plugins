@@ -57,6 +57,11 @@ def refresh_step(job_path, max_items=1):
     return _refresh_jobs.refresh_step(job_path, max_items)
 
 
+def refresh_run(job_path, budget_seconds=90):
+    """Drive a resumable refresh for a bounded 10-90 second MCP budget."""
+    return _refresh_jobs.refresh_run(job_path, budget_seconds)
+
+
 def refresh_status(job_path):
     return _refresh_jobs.refresh_status(job_path)
 
