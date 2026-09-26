@@ -183,9 +183,10 @@ file for the changed module or public symbol, and state the required restart in
 the handoff. Do this before reporting the change as deployed.
 
 - Repository plugins, including CFS: `pwsh tools/deploy.ps1 <plugin-dir>`.
-- `ida-pro-mcp` GUI package: from its checkout, `uv run ida-pro-mcp --install`.
-  The interactive client-config selector may be cancelled after the IDA plugin
-  install; never use it to add a Codex global connector.
+- `ida-pro-mcp` for Codex: `codex plugin add ida-pro-mcp@personal --json`.
+  This is the required consumer deployment path; do not substitute the GUI
+  installer. If Codex reports a locked or access-denied plugin cache, stop and
+  ask the user to close every Codex instance and run that command themselves.
 
 Source commits and passing tests prove source readiness, not deployment.
 
@@ -200,12 +201,14 @@ environment and are the fastest way to check API behaviour against a live IDB.
   depend on in plugin code. A probe against a real IDB beats reasoning.
 - MCP verifies *behaviour*; `tools/check.py` verifies *existence*. Neither
   replaces the other.
-- **Keep Codex MCP plugin-managed.** Deploy or refresh the personal
-  `ida-pro-mcp` plugin only; do not run `ida-pro-mcp --install codex --scope
-  global` and do not add `[mcp_servers.ida-pro-mcp]`. That installer creates a
-  GUI HTTP connector at port 13337, which breaks startup whenever no GUI
-  server is listening. Add a standalone connector only when the user
-  explicitly requests a persistent GUI MCP endpoint.
+- **Keep Codex MCP plugin-managed.** Refresh it only with
+  `codex plugin add ida-pro-mcp@personal --json`; a cache-lock failure requires
+  the user to close Codex and run the command. Do not run
+  `ida-pro-mcp --install codex --scope global` or add
+  `[mcp_servers.ida-pro-mcp]`. That installer creates a GUI HTTP connector at
+  port 13337, which breaks startup whenever no GUI server is listening. Add a
+  standalone connector only when the user explicitly requests a persistent GUI
+  MCP endpoint.
 
 ## Git
 
