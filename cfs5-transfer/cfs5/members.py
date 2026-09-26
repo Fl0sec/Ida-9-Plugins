@@ -642,6 +642,76 @@ def create_portable_member(owner, name, byte_offset, schema):
     return created
 
 
+def replace_portable_members(owner, rows, create_owner=False):
+    """Commit a complete portable-member batch as one named UDT replacement.
+
+    Adding sparse fields one at a time lets IDA manufacture gap members between
+    them.  Those members then make a later selected field appear to overlap.
+    Build the final layout first, so the only permanent members are the ones
+    that were reviewed by the caller.
+    """
+    current = get_struct_tinfo(owner)
+    details = ida_typeinf.udt_type_data_t()
+    if current is None:
+        if not create_owner:
+            return {"ok": False, "reason": "destination owner is missing"}
+    else:
+        try:
+            loaded = current.get_udt_details(details)
+        except Exception as exc:
+            msg("MEMBER: read owner %s failed: %s" % (owner, exc))
+            loaded = False
+        if not loaded and not create_owner:
+            return {"ok": False, "reason": "destination owner has no concrete layout"}
+        if not loaded:
+            details = ida_typeinf.udt_type_data_t()
+
+    ordered = sorted(rows, key=lambda row: (int(row["resolved_offset"]), row["id"]))
+    occupied = [(ref.byte_offset, ref.byte_offset + ref.byte_size, ref.name)
+                for ref in iter_members(owner)] if current is not None else []
+    pending = []
+    for row in ordered:
+        offset = int(row["resolved_offset"])
+        width = int(row["field_schema"]["width"])
+        end = offset + width
+        for start, stop, name in occupied + pending:
+            if offset < stop and start < end:
+                return {"ok": False, "failed_item_id": row["id"],
+                        "reason": "destination range overlaps %s" % name}
+        field_type = _portable_tinfo(row["field_schema"])
+        if field_type is None:
+            return {"ok": False, "failed_item_id": row["id"],
+                    "reason": "portable field schema is unsupported"}
+        try:
+            details.add_member(row["member"], field_type, _bits(offset))
+        except Exception as exc:
+            msg("MEMBER: batch add %s.%s failed: %s" %
+                (owner, row["member"], exc))
+            return {"ok": False, "failed_item_id": row["id"],
+                    "reason": "IDA rejected member layout"}
+        pending.append((offset, end, row["member"]))
+
+    replacement = ida_typeinf.tinfo_t()
+    try:
+        if not replacement.create_udt(details, ida_typeinf.BTF_STRUCT):
+            return {"ok": False, "reason": "IDA could not construct owner layout"}
+        flags = ida_typeinf.NTF_REPLACE if current is not None else 0
+        code = replacement.set_named_type(ida_typeinf.get_idati(), owner, flags)
+    except Exception as exc:
+        msg("MEMBER: replace owner %s failed: %s" % (owner, exc))
+        return {"ok": False, "reason": "IDA could not commit owner layout"}
+    if code != ida_typeinf.TERR_OK:
+        return {"ok": False, "reason": "IDA refused owner layout replacement"}
+
+    for row in ordered:
+        created = member_at_offset(owner, row["resolved_offset"])
+        if (created is None or created.name != row["member"] or
+                created.byte_size != int(row["field_schema"]["width"])):
+            return {"ok": False, "failed_item_id": row["id"],
+                    "reason": "committed member did not pass read-back"}
+    return {"ok": True, "created": [row["id"] for row in ordered]}
+
+
 def apply_stroff(ea, op_index, owner, delta=0):
     """Mark an operand as a struct offset into `owner`.
 

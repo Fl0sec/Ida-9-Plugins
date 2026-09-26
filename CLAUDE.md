@@ -186,6 +186,12 @@ environment and are the fastest way to check API behaviour against a live IDB.
   depend on in plugin code. A probe against a real IDB beats reasoning.
 - MCP verifies *behaviour*; `tools/check.py` verifies *existence*. Neither
   replaces the other.
+- **Keep Codex MCP plugin-managed.** Deploy or refresh the personal
+  `ida-pro-mcp` plugin only; do not run `ida-pro-mcp --install codex --scope
+  global` and do not add `[mcp_servers.ida-pro-mcp]`. That installer creates a
+  GUI HTTP connector at port 13337, which breaks startup whenever no GUI
+  server is listening. Add a standalone connector only when the user
+  explicitly requests a persistent GUI MCP endpoint.
 
 ## Git
 

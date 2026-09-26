@@ -6,7 +6,7 @@ import os
 
 import ida_typeinf
 
-from . import cfs6, importer, members
+from . import cfs6, importer, materialize_plan, members
 from .api_result import result
 from .common import get_search_ranges
 from .image import describe_image, open_image_view
@@ -43,6 +43,42 @@ def _plan_digest(loaded, catalogue_path, image, rows):
                  for row in rows],
     }
     return hashlib.sha256(_canonical(binding).encode("utf-8")).hexdigest()
+
+
+def _snapshot_layout(snapshot):
+    """Comparable read-back layout for an owner snapshot."""
+    details = ida_typeinf.udt_type_data_t()
+    try:
+        if not snapshot.get_udt_details(details):
+            return None
+    except Exception:
+        return None
+    return [(str(member.name), int(member.offset), int(member.size))
+            for member in details]
+
+
+def _restore_owner(owner, snapshot):
+    """Restore one owner and prove its pre-apply state is back."""
+    status = {"owner": owner, "attempted": True, "verified": False, "error": None}
+    try:
+        if snapshot is None:
+            deleted = ida_typeinf.del_named_type(ida_typeinf.get_idati(), owner, 0)
+            probe = ida_typeinf.tinfo_t()
+            absent = not probe.get_named_type(ida_typeinf.get_idati(), owner)
+            status.update(action="delete_created_shell", verified=bool(deleted and absent))
+            if not status["verified"]:
+                status["error"] = "created owner still exists after deletion"
+            return status
+        code = snapshot.set_named_type(ida_typeinf.get_idati(), owner, ida_typeinf.NTF_REPLACE)
+        restored = members.get_struct_tinfo(owner)
+        status.update(action="restore_snapshot",
+                      verified=(code == ida_typeinf.TERR_OK and restored is not None and
+                                _snapshot_layout(snapshot) == _snapshot_layout(restored)))
+        if not status["verified"]:
+            status["error"] = "owner layout did not match its snapshot after restoration"
+    except Exception as exc:
+        status["error"] = str(exc)
+    return status
 
 
 def _classify(item, evidence):
@@ -130,39 +166,43 @@ def apply_type_materialization(catalogue_path, item_ids, expected_plan_digest,
         return result(partial=True, unresolved=[{"kind": "member", "name": row["id"],
                                                   "reason": row["action"]} for row in unsafe],
                       rows=selected, plan_digest=planned["plan_digest"])
+    batches, conflicts = materialize_plan.create_batches(selected)
+    if conflicts:
+        return result(partial=True, rows=selected,
+                      unresolved=[{"kind": "member", "name": item["id"],
+                                   "reason": item["reason"]} for item in conflicts],
+                      plan_digest=planned["plan_digest"])
     snapshots = {}
-    created_shells = []
     for row in selected:
         if row["action"] == "create" and row["owner"] not in snapshots:
             _state, tif = members.owner_shell_state(row["owner"])
             snapshots[row["owner"]] = None if tif is None else tif.copy()
-    for owner, snapshot in snapshots.items():
-        state, tif = members.owner_shell_state(owner)
-        if state != "create_owner_shell":
-            continue
-        if members.create_owner_shell(owner, replace=snapshot is not None) is None:
-            return result(error="unable to create owner shell %s" % owner, rows=selected)
-        created_shells.append(owner)
     created = []
-    for row in selected:
-        if row["action"] != "create":
-            continue
-        made = members.create_portable_member(row["owner"], row["member"],
-                                              row["resolved_offset"], row["field_schema"])
-        if made is None:
-            rollback_ok = True
-            for owner, snapshot in snapshots.items():
-                if snapshot is None:
-                    rollback_ok = ida_typeinf.del_named_type(
-                        ida_typeinf.get_idati(), owner, 0
-                    ) and rollback_ok
-                else:
-                    rollback_ok = (snapshot.set_named_type(
-                        ida_typeinf.get_idati(), owner, ida_typeinf.NTF_REPLACE
-                    ) == ida_typeinf.TERR_OK) and rollback_ok
-            return result(error="materialization failed; rollback attempted", rows=selected,
-                          rollback_verified=rollback_ok)
-        created.append(row["id"])
+    committed_owners = []
+    for owner, batch in batches.items():
+        state, _tif = members.owner_shell_state(owner)
+        committed = members.replace_portable_members(
+            owner, batch, create_owner=(state == "create_owner_shell")
+        )
+        if not committed["ok"]:
+            # A failed batch may have committed its replacement before a
+            # read-back failure, so restore its snapshot as well.
+            rollback_owners = [owner] + list(reversed(committed_owners))
+            statuses = [_restore_owner(changed_owner, snapshots[changed_owner])
+                        for changed_owner in rollback_owners]
+            rollback_verified = all(status["verified"] for status in statuses)
+            failed_id = committed.get("failed_item_id")
+            return result(partial=not rollback_verified,
+                          error="materialization failed; rollback %s" %
+                                ("verified" if rollback_verified else "FAILED"),
+                          rows=selected, failed_item_id=failed_id,
+                          failure={"owner": owner, "reason": committed.get("reason")},
+                          rollback={"attempted": bool(statuses),
+                                    "verified": rollback_verified, "owners": statuses})
+        committed_owners.append(owner)
+        created.extend(committed["created"])
     return result(ok=True, rows=selected, created=created,
                   already_exact=[row["id"] for row in selected if row["action"] == "already_exact"],
-                  owner_shells=created_shells, plan_digest=planned["plan_digest"])
+                  owner_shells=[owner for owner in committed_owners
+                                if snapshots[owner] is None],
+                  plan_digest=planned["plan_digest"])

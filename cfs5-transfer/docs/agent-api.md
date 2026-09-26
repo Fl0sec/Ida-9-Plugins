@@ -287,6 +287,12 @@ api.apply_type_materialization(path, ["member:Owner::field"], plan["plan_digest"
 never relocates, renames, or retouches an existing field. Apply recomputes the
 plan and rejects a changed catalogue, target, schema, or owner layout.
 
+Selected creates for one owner are committed as one offset-ordered layout, so
+sparse fields never leave temporary padding members that block a later selected
+field. A failed apply returns `failed_item_id`, `failure`, and structured
+`rollback` owner statuses; `rollback.verified` is true only after every owner
+has been read back in its pre-apply state.
+
 ## Public surface
 
 | Branch | Calls |
