@@ -14,6 +14,7 @@ PUBLIC = {
     "declare_patches", "declare_strides", "declarations", "export",
     "export_list", "export_selected", "import_and_migrate",
     "import_catalogue", "migrate_state", "promote_catalogue", "refresh_catalogue",
+    "apply_type_materialization", "plan_type_materialization",
     "register", "registered",
     "undeclare", "unregister",
 }
@@ -43,7 +44,7 @@ class ApiLayoutTests(unittest.TestCase):
         found = {}
         for filename in (
             "api_registry.py", "api_declarations.py", "api_export.py",
-            "api_import.py",
+            "api_import.py", "api_materialize.py",
         ):
             for node in self._tree(filename).body:
                 if isinstance(node, ast.FunctionDef) and node.name in PUBLIC:

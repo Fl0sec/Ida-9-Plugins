@@ -526,6 +526,81 @@ def create_member(owner, name, byte_offset, byte_size):
     return created
 
 
+def portable_member_schema(owner, member_name):
+    """Return the narrow CFS7 schema for a safely recreatable member.
+
+    Complete IDA UDT payloads are intentionally not represented here.  A
+    missing/complex type is not an error; it simply has no portable schema.
+    """
+    tif = get_struct_tinfo(owner)
+    if tif is None:
+        return None
+    try:
+        _idx, udm = tif.get_udm(member_name)
+        if udm is None:
+            return None
+        mt = udm.type
+        width = int(mt.get_size())
+        if width not in _WIDTH_TO_BTF:
+            return None
+        if mt.is_bool():
+            return {"kind": "bool", "width": width}
+        if mt.is_integral():
+            # IDA exposes signedness through the type spelling reliably across
+            # the supported TILs; ambiguous spellings are deliberately skipped.
+            text = str(mt.dstr() or "").lower()
+            signed = not ("unsigned" in text or text.startswith("uint"))
+            return {"kind": "integer", "width": width, "signed": signed}
+        if mt.is_floating():
+            return {"kind": "float", "width": width}
+        if mt.is_ptr() and width == 8:
+            return {"kind": "pointer", "width": width}
+    except Exception as exc:
+        msg("MEMBER: portable schema for %s.%s failed: %s" % (owner, member_name, exc))
+    return None
+
+
+def _portable_tinfo(schema):
+    """Build only the closed primitive/pointer schema vocabulary."""
+    kind = schema.get("kind")
+    width = int(schema.get("width", 0))
+    if kind == "integer":
+        prefix = "BTF_INT" if bool(schema.get("signed")) else "BTF_UINT"
+        return getattr(ida_typeinf, "%s%d" % (prefix, width * 8), None)
+    if kind == "bool" and width == 1:
+        return ida_typeinf.BTF_BOOL
+    if kind == "float":
+        return {4: ida_typeinf.BTF_FLOAT, 8: ida_typeinf.BTF_DOUBLE}.get(width)
+    if kind == "pointer" and width == 8:
+        base = ida_typeinf.tinfo_t(ida_typeinf.BTF_VOID)
+        out = ida_typeinf.tinfo_t()
+        return out if out.create_ptr(base) else None
+    return None
+
+
+def create_portable_member(owner, name, byte_offset, schema):
+    """Create one schema-validated member and prove the exact read-back."""
+    tif = get_struct_tinfo(owner)
+    if tif is None or tif.is_union():
+        return None
+    if member_at_offset(owner, byte_offset) is not None or enclosing_member_name(owner, byte_offset):
+        return None
+    field_type = _portable_tinfo(schema)
+    if field_type is None:
+        return None
+    try:
+        code = tif.add_udm(name, field_type, _bits(byte_offset))
+    except Exception as exc:
+        msg("MEMBER: portable add %s.%s failed: %s" % (owner, name, exc))
+        return None
+    if code != ida_typeinf.TERR_OK:
+        return None
+    created = member_at_offset(owner, byte_offset)
+    if created is None or created.name != name or created.byte_size != int(schema["width"]):
+        return None
+    return created
+
+
 def apply_stroff(ea, op_index, owner, delta=0):
     """Mark an operand as a struct offset into `owner`.
 

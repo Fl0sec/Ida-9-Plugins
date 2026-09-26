@@ -8,6 +8,7 @@ from . import export as _export
 from . import promotion
 from . import selection
 from . import store
+from . import members
 from .api_registry import _collect
 from .common import get_search_ranges
 from .image import BodyOwnership, describe_image, get_imagebase, open_image_view, detect_build
@@ -54,7 +55,7 @@ def _limit(item):
     return MAX_VALUE_CANDIDATES
 
 
-def _write_item(writer, item, candidates):
+def _write_item(writer, item, candidates, active=False):
     if item.kind == cfs6.REC_PATCH:
         iid = writer.write_patch(item.owner, item.name, len(candidates), item.coverage,
             {"expected_instruction": item.expected_instruction,
@@ -62,9 +63,13 @@ def _write_item(writer, item, candidates):
     elif item.kind in (cfs6.REC_FUNCTION, cfs6.REC_GLOBAL):
         iid = writer.write_item(item.kind, item.name, len(candidates), item.coverage)
     elif item.kind == cfs6.REC_DERIVED_VALUE:
+        schema = item.portable_member_schema
+        if active and item.semantic == cfs6.SEM_MEMBER_OFFSET:
+            schema = members.portable_member_schema(item.owner, item.name)
         iid = writer.write_derived_value(item.semantic, item.owner, item.name,
                                          len(candidates), item.coverage,
-                                         expected_value=item.expected_value)
+                                         expected_value=item.expected_value,
+                                         portable_member_schema=schema)
     else:
         raise ValueError("unsupported item kind %s" % item.kind)
     for rank, (rec, source, provenance) in enumerate(candidates):
@@ -206,7 +211,7 @@ def refresh_catalogue(source_path, destination_path, build=None, item_ids=(),
             writer.write_header(image, build_number, build_source)
             active_ids = set()
             for item, candidates, is_active in planned:
-                iid = _write_item(writer, item, candidates)
+                iid = _write_item(writer, item, candidates, active=is_active)
                 if is_active:
                     active_ids.add(iid)
             # Type records are emitted only from the current-target selected export.

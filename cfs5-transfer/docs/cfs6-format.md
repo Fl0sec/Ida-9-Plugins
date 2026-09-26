@@ -152,6 +152,11 @@ Duplicate `id`, or a candidate naming an unknown `item`, is an error.
  "source":{"expected_value":480}}
 ```
 
+CFS7 schema revision 4 may add `portable_member_schema` to a
+`member_offset`. It is a closed, portable description (`integer`, `float`,
+`bool`, or `pointer`) with its byte width; it is not an IDA type payload.
+Consumers may use it only after independently resolving target candidates.
+
 | Field | Meaning |
 |---|---|
 | `id` | `<prefix>:<owner>::<name>`. Prefix per semantic: `member`, `stride`, `extent`, `const`. Opaque key. |

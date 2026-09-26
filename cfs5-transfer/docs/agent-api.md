@@ -272,6 +272,21 @@ are freshly exported from the target and therefore carry target provenance.
 The selection is all-or-nothing. Type payloads are included only for those
 fresh target records; refresh never carries type payloads from an older build.
 
+## Materialize safe target-side members
+
+Only CFS7 revision-4 member records with a portable primitive/pointer schema
+may be materialized. Plan first; it resolves all candidates, tolerates stale
+candidate failures, and requires every successful candidate to agree:
+
+```python
+plan = api.plan_type_materialization(path, item_ids=["member:Owner::field"])
+api.apply_type_materialization(path, ["member:Owner::field"], plan["plan_digest"])
+```
+
+`missing_only` creates only an absent field in unoccupied target space. It
+never relocates, renames, or retouches an existing field. Apply recomputes the
+plan and rejects a changed catalogue, target, schema, or owner layout.
+
 ## Public surface
 
 | Branch | Calls |
@@ -280,6 +295,7 @@ fresh target records; refresh never carries type payloads from an older build.
 | Declarations | `declare_members`, `declare_strides`, `declare_constants`, `declare_extents`, `declare_patches`, `undeclare`, `declarations` |
 | Export | `export`, `export_list`, `export_selected` |
 | Import | `import_catalogue`, `migrate_state`, `import_and_migrate`, `promote_catalogue`, `refresh_catalogue` |
+| Materialization | `plan_type_materialization`, `apply_type_materialization` |
 
 Adding a public call requires one implementation branch, a facade re-export,
 the shared result envelope, an API layout test update, and documentation here.

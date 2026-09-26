@@ -51,7 +51,7 @@ CFS7_FORMAT_VERSION = 7
 # kinds already behave. An item fails only when no candidate survives, which
 # was always the semantics, so an older reader degrades to "this item has
 # fewer candidates" instead of "this file is broken".
-SCHEMA_REVISION = 3
+SCHEMA_REVISION = 4
 GENERATOR_NAME = "cfs5-transfer"
 GENERATOR_VERSION = "6.4.0"
 
@@ -462,10 +462,10 @@ class DerivedValueRecord(ItemRecord):
     compare against; `member_offset` always does.
     """
 
-    __slots__ = ("semantic", "owner", "expected_value")
+    __slots__ = ("semantic", "owner", "expected_value", "portable_member_schema")
 
     def __init__(self, line_no, id, name, semantic, owner, coverage=None,
-                 candidate_count=0, expected_value=None):
+                 candidate_count=0, expected_value=None, portable_member_schema=None):
         ItemRecord.__init__(
             self, line_no, REC_DERIVED_VALUE, id, name,
             coverage=coverage, candidate_count=candidate_count,
@@ -473,6 +473,7 @@ class DerivedValueRecord(ItemRecord):
         self.semantic = semantic
         self.owner = owner or ""
         self.expected_value = expected_value
+        self.portable_member_schema = portable_member_schema
 
     @property
     def qualified_name(self):
@@ -656,7 +657,7 @@ class Cfs6Writer:
         return iid
 
     def write_derived_value(self, semantic, owner, name, candidate_count,
-                            coverage, expected_value=None):
+                            coverage, expected_value=None, portable_member_schema=None):
         """Emit a derived_value item. Returns its id."""
         if semantic not in VALID_SEMANTICS:
             raise ValueError("unsupported semantic %r" % (semantic,))
@@ -674,6 +675,8 @@ class Cfs6Writer:
         # one item must never intentionally represent different values.
         if expected_value is not None:
             obj["source"] = {"expected_value": int(expected_value)}
+        if portable_member_schema is not None:
+            obj["portable_member_schema"] = dict(portable_member_schema)
         self._emit(obj)
         self.items += 1
         self.item_ids.add(iid)
@@ -1285,11 +1288,21 @@ def _parse_derived_value(obj, line_no):
             "line %d: %s must carry source.expected_value" % (line_no, semantic)
         )
 
+    portable = obj.get("portable_member_schema")
+    if portable is not None:
+        if semantic != SEM_MEMBER_OFFSET or not isinstance(portable, dict):
+            raise ValueError("line %d: portable_member_schema is only valid for member_offset" % line_no)
+        kind = portable.get("kind")
+        width = portable.get("width")
+        if kind not in ("integer", "float", "bool", "pointer", "handle") or width not in VALID_FIELD_SIZES:
+            raise ValueError("line %d: invalid portable_member_schema" % line_no)
+        if kind == "integer" and not isinstance(portable.get("signed"), bool):
+            raise ValueError("line %d: integer portable_member_schema needs signed" % line_no)
     return DerivedValueRecord(
         line_no=line_no, id=iid, name=name, semantic=semantic, owner=owner,
         coverage=obj.get("coverage") or {},
         candidate_count=int(obj.get("candidate_count", 0)),
-        expected_value=expected,
+        expected_value=expected, portable_member_schema=portable,
     )
 
 

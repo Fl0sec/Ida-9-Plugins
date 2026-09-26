@@ -18,6 +18,7 @@ from .api_import import (
     import_and_migrate, import_catalogue, migrate_state, promote_catalogue,
     refresh_catalogue,
 )
+from .api_materialize import apply_type_materialization, plan_type_materialization
 from .api_registry import clear, register, registered, unregister
 
 
@@ -26,6 +27,7 @@ __all__ = (
     "declare_patches", "declare_strides", "declarations", "export",
     "export_list", "export_selected", "import_and_migrate",
     "import_catalogue", "migrate_state", "promote_catalogue", "refresh_catalogue",
+    "apply_type_materialization", "plan_type_materialization",
     "register", "registered",
     "undeclare", "unregister",
 )
