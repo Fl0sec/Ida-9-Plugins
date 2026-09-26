@@ -13,7 +13,8 @@ PUBLIC = {
     "clear", "declare_constants", "declare_extents", "declare_members",
     "declare_patches", "declare_strides", "declarations", "export",
     "export_list", "export_selected", "import_and_migrate",
-    "import_catalogue", "migrate_state", "promote_catalogue", "register", "registered",
+    "import_catalogue", "migrate_state", "promote_catalogue", "refresh_catalogue",
+    "register", "registered",
     "undeclare", "unregister",
 }
 

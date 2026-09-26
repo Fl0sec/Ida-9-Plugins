@@ -918,11 +918,11 @@ def import_catalogue(path, show_progress=False, transport_types=False,
     stats = Stats()
 
     try:
-        loaded = cfs6.load_cfs6(path, log=msg)
+        loaded = cfs6.load_catalogue(path, log=msg)
     except cfs6.Cfs6Error as exc:
         return _result(error=str(exc), path=path)
     except Exception as exc:
-        return _result(error="could not read CFS6 file: %s" % exc, path=path)
+        return _result(error="could not read CFS catalogue: %s" % exc, path=path)
 
     stats.parse_errors = loaded.parse_errors
     func_groups = loaded.functions()
@@ -933,7 +933,7 @@ def import_catalogue(path, show_progress=False, transport_types=False,
     derived = loaded.derived_values()
     patches = loaded.patches()
     if not func_groups and not glob_groups and not derived and not patches:
-        return _result(error="no CFS6 item records found", path=path)
+        return _result(error="no CFS item records found", path=path)
 
     ranges = get_search_ranges()
     if not ranges:
@@ -943,7 +943,7 @@ def import_catalogue(path, show_progress=False, transport_types=False,
     glob_sigs = sum(len(i.candidates) for i in glob_groups)
 
     msg("=" * 72)
-    msg("CFS6 Importer %s" % VERSION)
+    msg("CFS Importer %s" % VERSION)
     msg("File: %s" % path)
     msg("Source: %s" % loaded.describe_source())
     _warn_on_image_mismatch(loaded)
@@ -1383,9 +1383,9 @@ def migrate_producer_state(path, require_all=False, member_baseline=None):
     different definition.
     """
     try:
-        loaded = cfs6.load_cfs6(path, log=msg)
+        loaded = cfs6.load_catalogue(path, log=msg)
     except Exception as exc:
-        return _result(error="could not read CFS6 file: %s" % exc, path=path)
+        return _result(error="could not read CFS catalogue: %s" % exc, path=path)
     ranges = get_search_ranges()
     if not ranges:
         return _result(error="no executable/code search ranges found", path=path)

@@ -247,6 +247,31 @@ those require their own target validation before a later full-catalogue mode.
 Pass `preserve_validated=True` to revalidate every source item and retain only
 the target-valid subset; the result is partial when any item cannot promote.
 
+## Refresh a rolling CFS7 catalogue
+
+CFS6 remains the strict, single-source format. Use CFS7 when one catalogue
+must retain independently validated evidence from more than one build:
+
+```python
+api.refresh_catalogue(
+    source_path=r"C:\catalogues\client-14182.cfs",
+    destination_path=r"C:\catalogues\client-14185.cfs",
+    build=14185,
+    declaration_names=["spotted::DroppedC4Gate"],
+)
+```
+
+Refresh revalidates every source candidate against the active target. It keeps
+only uniquely resolving, semantically valid candidates, records each retained
+candidate's immutable origin image/build, and writes a CFS7 header identifying
+the complete catalogue's validation target. Older candidates are not removed
+because of their age; they are removed only after target validation fails.
+
+`item_ids` and `declaration_names` add exact active-IDB evidence. Those records
+are freshly exported from the target and therefore carry target provenance.
+The selection is all-or-nothing. Type payloads are included only for those
+fresh target records; refresh never carries type payloads from an older build.
+
 ## Public surface
 
 | Branch | Calls |
@@ -254,7 +279,7 @@ the target-valid subset; the result is partial when any item cannot promote.
 | Registry | `register`, `unregister`, `clear`, `registered` |
 | Declarations | `declare_members`, `declare_strides`, `declare_constants`, `declare_extents`, `declare_patches`, `undeclare`, `declarations` |
 | Export | `export`, `export_list`, `export_selected` |
-| Import | `import_catalogue`, `migrate_state`, `import_and_migrate`, `promote_catalogue` |
+| Import | `import_catalogue`, `migrate_state`, `import_and_migrate`, `promote_catalogue`, `refresh_catalogue` |
 
 Adding a public call requires one implementation branch, a facade re-export,
 the shared result envelope, an API layout test update, and documentation here.

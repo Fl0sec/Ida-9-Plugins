@@ -2,6 +2,7 @@
 
 from . import importer as _importer
 from . import promotion as _promotion
+from . import rolling as _rolling
 
 
 def import_catalogue(path):
@@ -27,4 +28,13 @@ def promote_catalogue(source_path, destination_path, build=None, item_ids=(),
     return _promotion.promote_catalogue(
         source_path, destination_path, build=build, item_ids=item_ids,
         declaration_names=declaration_names, preserve_validated=preserve_validated,
+    )
+
+
+def refresh_catalogue(source_path, destination_path, build=None, item_ids=(),
+                      declaration_names=()):
+    """Write a rolling CFS7 catalogue validated against the active target."""
+    return _rolling.refresh_catalogue(
+        source_path, destination_path, build=build, item_ids=item_ids,
+        declaration_names=declaration_names,
     )

@@ -39,6 +39,7 @@ import zlib
 
 FORMAT_NAME = "CFS"
 FORMAT_VERSION = 6
+CFS7_FORMAT_VERSION = 7
 # Revision 1 adds the `derived_value` item kind and the VALUE candidate mode.
 # Additive only: a revision-0 reader skips both as unknown record kinds.
 #
@@ -286,11 +287,12 @@ class CandidateRecord:
 
     __slots__ = (
         "line_no", "item", "rank", "mode", "pattern", "origin", "score",
-        "source", "resolve", "is_data",
+        "source", "resolve", "provenance", "is_data",
     )
 
     def __init__(self, line_no, item, rank, mode, pattern, origin="",
-                 score=0, source=None, resolve=None, is_data=False):
+                 score=0, source=None, resolve=None, provenance=None,
+                 is_data=False):
         self.line_no = int(line_no)
         self.item = item
         self.rank = int(rank)
@@ -300,6 +302,7 @@ class CandidateRecord:
         self.score = int(score)
         self.source = dict(source or {})
         self.resolve = dict(resolve or {})
+        self.provenance = dict(provenance or {})
         self.is_data = bool(is_data)
 
     # Resolve-time accessors. Every offset is relative to the match start.
@@ -713,6 +716,7 @@ class Cfs6Writer:
         })
         self.candidates += 1
 
+
     def write_item_type(self, iid, name, quality, blobs, dependencies,
                         is_global=False):
         self._emit({
@@ -740,6 +744,37 @@ class Cfs6Writer:
             "fields": pack_bytes(blobs[1]),
             "field_comments": pack_bytes(blobs[2]),
         })
+
+
+class Cfs7Writer(Cfs6Writer):
+    """CFS7 writer for rolling catalogues with immutable provenance."""
+
+    def write_header(self, image, build_number=None, build_source="unknown"):
+        self._emit({
+            "record": REC_HEADER,
+            "format": FORMAT_NAME,
+            "version": CFS7_FORMAT_VERSION,
+            "schema_revision": SCHEMA_REVISION,
+            "generator": {"name": GENERATOR_NAME, "version": GENERATOR_VERSION},
+            "target": {
+                "image": dict(image or {}),
+                "build": {"number": build_number, "source": build_source},
+            },
+            "scoring": {"direction": "lower-is-better"},
+        })
+
+    def write_revalidated_candidate(self, iid, rank, rec, source, provenance):
+        if (not isinstance(provenance, dict) or
+                not isinstance(provenance.get("image"), dict) or
+                not isinstance(provenance.get("build"), dict)):
+            raise ValueError("CFS7 candidates require image/build provenance")
+        self._emit({
+            "record": REC_CANDIDATE, "item": iid, "rank": int(rank),
+            "mode": rec.mode, "pattern": rec.pattern, "origin": rec.origin,
+            "score": int(rec.score), "source": dict(source),
+            "resolve": dict(rec.resolve), "provenance": dict(provenance),
+        })
+        self.candidates += 1
 
 
 # ---------------------------------------------------------------------------
@@ -902,15 +937,31 @@ def _require_int(obj, key, line_no, minimum=None):
     return value
 
 
-def _parse_header(obj, line_no):
+def _parse_header(obj, line_no, expected_version=FORMAT_VERSION):
     if obj.get("record") != REC_HEADER or obj.get("format") != FORMAT_NAME:
         raise Cfs6Error(_NOT_CFS6)
     version = obj.get("version")
-    if version != FORMAT_VERSION:
+    if version not in (FORMAT_VERSION, CFS7_FORMAT_VERSION):
         raise Cfs6Error(
-            "unsupported CFS format version %r (this build reads version %d); "
-            "re-export" % (version, FORMAT_VERSION)
+            "unsupported CFS format version %r (this build reads versions %d and %d); "
+            "re-export" % (version, FORMAT_VERSION, CFS7_FORMAT_VERSION)
         )
+    if expected_version is not None and version != expected_version:
+        raise Cfs6Error(
+            "unsupported CFS format version %r (expected version %d)"
+            % (version, expected_version)
+        )
+    if version == CFS7_FORMAT_VERSION:
+        target = obj.get("target")
+        if (not isinstance(target, dict) or
+                not isinstance(target.get("image"), dict) or
+                not isinstance(target.get("build"), dict)):
+            raise Cfs6Error("CFS7 header is missing its 'target' object")
+        # The rest of the resolver intentionally consumes target diagnostics
+        # through the legacy accessors. These aliases are in-memory only.
+        obj = dict(obj)
+        obj["image"] = dict(target["image"])
+        obj["build"] = dict(target["build"])
     if not isinstance(obj.get("image"), dict):
         raise Cfs6Error("CFS6 header is missing its 'image' object")
     return obj
@@ -932,7 +983,7 @@ class UnknownMode(Exception):
         self.line_no = line_no
 
 
-def _parse_candidate(obj, line_no):
+def _parse_candidate(obj, line_no, require_provenance=False):
     mode = str(obj.get("mode", "")).upper()
     if mode not in MODES:
         raise UnknownMode(
@@ -955,6 +1006,12 @@ def _parse_candidate(obj, line_no):
     if not isinstance(source, dict) or not isinstance(resolve, dict):
         raise ValueError("line %d: 'source'/'resolve' must be objects" % line_no)
 
+    provenance = obj.get("provenance") or {}
+    if require_provenance:
+        if (not isinstance(provenance, dict) or
+                not isinstance(provenance.get("image"), dict) or
+                not isinstance(provenance.get("build"), dict)):
+            raise ValueError("line %d: CFS7 candidate needs provenance image/build" % line_no)
     rec = CandidateRecord(
         line_no=line_no,
         item=item,
@@ -965,6 +1022,7 @@ def _parse_candidate(obj, line_no):
         score=int(obj.get("score", 0)),
         source=source,
         resolve=resolve,
+        provenance=provenance,
     )
 
     pattern_len = len(pattern.split())
@@ -1299,7 +1357,7 @@ def _parse_item_meta(obj, line_no, is_global):
     )
 
 
-def load_cfs6(path, log=None):
+def _load(path, log=None, expected_version=FORMAT_VERSION):
     """Parse a CFS6 file. Raises Cfs6Error when the file is unusable.
 
     Recoverable per-line problems are counted in `parse_errors` and reported
@@ -1345,7 +1403,7 @@ def load_cfs6(path, log=None):
         kind = obj.get("record")
 
         if loaded is None:
-            loaded = LoadedCfs(_parse_header(obj, line_no))
+            loaded = LoadedCfs(_parse_header(obj, line_no, expected_version))
             loaded.lines = lines
             loaded.header_line = line_no
             continue
@@ -1367,7 +1425,10 @@ def load_cfs6(path, log=None):
                 loaded.items.append(item)
 
             elif kind == REC_CANDIDATE:
-                pending.append(_parse_candidate(obj, line_no))
+                pending.append(_parse_candidate(
+                    obj, line_no,
+                    require_provenance=(loaded.header.get("version") == CFS7_FORMAT_VERSION),
+                ))
 
             elif kind in (REC_FUNC_TYPE, REC_GLOB_TYPE):
                 meta = _parse_item_meta(
@@ -1413,6 +1474,16 @@ def load_cfs6(path, log=None):
 
     _attach_candidates(loaded, by_id, pending, seen_ranks, skipped_ranks, report)
     return loaded
+
+
+def load_cfs6(path, log=None):
+    """Parse a CFS6 file. Raises Cfs6Error when the file is unusable."""
+    return _load(path, log=log, expected_version=FORMAT_VERSION)
+
+
+def load_catalogue(path, log=None):
+    """Parse either a legacy CFS6 or a rolling CFS7 catalogue."""
+    return _load(path, log=log, expected_version=None)
 
 
 def _attach_candidates(loaded, by_id, pending, seen_ranks, skipped_ranks, report):
