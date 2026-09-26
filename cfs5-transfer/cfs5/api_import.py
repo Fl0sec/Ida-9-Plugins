@@ -4,23 +4,55 @@ from . import importer as _importer
 from . import promotion as _promotion
 from . import rolling as _rolling
 from . import refresh_jobs as _refresh_jobs
+from . import import_jobs as _import_jobs
 
 
 def import_catalogue(path):
     """Apply names and types from a CFS6 catalogue without interactive UI."""
+    routed = _import_jobs.direct_required(path, "catalogue")
+    if routed is not None:
+        return routed
     return _importer.import_catalogue(path, show_progress=False)
 
 
 def migrate_state(path, require_all=False):
     """Transactionally reconstruct portable producer state from a catalogue."""
+    routed = _import_jobs.direct_required(path, "migrate", require_all)
+    if routed is not None:
+        return routed
     return _importer.migrate_producer_state(path, require_all=require_all)
 
 
 def import_and_migrate(path, require_all_state=False):
     """Apply a catalogue, then reconstruct producer state from resolved proof."""
+    routed = _import_jobs.direct_required(path, "import_and_migrate", require_all_state)
+    if routed is not None:
+        return routed
     return _importer.import_and_migrate(
         path, require_all_state=require_all_state, show_progress=False
     )
+
+
+def begin_import_job(catalogue_path, operation="import_and_migrate",
+                     require_all_state=False, job_path=None):
+    return _import_jobs.begin_import_job(catalogue_path, operation,
+                                         require_all_state, job_path)
+
+
+def run_import_job(job_path, budget_seconds=90):
+    return _import_jobs.run_import_job(job_path, budget_seconds)
+
+
+def import_job_status(job_path):
+    return _import_jobs.import_job_status(job_path)
+
+
+def import_job_outcomes(job_path, offset=0, limit=100):
+    return _import_jobs.import_job_outcomes(job_path, offset, limit)
+
+
+def discard_import_job(job_path):
+    return _import_jobs.discard_import_job(job_path)
 
 
 def promote_catalogue(source_path, destination_path, build=None, item_ids=(),

@@ -50,6 +50,28 @@ This first applies resolvable names and types, then transactionally reconstructs
 producer state from destination-build evidence. The normal policy commits the
 valid subset and reports every non-portable record.
 
+Catalogues with more than eight items must use the durable import job; direct
+calls return `resumable_job_required` with the exact recommended arguments.
+This prevents a large target-wide signature scan from exceeding the MCP
+deadline without a structured result:
+
+```python
+job = api.begin_import_job(
+    r"C:\catalogues\client-14182.cfs", operation="import_and_migrate",
+    require_all_state=False,
+)
+for _ in range(5):
+    progress = api.run_import_job(job["job_path"], budget_seconds=90)
+    if progress["finalized"]:
+        break
+```
+
+The job freezes the catalogue hash and target identity, registers transported
+local types before item application, checkpoints each applied catalogue item,
+and defers producer-state migration to its final phase. `import_job_outcomes`
+returns bounded pages of detailed item results; the runner returns compact
+progress only. The job never saves the IDB.
+
 Use strict producer-state migration when any missing record must block all
 state writes:
 
