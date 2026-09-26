@@ -62,7 +62,9 @@ def _restore_owner(owner, snapshot):
     status = {"owner": owner, "attempted": True, "verified": False, "error": None}
     try:
         if snapshot is None:
-            ida_typeinf.del_named_type(ida_typeinf.get_idati(), owner, 0)
+            ida_typeinf.del_named_type(
+                ida_typeinf.get_idati(), owner, ida_typeinf.NTF_TYPE
+            )
             probe = ida_typeinf.tinfo_t()
             absent = not probe.get_named_type(ida_typeinf.get_idati(), owner)
             status.update(action="delete_created_shell", verified=bool(absent))

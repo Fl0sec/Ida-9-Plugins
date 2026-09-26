@@ -693,6 +693,13 @@ def replace_portable_members(owner, rows, create_owner=False):
                     "reason": "IDA rejected member layout"}
         pending.append((offset, end, row["member"]))
 
+    # create_udt() recalculates a normal structure and discards sparse offsets.
+    # A fixed UDT keeps the reviewed offsets, provided its declared size reaches
+    # the last field.
+    final_size = max([int(details.total_size)] + [end for _start, end, _name in pending])
+    details.total_size = final_size
+    details.set_fixed(True)
+
     replacement = ida_typeinf.tinfo_t()
     try:
         if not replacement.create_udt(details, ida_typeinf.BTF_STRUCT):
