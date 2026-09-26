@@ -607,11 +607,13 @@ def _portable_tinfo(schema):
     width = int(schema.get("width", 0))
     if kind == "integer":
         prefix = "BTF_INT" if bool(schema.get("signed")) else "BTF_UINT"
-        return getattr(ida_typeinf, "%s%d" % (prefix, width * 8), None)
+        primitive = getattr(ida_typeinf, "%s%d" % (prefix, width * 8), None)
+        return None if primitive is None else ida_typeinf.tinfo_t(primitive)
     if kind == "bool" and width == 1:
-        return ida_typeinf.BTF_BOOL
+        return ida_typeinf.tinfo_t(ida_typeinf.BTF_BOOL)
     if kind == "float":
-        return {4: ida_typeinf.BTF_FLOAT, 8: ida_typeinf.BTF_DOUBLE}.get(width)
+        primitive = {4: ida_typeinf.BTF_FLOAT, 8: ida_typeinf.BTF_DOUBLE}.get(width)
+        return None if primitive is None else ida_typeinf.tinfo_t(primitive)
     if kind == "pointer" and width == 8:
         base = ida_typeinf.tinfo_t(ida_typeinf.BTF_VOID)
         out = ida_typeinf.tinfo_t()
