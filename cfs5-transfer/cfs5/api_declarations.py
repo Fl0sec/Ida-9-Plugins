@@ -29,28 +29,7 @@ def _split_qualified(entry, key):
 
 
 def declare_members(members_=(), discovery=declare.DISCOVER_SITES_ONLY):
-    """Declare `member_offset` values, with explicit evidence sites.
-
-    Each entry is either `"Owner::field"` or a dict:
-
-        {"owner": "CModel", "member": "m_nBoneCount",
-         "name": "bone_count",                 # optional export name
-         "sites": [{"ea": 0x1234, "op": 1}],   # instruction + operand
-         "value_adjust": 0}
-
-    The sites are where *you* know the field is touched. They exist because
-    IDA's member xref index is incomplete: correct pointer typing does not
-    guarantee xrefs for a heap-backed object, so automatic discovery can
-    legitimately find nothing however well typed the database is.
-
-    What a site is **not** is a value. The offset still comes from the IDA
-    member, and a site that decodes a different number is dropped. You supply
-    where to look; the database supplies the answer.
-
-    `discovery="sites_plus_auto"` keeps automatic scanning as well, which buys
-    independent candidates at the cost of decompiling. The default uses only
-    the sites given: deterministic, and fast.
-    """
+    """Declare member offsets, optionally restricting discovery to given sites."""
     stored, unresolved = [], []
 
     for entry in members_ or ():
@@ -90,49 +69,12 @@ def declare_members(members_=(), discovery=declare.DISCOVER_SITES_ONLY):
 
 
 def declare_strides(strides=()):
-    """Declare `element_stride` values: a constant encoded in code.
-
-    Each entry is a dict, because a stride cannot be written as a bare name:
-
-        {"owner": "CMeshDrawPrimitive", "name": "kStride", "value": 0x30,
-         "sites": [{"ea": 0x1234, "op": 1}, ...]}
-
-    Unlike a member offset there is no field in the database to read, so two
-    things differ and both are deliberate. You assert the value, and every
-    site you give must decode exactly it -- one that decodes something else
-    rejects the whole declaration rather than exporting a number its own
-    witnesses contradict. And there is no automatic discovery: nothing in the
-    database associates an instruction with "the stride of this array", and
-    finding other instructions holding the same number would be coincidence,
-    not evidence.
-
-    `owner` is a namespace here, not a claim that the type has such a field.
-    """
+    """Declare asserted element strides; every supplied site must agree."""
     return _declare_asserted(strides, "stride", declare.make_stride)
 
 
 def declare_constants(constants=()):
-    """Declare `constant` values: a number that exists only in the code.
-
-    Each entry is a dict, same shape as a stride:
-
-        {"owner": "CEntityIdentityFlags", "name": "kModelChangeBlockedBit",
-         "value": 0x6, "sites": [{"ea": 0x1234, "op": 1}, ...]}
-
-    For a number that is not an offset and has no owning IDA field: a bit
-    position tested by `bt reg, 6`, a sentinel compared against a field. The
-    gate is the same as a stride's -- you assert the value, every site must
-    decode exactly it, and there is no discovery, because nothing in the
-    database associates an instruction with "this constant" and another
-    instruction holding the same number would be coincidence, not evidence.
-
-    A small immediate is more likely than a member offset to sit in an
-    instruction whose surrounding bytes are not unique, and that refusal is
-    kept: a non-unique pattern resolves to nothing on the consumer's side, so
-    exporting it would publish a signature that cannot be used.
-
-    `owner` is a namespace here, not a claim that the type has such a field.
-    """
+    """Declare asserted constants; every supplied site must agree."""
     return _declare_asserted(constants, "constant", declare.make_constant)
 
 
@@ -283,4 +225,3 @@ def declarations():
                                    unresolved)
     return _result(ok=ok, partial=partial, unresolved=unresolved,
                    declarations=out, count=len(out))
-

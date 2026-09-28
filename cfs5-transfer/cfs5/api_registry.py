@@ -116,36 +116,7 @@ def _verify_locators(locators, func_ea):
 
 
 def register(function_names=(), global_names=()):
-    """Add names to this IDB's export set.
-
-    An entry is a name, or an object carrying anchor sites:
-
-        register(function_names=[
-            "CCSPlayer_Think",
-            {"name": "ui_toolkit_show_generic_popup_ok",
-             "sites": [0x108C545]},
-        ])
-
-    A site is an address you have already determined identifies the function:
-    an instruction that references it (a `call`, a `jmp`, or the `lea` that
-    passes it to a registrar), or an instruction inside it to anchor a body
-    pattern on. It exists because automatic discovery legitimately runs out of
-    options -- a function whose only reference is from a vtable has no call
-    site, and one belonging to a family of byte-identical clones has no unique
-    prologue -- and when it does, the address you found by hand is the only
-    evidence left.
-
-    What a site is **not** is a signature. The exporter re-decodes it, re-
-    derives what it references, and refuses it if that is not this function;
-    then it builds and uniqueness-checks a pattern exactly as it would for a
-    discovered anchor. You supply where to look; the database supplies the
-    answer. A refused site is reported in `unresolved` and in the export's
-    `advisory` list -- it never silently exports something else.
-
-    Names are validated for shape and checked against the database now, so a
-    typo is reported at registration instead of silently producing nothing at
-    export time. Registration itself does no analysis and is cheap.
-    """
+    """Add names and optional, verified anchor sites to the export set."""
     existing = set(store.load_registry())
     stored_sites = store.load_sites()
     stored_locators = store.load_locators()
@@ -327,4 +298,3 @@ def registered():
             "members": store.count(),
         },
     )
-

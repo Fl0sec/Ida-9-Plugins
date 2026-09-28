@@ -1,14 +1,7 @@
-"""Shared core for the CFS6 exporter/importer IDA 9.4 plugins.
+"""Shared implementation package for the CFS6 IDA 9.4 plugins.
 
-This package holds every primitive shared between the two plugin entry files
-(signature building, instruction decoding, binary type transport and the .cfs
-file format) so neither plugin duplicates the other.
-
-The package name stays `cfs5` -- it is the plugins' import identity, not the
-format version. The format the plugins read and write is CFS6; see
-`cfs6.py` and docs/cfs6-format.md.
-
-Target: IDA Professional 9.4 / IDAPython 9.4 / Python 3.12.
+The package name remains ``cfs5`` for import compatibility; the file format is
+CFS6.  Shared logic lives here so the two entry plugins do not diverge.
 """
 
 VERSION = "6.4.0-ida9.4"

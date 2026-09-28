@@ -61,22 +61,7 @@ _TOKEN_STOPLIST = frozenset("""
 
 
 def resolve_target(node):
-    """Resolve a node to `(ea, why)`, or `(BADADDR, None)`.
-
-    Four passes, most trustworthy first. An explicit `click` target wins; then
-    the whole label; then each of its lines; and only then individual
-    identifier tokens inside the label. That ordering is what makes
-    `Install IRP_MJ_CREATE<br/>DispatchCreate` reach `DispatchCreate` without
-    letting a one-word coincidence hijack a node that had an exact match
-    available.
-
-    A name is preferred over a raw address everywhere because an address dies
-    the moment the IDB is rebased, while a name that stops resolving is a
-    visible, useful signal rather than a silent wrong jump.
-
-    `why` records what actually matched, so the hover hint can show it: a
-    wrong link should be legible, not mysterious.
-    """
+    """Resolve a node to ``(ea, why)``, or ``(BADADDR, None)``."""
     if node.target:
         ea = _resolve_token(node.target)
         if ea != BADADDR:
@@ -108,19 +93,7 @@ def _is_func_start(ea):
 
 
 def _resolve_from_tokens(label):
-    """Last-resort match on a single word of a multi-word label.
-
-    Longest token first, and **only a function start counts**. A flowchart step
-    means a routine; accepting data here is how `Register process-handle filter
-    / Altitude 321500` ends up jumping to a global called `Altitude`. An exact
-    label or line may still resolve to data -- that is a deliberate choice by
-    whoever wrote the label -- and `click` can always name data explicitly.
-
-    The stoplist and length floor also apply only here. An exact label has
-    already been tried, so a node genuinely called `Process` still links; what
-    is filtered out is `Process` extracted from `Register process callback`,
-    which is precisely where a false jump would come from.
-    """
+    """Match the longest acceptable label token, counting only function starts."""
     tokens = sorted(set(_TOKEN_RE.findall(label)), key=len, reverse=True)
     for token in tokens:
         if len(token) < MIN_TOKEN_LEN or token.lower() in _TOKEN_STOPLIST:
