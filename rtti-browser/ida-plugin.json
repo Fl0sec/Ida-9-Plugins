@@ -1,0 +1,11 @@
+{
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "RTTI Browser",
+    "entryPoint": "cvutils-rtti-browser.py",
+    "idaVersions": ">=9.4",
+    "version": "1.0.0",
+    "description": "Cached, searchable MSVC RTTI hierarchy and virtual-method browser.",
+    "categories": ["api-scripting-and-automation"]
+  }
+}

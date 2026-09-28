@@ -1,0 +1,8 @@
+{
+  "required_classes": ["Root", "Left", "Right", "Diamond"],
+  "required_diamond_bases": ["Diamond", "Left", "Root", "Right", "Root"],
+  "required_inheritance": {
+    "Diamond": ["multiple", "virtual"]
+  },
+  "minimum_vtables": 4
+}
