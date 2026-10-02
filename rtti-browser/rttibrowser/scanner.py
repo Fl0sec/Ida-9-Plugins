@@ -17,6 +17,7 @@ import ida_segment
 import ida_xref
 import idautils
 
+from . import anchors
 from .common import ScanCancelled, msg
 from .model import (
     BaseRecord, MAX_BASES, MAX_METHODS, Snapshot, VtableRecord,
@@ -56,6 +57,12 @@ class RttiScanner:
         self.image_base = int(ida_nalt.get_imagebase())
         self.pointer_size = 8 if ida_ida.inf_is_64bit() else 4
         self._ticks = 0
+        # Every vtable of a class re-validates the same TD/CHD/COL structures;
+        # caching them per scan keeps validation linear in distinct RTTI.
+        self._td_cache = {}
+        self._name_cache = {}
+        self._chd_cache = {}
+        self._col_cache = {}
 
     def _check_cancelled(self, force=False):
         self._ticks += 1
@@ -107,6 +114,12 @@ class RttiScanner:
             return None
 
     def _type_name(self, type_descriptor):
+        if type_descriptor not in self._name_cache:
+            self._name_cache[type_descriptor] = self._read_type_name(
+                type_descriptor)
+        return self._name_cache[type_descriptor]
+
+    def _read_type_name(self, type_descriptor):
         raw = self._read_c_string(type_descriptor + (self.pointer_size * 2))
         if not raw or not raw.startswith(".?"):
             return None
@@ -124,6 +137,11 @@ class RttiScanner:
         return descriptor_fallback(raw)
 
     def _valid_type_descriptor(self, ea):
+        if ea not in self._td_cache:
+            self._td_cache[ea] = self._check_type_descriptor(ea)
+        return self._td_cache[ea]
+
+    def _check_type_descriptor(self, ea):
         if not self._mapped(ea, (self.pointer_size * 2) + 5):
             return False
         vfptr = self._read_ptr(ea)
@@ -144,6 +162,12 @@ class RttiScanner:
         )
 
     def _valid_chd(self, ea, image_base):
+        key = (ea, image_base)
+        if key not in self._chd_cache:
+            self._chd_cache[key] = self._check_chd(ea, image_base)
+        return self._chd_cache[key]
+
+    def _check_chd(self, ea, image_base):
         if not self._mapped(ea, 16):
             return False
         signature = self._read_u32(ea)
@@ -160,6 +184,11 @@ class RttiScanner:
         return first is not None and self._valid_bcd(first, image_base)
 
     def _parse_col(self, ea):
+        if ea not in self._col_cache:
+            self._col_cache[ea] = self._read_col(ea)
+        return self._col_cache[ea]
+
+    def _read_col(self, ea):
         size = 24 if self.pointer_size == 8 else 20
         if not self._mapped(ea, size):
             return None
@@ -281,33 +310,52 @@ class RttiScanner:
         if not deep_scan:
             return candidates
 
-        segments = []
-        total = 0
-        for index in range(ida_segment.get_segm_qty()):
-            segment = ida_segment.getnseg(index)
-            if segment is None or segment.type != ida_segment.SEG_DATA:
-                continue
-            start = ((segment.start_ea + self.pointer_size - 1)
-                     & ~(self.pointer_size - 1))
-            slots = max(0, (segment.end_ea - start) // self.pointer_size)
-            segments.append((start, segment.end_ea, slots))
-            total += slots
-
-        visited = 0
-        for start, end, slots in segments:
-            stop = end - (self.pointer_size * 2) + 1
-            for pointer_ea in range(start, max(start, stop), self.pointer_size):
-                self._check_cancelled()
-                if visited % 32768 == 0:
-                    self.progress("Deep RTTI candidates", visited, total)
-                visited += 1
-                col_ea = self._read_ptr(pointer_ea)
-                slot_zero = self._read_ptr(pointer_ea + self.pointer_size)
-                if (col_ea and self._mapped(col_ea, 20)
-                        and slot_zero and self._is_code(slot_zero)):
-                    candidates.add(pointer_ea)
-            visited += max(0, slots - max(0, (stop - start) // self.pointer_size))
+        names_found = len(candidates)
+        chunks = self._image_chunks()
+        tick = lambda: self._check_cancelled(force=True)
+        self.progress("Finding RTTI type descriptors", 0, 3)
+        tds = {td for td in anchors.find_type_descriptors(
+            chunks, self.pointer_size, tick) if self._valid_type_descriptor(td)}
+        self.progress("Finding RTTI complete object locators", 1, 3)
+        cols = {col for col in anchors.find_cols(
+            chunks, tds, self.pointer_size, self.image_base, tick)
+            if self._parse_col(col) is not None}
+        self.progress("Finding RTTI vtables", 2, 3)
+        candidates.update(anchors.find_vtable_slots(
+            chunks, cols, self.pointer_size, tick))
+        self.diagnostic(
+            "SCAN: %d name candidate(s), %d type descriptor(s), %d COL(s), "
+            "%d vtable candidate(s) total" % (
+                names_found, len(tds), len(cols), len(candidates)))
         return candidates
+
+    _CHUNK = 16 << 20
+    _OVERLAP = 64
+
+    def _image_chunks(self):
+        """Read every segment in large overlapping chunks for byte search.
+
+        All segment types are included: dumps and packers often mislabel
+        segments, and a byte sweep of code is cheap next to validation.
+        """
+        chunks = []
+        for index in range(ida_segment.get_segm_qty()):
+            self._check_cancelled(force=True)
+            segment = ida_segment.getnseg(index)
+            if segment is None:
+                continue
+            ea = segment.start_ea
+            while ea < segment.end_ea:
+                size = min(self._CHUNK + self._OVERLAP, segment.end_ea - ea)
+                try:
+                    data = ida_bytes.get_bytes(ea, size)
+                except Exception as exc:
+                    self.diagnostic("read 0x%X+0x%X failed: %s" % (ea, size, exc))
+                    data = None
+                if data:
+                    chunks.append((ea, data))
+                ea += self._CHUNK
+        return chunks
 
     def scan(self, identity, deep_scan=True):
         """Return one validated, RVA-based snapshot for the current IDB."""
