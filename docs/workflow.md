@@ -86,4 +86,4 @@ fastest way to answer "what does this API actually return here?".
 
 - Run `python tools/check.py` (whole repo) before committing.
 - Commit only when asked. Keep changes to one plugin per commit where possible.
-- Never commit into `ida-pro-mcp/` or `reference/`; never commit IDBs.
+- Never commit into `fl0sec-ida-pro-mcp/` or `reference/`; never commit IDBs.

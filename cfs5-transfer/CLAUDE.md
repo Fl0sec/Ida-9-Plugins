@@ -85,7 +85,7 @@ the exact live result. Never test mutations against the only copy of an IDB.
 ## Repository boundaries
 
 - Edit on `main`; commit only when authorized.
-- `ida-pro-mcp/` and `reference/` are read-only upstream/reference trees.
+- `fl0sec-ida-pro-mcp/` and `reference/` are read-only upstream/reference trees.
 - Never commit IDBs or IDA sidecar files.
 - Plugin identities (`CFS5ExporterPlugin`, `CFS5ImporterPlugin`, `cfs5:*`, and
   package name `cfs5`) are stable public surface.

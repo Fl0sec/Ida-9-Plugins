@@ -12,7 +12,7 @@ conventions they are written against.
 | [`templates/plugin_skeleton/`](templates/plugin_skeleton/) | copy this to start a new plugin |
 | [`tools/`](tools/) | offline check gate and the deploy script |
 | [`cfs5-transfer/`](cfs5-transfer/) | CFS5 signature/type transfer plugins |
-| `ida-pro-mcp/` | upstream MCP server checkout — read-only, git-ignored |
+| `fl0sec-ida-pro-mcp/` | upstream MCP server checkout — read-only, git-ignored |
 | `reference/` | third-party plugin sources for reading — git-excluded |
 
 ## Quick start

@@ -56,13 +56,13 @@ ida-9-plugins/
     deploy.ps1         # copy a plugin into IDA's user plugins dir
   cfs5-transfer/       # CFS5 signature/type transfer plugins (has its own CLAUDE.md)
   rtti-browser/        # cached, read-only MSVC RTTI and virtual-method browser
-  ida-pro-mcp/         # separate upstream checkout, git-ignored, DO NOT EDIT from here
+  fl0sec-ida-pro-mcp/         # separate upstream checkout, git-ignored, DO NOT EDIT from here
   reference/           # third-party plugin sources for reading only, git-excluded
 ```
 
 `cfs5-transfer/CLAUDE.md` is the authority for that plugin's internals;
 `rtti-browser/README.md` documents its user contract and verification commands;
-this file is the authority for everything shared. `ida-pro-mcp/` and
+this file is the authority for everything shared. `fl0sec-ida-pro-mcp/` and
 `reference/` are **read-only references** — never commit changes into them
 from this repo.
 
@@ -216,7 +216,7 @@ environment and are the fastest way to check API behaviour against a live IDB.
 ## Git
 
 - Work on `main` unless the user asks otherwise; commit only when asked.
-- Never commit into `ida-pro-mcp/` (git-ignored) or `reference/` (excluded via
+- Never commit into `fl0sec-ida-pro-mcp/` (git-ignored) or `reference/` (excluded via
   `.git/info/exclude`) — they are upstream checkouts.
 - Never commit IDBs or IDA artifacts (`*.i64`, `*.idb`, `*.til`, ...) —
   `.gitignore` covers these; don't force-add past it.

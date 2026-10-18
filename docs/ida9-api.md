@@ -64,7 +64,7 @@ An empty result is a definitive answer: it does not exist in 9.0.
 against a real IDB (`py_eval`). Use it when the signature is present but you are
 unsure what the call returns for a given IDB state.
 
-Also available: `ida-pro-mcp/skills/idapython/docs/ida_*.md` — per-module
+Also available: `fl0sec-ida-pro-mcp/skills/idapython/docs/ida_*.md` — per-module
 reference docs checked into the sibling repo.
 
 ## Removed in 9.0 — the ones that bite

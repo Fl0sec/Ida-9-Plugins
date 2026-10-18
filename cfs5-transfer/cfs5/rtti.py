@@ -1,7 +1,7 @@
 """Targeted MSVC RTTI lookup: a class name and a slot to a function address.
 
 Ported, deliberately, rather than imported. The equivalent logic in
-`ida-pro-mcp/src/ida_pro_mcp/ida_mcp/api_rtti.py` is already debugged against
+`fl0sec-ida-pro-mcp/src/ida_pro_mcp/ida_mcp/api_rtti.py` is already debugged against
 this exact binary, but every public function there is wrapped in `@tool` /
 `@idasync` from that package's `.rpc` / `.sync`, so importing it would drag the
 MCP server runtime into an IDA plugin -- and it lives in a git-ignored upstream

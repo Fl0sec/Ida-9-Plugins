@@ -6,7 +6,7 @@ __pycache__/
 .pytest_cache/
 
 # Embedded/unrelated projects checked out alongside this repo
-ida-pro-mcp/
+fl0sec-ida-pro-mcp/
 
 # IDA database artifacts
 *.i64
