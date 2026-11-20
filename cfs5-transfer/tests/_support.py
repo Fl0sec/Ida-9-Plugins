@@ -19,7 +19,9 @@ from cfs5 import cfs6  # noqa: E402
 from cfs5.policy import Candidate  # noqa: E402
 
 
-BUILDS_ROOT = r"C:\Users\Kiwi\Desktop\fl0sec\ida\cs2\builds"
+# Golden-vector tests need real binaries. Point CFS_BUILDS_ROOT at a folder
+# laid out as <build>/modules/client/client.dll; without it they are skipped.
+BUILDS_ROOT = os.environ.get("CFS_BUILDS_ROOT", "")
 
 
 def dll_path(build):
